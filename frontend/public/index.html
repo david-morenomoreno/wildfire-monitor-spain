@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Wildfire Monitor Spain</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Set the theme before first paint - avoids a flash of the wrong theme
+       when a returning user's preference is "light". -->
+  <script>
+    document.documentElement.dataset.theme = localStorage.getItem("wm-theme") || "dark";
+  </script>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <link rel="stylesheet" href="/shared.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: var(--font-ui); }
+
+    /* ---------- Control panel ---------- */
+    #panel {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      z-index: 1000;
+      width: 290px;
+      background: var(--bg-panel);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      border: 1px solid var(--border-soft);
+      border-radius: 14px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      color: var(--text-primary);
+      font-size: 13px;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .panel-header h1 {
+      margin: 0;
+      font-size: 13.5px;
+      font-weight: 650;
+      letter-spacing: 0.01em;
+    }
+    .panel-header .sub {
+      margin-left: auto;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-muted);
+      letter-spacing: 0.04em;
+    }
+
+    .panel-section {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .panel-section:last-child { border-bottom: none; }
+    .panel-label {
+      font-size: 10.5px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .legend-item { display: flex; align-items: center; gap: 6px; }
+    .legend-ring {
+      width: 10px; height: 10px; border-radius: 50%;
+      border: 2px solid var(--text-secondary);
+      background: transparent;
+      flex-shrink: 0;
+    }
+    .legend-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #2dd4bf;
+      box-shadow: 0 0 6px rgba(45, 212, 191, 0.6);
+      flex-shrink: 0;
+    }
+    .legend-hint { margin-top: 6px; font-size: 11px; color: var(--text-muted); }
+
+    .recency-bar {
+      display: block;
+      height: 6px;
+      border-radius: 4px;
+      margin-top: 8px;
+      background: linear-gradient(to right, var(--recent), var(--oldest));
+      box-shadow: 0 0 8px rgba(255, 106, 61, 0.25);
+    }
+    .recency-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    /* Form controls */
+    .field { margin-top: 10px; }
+    .field:first-child { margin-top: 0; }
+    .field-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+    select, input[type="date"] {
+      width: 100%;
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border-soft);
+      border-radius: 8px;
+      padding: 7px 9px;
+      font-size: 12.5px;
+      font-family: var(--font-ui);
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+    select:hover, input[type="date"]:hover { border-color: var(--border-strong); }
+    select:focus, input[type="date"]:focus { border-color: var(--accent); }
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(1) opacity(0.6); }
+
+    label.toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      user-select: none;
+    }
+    input[type="checkbox"] {
+      accent-color: var(--accent);
+      width: 14px;
+      height: 14px;
+      cursor: pointer;
+    }
+
+    /* ---------- Right panel: grouped settings rows + switches ---------- */
+    .settings-group-title {
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 0;
+    }
+    .settings-row + .settings-row { border-top: 1px solid var(--border-soft); }
+    .settings-row-label {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      min-width: 0;
+    }
+    .settings-row-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; flex-shrink: 0; }
+
+    /* Monochrome line icons (replacing colorful emoji) - inherit
+       currentColor from whatever text color surrounds them, so they stay
+       consistent across both themes and never clash with the accent color. */
+    .icon { display: inline-flex; align-items: center; justify-content: center; vertical-align: -2px; flex-shrink: 0; }
+    .settings-row-text { display: flex; flex-direction: column; min-width: 0; }
+    .settings-row-hint { font-size: 10.5px; color: var(--text-muted); margin-top: 1px; }
+    .settings-block { margin-top: 10px; }
+    .settings-block:first-child { margin-top: 0; }
+
+    /* Toggle switch (replaces square checkboxes for on/off map layers) */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 34px;
+      height: 20px;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+    .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .switch-track {
+      position: absolute;
+      inset: 0;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+      border-radius: 999px;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .switch-thumb {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      transition: transform 0.15s ease, background 0.15s ease;
+    }
+    .switch input:checked ~ .switch-track { background: var(--accent-dim); border-color: var(--accent); }
+    .switch input:checked ~ .switch-track .switch-thumb { transform: translateX(14px); background: var(--accent); }
+
+    /* Experimental tool sub-block: visually distinct from regular settings */
+    .tool-experimental {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px dashed var(--border-strong);
+      border-radius: 10px;
+      background: rgba(255, 106, 61, 0.04);
+    }
+    .tool-experimental-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      font-size: 12.5px;
+      font-family: var(--font-ui);
+      font-weight: 650;
+      color: var(--text-primary);
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      text-align: left;
+    }
+    .tool-experimental-header span:first-child { flex: 1; }
+    .badge-experimental {
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(255, 106, 61, 0.18);
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+    .tool-experimental-chevron { transition: transform 0.15s ease; font-size: 11px; color: var(--text-muted); }
+    .tool-experimental.collapsed .tool-experimental-chevron { transform: rotate(-90deg); }
+    .tool-experimental.collapsed .tool-experimental-body { display: none; }
+    .tool-experimental-body { margin-top: 2px; }
+
+    .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+    button {
+      font-family: var(--font-ui);
+      font-size: 12px;
+      font-weight: 550;
+      color: var(--text-primary);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+      border-radius: 8px;
+      padding: 7px 11px;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
+    }
+    button:hover { background: var(--bg-elevated-hover); border-color: var(--border-strong); }
+    button:active { transform: scale(0.97); }
+    button:disabled { opacity: 0.5; cursor: default; }
+
+    #status {
+      margin-top: 10px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.5;
+      min-height: 14px;
+    }
+
+    /* ---------- Leaflet popup chrome, dark themed ---------- */
+    .leaflet-popup-content-wrapper {
+      background: var(--bg-panel);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      color: var(--text-primary);
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+      font-family: var(--font-ui);
+    }
+    .leaflet-popup-tip { background: var(--bg-panel); box-shadow: none; }
+    .leaflet-popup-content { margin: 12px 14px; font-size: 12.5px; line-height: 1.55; }
+    .leaflet-popup-close-button { color: var(--text-muted) !important; }
+    .leaflet-popup-close-button:hover { color: var(--text-primary) !important; }
+    .leaflet-tooltip {
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border-soft);
+      border-radius: 6px;
+      font-family: var(--font-ui);
+      font-size: 11.5px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+    .leaflet-tooltip-top:before { border-top-color: var(--bg-elevated); }
+
+    /* ---------- Popup card content ---------- */
+    .card-title { font-size: 14px; font-weight: 650; color: var(--text-primary); }
+    .card-subtitle { color: var(--text-muted); font-weight: 500; }
+    .card-meta {
+      margin-top: 6px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+    .card-caveat {
+      display: block;
+      margin-top: 4px;
+      font-size: 10.5px;
+      color: var(--text-muted);
+      font-style: italic;
+    }
+
+    .x-card {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-soft);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .x-card code {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+      color: var(--accent);
+      padding: 3px 7px;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+    }
+    .copy-btn, .geocode-btn {
+      font-size: 11px;
+      padding: 5px 9px;
+    }
+    .x-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #fff;
+      color: #000;
+      text-decoration: none;
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 11.5px;
+      font-weight: 650;
+      transition: opacity 0.15s ease;
+    }
+    .x-link:hover { opacity: 0.85; }
+
+    /* ---------- Incident sidebar ---------- */
+    #incident-sidebar {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      bottom: 14px;
+      z-index: 1000;
+      width: 320px;
+      max-width: calc(100vw - 28px);
+      background: var(--bg-panel);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      border: 1px solid var(--border-soft);
+      border-radius: 14px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      color: var(--text-primary);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border-soft);
+      flex-shrink: 0;
+    }
+    .sidebar-header h2 {
+      margin: 0;
+      font-size: 13.5px;
+      font-weight: 650;
+      letter-spacing: 0.01em;
+    }
+    .sidebar-header .count {
+      margin-left: auto;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-muted);
+    }
+    .sidebar-back {
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 16px;
+      padding: 0 4px 0 0;
+      cursor: pointer;
+    }
+    .sidebar-back:hover { color: var(--text-primary); }
+
+    /* ---------- Sidebar filters ---------- */
+    .filter-panel {
+      padding: 10px 12px 12px;
+      border-bottom: 1px solid var(--border-soft);
+      flex-shrink: 0;
+    }
+    .filter-panel-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      background: none;
+      border: none;
+      padding: 0;
+      margin-bottom: 10px;
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .filter-panel-toggle:hover { color: var(--text-primary); }
+    .filter-panel-chevron { transition: transform 0.15s ease; font-size: 11px; }
+    .filter-panel.collapsed .filter-panel-toggle { margin-bottom: 0; }
+    .filter-panel.collapsed .filter-panel-chevron { transform: rotate(-90deg); }
+    .filter-panel.collapsed .filter-panel-body { display: none; }
+
+    .filter-group { margin-bottom: 10px; }
+    .filter-group:last-child { margin-bottom: 0; }
+
+    .search-row {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+    .search-icon {
+      position: absolute;
+      left: 9px;
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+    #locality-search {
+      width: 100%;
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border-soft);
+      border-radius: 8px;
+      padding: 7px 9px 7px 30px;
+      font-size: 12.5px;
+      font-family: var(--font-ui);
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+    #locality-search:hover { border-color: var(--border-strong); }
+    #locality-search:focus { border-color: var(--accent); }
+    #locality-search::placeholder { color: var(--text-muted); }
+
+    .quick-filter-btn {
+      width: 100%;
+      font-family: var(--font-ui);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-dim);
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      padding: 7px 11px;
+      cursor: pointer;
+      transition: opacity 0.15s ease;
+    }
+    .quick-filter-btn:hover { opacity: 0.85; }
+    .quick-filter-btn.active {
+      background: var(--accent);
+      color: #1a1a1a;
+    }
+    .filter-group-label {
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
+    .chip { cursor: pointer; display: inline-flex; }
+    .chip input {
+      position: absolute;
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .chip span {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 600;
+      border: 1px solid var(--border-soft);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+      user-select: none;
+      white-space: nowrap;
+    }
+    .chip:hover span { border-color: var(--border-strong); }
+    .chip input:checked + span {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: var(--text-primary);
+    }
+    .chip.chip-risk-low input:checked + span { background: rgba(74, 222, 128, 0.18); border-color: #4ade80; color: #4ade80; }
+    .chip.chip-risk-moderate input:checked + span { background: rgba(250, 204, 21, 0.18); border-color: #facc15; color: #facc15; }
+    .chip.chip-risk-high input:checked + span { background: rgba(251, 146, 60, 0.2); border-color: #fb923c; color: #fb923c; }
+    .chip.chip-risk-critical input:checked + span { background: rgba(248, 113, 113, 0.22); border-color: #f87171; color: #f87171; }
+    .filter-reset {
+      margin-top: 8px;
+      font-size: 10.5px;
+      color: var(--text-muted);
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .filter-reset:hover { color: var(--text-primary); }
+
+    .sidebar-body { flex: 1; overflow-y: auto; padding: 8px; }
+    .incident-section-label {
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--text-muted);
+      margin: 14px 4px 8px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .incident-section-label:first-child { margin-top: 4px; padding-top: 0; border-top: none; }
+    .sidebar-empty {
+      padding: 20px 12px;
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .incident-card {
+      padding: 10px 12px;
+      border-radius: 10px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      border: 1px solid var(--border-soft);
+      background: var(--bg-elevated);
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .incident-card:hover { background: var(--bg-elevated-hover); border-color: var(--border-strong); }
+    .incident-card.keyboard-focused { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .incident-card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .incident-card-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+    .incident-card-meta {
+      margin-top: 5px;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .risk-badge {
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 3px 8px;
+      border-radius: 999px;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+    .risk-low { background: rgba(74, 222, 128, 0.18); color: #4ade80; }
+    .risk-moderate { background: rgba(250, 204, 21, 0.18); color: #facc15; }
+    .risk-high { background: rgba(251, 146, 60, 0.2); color: #fb923c; }
+    .risk-critical { background: rgba(248, 113, 113, 0.22); color: #f87171; }
+
+    /* Growth-rate badge - same semantic colors as risk (green/orange/red),
+       "new" reuses the neutral chip style since there isn't enough history
+       yet to say anything about trend. */
+    .growth-badge {
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 3px 8px;
+      border-radius: 999px;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+    .growth-new { background: var(--bg-elevated); color: var(--text-secondary); }
+    .growth-stable { background: rgba(74, 222, 128, 0.18); color: #4ade80; }
+    .growth-moderate { background: rgba(251, 146, 60, 0.2); color: #fb923c; }
+    .growth-fast { background: rgba(248, 113, 113, 0.22); color: #f87171; }
+
+    /* ---------- Incident detail card ---------- */
+    .incident-detail-meta {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border-soft);
+      flex-shrink: 0;
+    }
+    .incident-detail-title { font-size: 15px; font-weight: 650; }
+    .incident-detail-sub { margin-top: 4px; font-size: 11.5px; color: var(--text-muted); }
+    .incident-detail-badges { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+
+    /* Big-number metrics: the primary way to read an incident at a glance,
+       replacing the old flat monospace stat row. */
+    .incident-detail-metrics {
+      margin-top: 14px;
+      display: flex;
+      gap: 18px;
+    }
+    .incident-metric { display: flex; flex-direction: column; }
+    .incident-metric-value {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }
+    .incident-metric-label {
+      margin-top: 3px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .sparkline-wrap { margin-top: 14px; }
+    .sparkline-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+    .sparkline-svg { width: 100%; height: 36px; display: block; }
+
+    .stale-data-warning {
+      margin-top: 8px;
+      padding: 7px 9px;
+      border-radius: 8px;
+      background: rgba(250, 204, 21, 0.12);
+      border: 1px solid rgba(250, 204, 21, 0.4);
+      color: #facc15;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    /* Timeline is secondary detail, collapsed by default */
+    .timeline-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      background: none;
+      border: none;
+      border-top: 1px solid var(--border-soft);
+      padding: 12px 16px;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+    }
+    .timeline-toggle:hover { color: var(--text-primary); }
+    .timeline-toggle-chevron { transition: transform 0.15s ease; font-size: 11px; }
+    .timeline-toggle.expanded .timeline-toggle-chevron { transform: rotate(180deg); }
+
+    .timeline-list { padding: 14px 16px 14px 20px; display: none; }
+    .timeline-list.expanded { display: block; }
+    .timeline-item {
+      position: relative;
+      padding-left: 18px;
+      padding-bottom: 16px;
+      border-left: 2px solid var(--border-soft);
+      margin-left: 5px;
+    }
+    .timeline-item:last-child { border-left-color: transparent; padding-bottom: 0; }
+    .timeline-dot {
+      position: absolute;
+      left: -7px;
+      top: 2px;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 2px solid var(--bg-elevated);
+    }
+    .timeline-time {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+    .timeline-title { font-size: 12.5px; font-weight: 600; color: var(--text-primary); margin-top: 2px; }
+    .timeline-desc { font-size: 11.5px; color: var(--text-secondary); margin-top: 2px; }
+    .timeline-thumb {
+      display: block;
+      margin-top: 8px;
+      max-width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+    }
+
+    /* ---------- Telegram mentions (popup + timeline) ---------- */
+    .telegram-card {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .telegram-card-title { font-size: 11.5px; font-weight: 650; color: var(--text-primary); }
+    .telegram-thumb {
+      display: block;
+      margin-top: 6px;
+      max-width: 100%;
+      max-height: 140px;
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+      object-fit: cover;
+    }
+    .telegram-snippet {
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .timeline-btn { font-size: 11px; padding: 6px 10px; }
+
+    /* ---------- Official regional status (popup + timeline) ---------- */
+    .regional-card {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .regional-card-title {
+      font-size: 11.5px;
+      font-weight: 650;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .regional-status-pill {
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(45, 212, 191, 0.16);
+      color: #2dd4bf;
+    }
+    .regional-summary {
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .regional-summary + .regional-summary { margin-top: 3px; }
+
+    /* ---------- Satellite imagery (popup) ---------- */
+    .satellite-card {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .satellite-card-title { font-size: 11.5px; font-weight: 650; color: var(--text-primary); }
+    .satellite-thumb {
+      display: block;
+      margin-top: 6px;
+      max-width: 100%;
+      max-height: 140px;
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+      object-fit: cover;
+    }
+    .satellite-summary {
+      margin-top: 6px;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-secondary);
+    }
+
+    /* ---------- Webcams (map popup, Windy-style viewer) ---------- */
+    .webcam-thumb {
+      display: block;
+      margin-top: 8px;
+      max-width: 100%;
+      max-height: 220px;
+      width: 280px;
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+      object-fit: cover;
+    }
+    .webcam-nearby-label {
+      margin-top: 8px;
+      font-size: 10px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+    .webcam-nearby-strip {
+      margin-top: 6px;
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .webcam-nearby-thumb {
+      width: 56px;
+      height: 42px;
+      object-fit: cover;
+      border-radius: 6px;
+      border: 1px solid var(--border-soft);
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: border-color 0.15s ease;
+    }
+    .webcam-nearby-thumb:hover { border-color: var(--accent); }
+
+    /* ---------- Fire spread prediction (experimental POC) ---------- */
+    #fire-spread-place.active-placing {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #1a1a1a;
+    }
+    .fire-spread-slider-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .fire-spread-slider-row input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent);
+    }
+    .fire-spread-hour-label {
+      font-size: 11.5px;
+      font-weight: 650;
+      color: var(--text-primary);
+      min-width: 32px;
+      text-align: right;
+    }
+    .fire-spread-info { margin-top: 10px; }
+    .fire-spread-card {
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+    .fire-spread-row b { color: var(--text-primary); font-weight: 650; }
+
+    /* Any thumbnail (timeline, Telegram, satellite, webcam) is click-to-zoom -
+       see openLightbox() in app.js. Cursor + subtle hover cue make that discoverable. */
+    .timeline-thumb, .telegram-thumb, .satellite-thumb, .webcam-thumb {
+      cursor: zoom-in;
+      transition: opacity 0.15s ease;
+    }
+    .timeline-thumb:hover, .telegram-thumb:hover, .satellite-thumb:hover, .webcam-thumb:hover { opacity: 0.85; }
+
+    #lightbox-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 3000;
+      background: rgba(6, 7, 10, 0.88);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: zoom-out;
+      backdrop-filter: blur(4px);
+    }
+    #lightbox-overlay img {
+      max-width: 90vw;
+      max-height: 90vh;
+      border-radius: 10px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+    }
+    #lightbox-overlay .lightbox-close {
+      position: absolute;
+      top: 18px;
+      right: 24px;
+      font-size: 28px;
+      color: var(--text-primary);
+      background: none;
+      border: none;
+      cursor: pointer;
+      line-height: 1;
+    }
+
+    .status-page-link { font-size: 11.5px; color: var(--accent); text-decoration: none; }
+    .status-page-link:hover { text-decoration: underline; }
+
+    /* ---------- Mobile: floating panels become full-screen overlays ---------- */
+    .mobile-panel-toggle {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 999px;
+      border: 1px solid var(--border-soft);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      cursor: pointer;
+    }
+    .mobile-panel-toggle:hover { color: var(--text-primary); border-color: var(--border-strong); }
+    .mobile-panel-close {
+      display: none;
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 10;
+      width: 28px;
+      height: 28px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      border: 1px solid var(--border-soft);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      font-size: 15px;
+      cursor: pointer;
+    }
+
+    @media (max-width: 768px) {
+      .mobile-panel-toggle { display: inline-flex; }
+      .topbar-tabs { display: none; } /* reclaim header space - Mapa/Fuentes still reachable, just not as tabs */
+
+      #incident-sidebar, #panel {
+        position: fixed;
+        inset: 0;
+        top: 49px; /* below the topbar */
+        width: auto;
+        max-width: none;
+        bottom: 0;
+        border-radius: 0;
+        z-index: 1500;
+        transform: translateY(100%);
+        transition: transform 0.2s ease;
+      }
+      #incident-sidebar.mobile-open, #panel.mobile-open { transform: translateY(0); }
+      .mobile-panel-close { display: flex; }
+    }
+  </style>
+</head>
+<body class="has-topbar-map">
+  <nav class="topbar">
+    <span class="topbar-brand"><span class="pulse" id="topbar-pulse"></span>Wildfire Monitor</span>
+    <div class="topbar-tabs">
+      <a class="topbar-tab active" href="/index.html">Mapa</a>
+      <a class="topbar-tab" href="/sources.html">Fuentes</a>
+    </div>
+    <button class="mobile-panel-toggle" id="mobile-sidebar-toggle" aria-label="Ver incidentes">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <button class="mobile-panel-toggle" id="mobile-settings-toggle" aria-label="Ver ajustes">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 0 1-4 0v-.09A1.7 1.7 0 0 0 8.96 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 0 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.96a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.04-1.56V3a2 2 0 0 1 4 0v.09a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.04H21a2 2 0 0 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.04z"/></svg>
+    </button>
+    <button class="theme-toggle" id="theme-toggle" title="Cambiar a modo claro" aria-label="Cambiar tema">🌙</button>
+  </nav>
+  <div id="map-wrap">
+  <div id="map"></div>
+  <div id="incident-sidebar">
+    <button class="mobile-panel-close" id="mobile-sidebar-close" aria-label="Cerrar">✕</button>
+    <div class="sidebar-header" id="sidebar-header">
+      <h2>Incendios por gravedad</h2>
+      <span class="count" id="incident-count"></span>
+    </div>
+    <div class="filter-panel" id="filter-panel">
+      <button class="filter-panel-toggle" id="filter-panel-toggle">
+        <span>Filtros</span>
+        <span class="filter-panel-chevron" id="filter-panel-chevron">▾</span>
+      </button>
+      <div class="filter-panel-body" id="filter-panel-body">
+        <div class="filter-group">
+          <div class="search-row">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="search-icon"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+            <input type="text" id="locality-search" placeholder="Buscar localidad o provincia... ( / )" autocomplete="off" />
+          </div>
+        </div>
+        <div class="filter-group">
+          <button class="quick-filter-btn" id="quick-filter-critical">Solo crítico + activo</button>
+        </div>
+        <div class="filter-group">
+          <div class="filter-group-label">Nivel de riesgo</div>
+          <div class="chip-row">
+            <label class="chip chip-risk-low"><input type="checkbox" class="filter-risk" value="low" checked /><span>Bajo</span></label>
+            <label class="chip chip-risk-moderate"><input type="checkbox" class="filter-risk" value="moderate" checked /><span>Moderado</span></label>
+            <label class="chip chip-risk-high"><input type="checkbox" class="filter-risk" value="high" checked /><span>Alto</span></label>
+            <label class="chip chip-risk-critical"><input type="checkbox" class="filter-risk" value="critical" checked /><span>Crítico</span></label>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="filter-group-label">Estado del incidente</div>
+          <div class="chip-row">
+            <label class="chip"><input type="checkbox" class="filter-status" value="active" checked /><span>Activo</span></label>
+            <label class="chip"><input type="checkbox" class="filter-status" value="cooling" checked /><span>En enfriamiento</span></label>
+            <label class="chip"><input type="checkbox" class="filter-status" value="archived" checked /><span>Archivado</span></label>
+          </div>
+        </div>
+        <div class="filter-group">
+          <div class="filter-group-label">Confirmado por</div>
+          <div class="chip-row">
+            <label class="chip"><input type="checkbox" class="filter-source" value="has_regional_status" /><span>Estado oficial</span></label>
+            <label class="chip"><input type="checkbox" class="filter-source" value="has_telegram_mentions" /><span>Telegram</span></label>
+            <label class="chip"><input type="checkbox" class="filter-source" value="has_satellite_imagery" /><span>Satélite</span></label>
+          </div>
+        </div>
+        <button class="filter-reset" id="filter-reset">Restablecer filtros</button>
+      </div>
+    </div>
+    <div class="sidebar-body" id="sidebar-body">
+      <div class="sidebar-empty">Cargando incidentes…</div>
+    </div>
+  </div>
+  <div id="panel">
+    <button class="mobile-panel-close" id="mobile-settings-close" aria-label="Cerrar">✕</button>
+    <div class="panel-header">
+      <span class="pulse" id="header-pulse"></span>
+      <h1>Wildfire Monitor</h1>
+      <span class="sub">ES</span>
+    </div>
+
+    <!-- ---------- Visualización ---------- -->
+    <div class="panel-section">
+      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6l5-1.5 6 1.5 6-1.5v13.5l-6 1.5-6-1.5-5 1.5z"/><path d="M9 4.5v13.5M15 6v13.5"/></svg></span> Visualización</div>
+
+      <div class="settings-block">
+        <div class="legend-row">
+          <div class="legend-item"><span class="legend-ring"></span>Foco de detección</div>
+          <div class="legend-item"><span class="legend-dot"></span>Reportes de usuarios</div>
+        </div>
+        <div class="legend-hint">Cada foco tiene siempre el mismo tamaño; el color indica su antigüedad (rojo = reciente, amarillo = antiguo), así se aprecia la dirección de avance del incendio. El polígono sombreado marca el perímetro estimado del área afectada.</div>
+        <div class="recency-bar"></div>
+        <div class="recency-labels"><span>Reciente</span><span>Antiguo (72h+)</span></div>
+      </div>
+
+      <div class="settings-block">
+        <div class="field-row" style="margin-bottom:8px;">
+          <label for="basemap-style" style="font-size:12.5px; color:var(--text-secondary); display:flex; align-items:center; gap:6px;"><span class="icon"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6l5-1.5 6 1.5 6-1.5v13.5l-6 1.5-6-1.5-5 1.5z"/><path d="M9 4.5v13.5M15 6v13.5"/></svg></span> Mapa base</label>
+        </div>
+        <select id="basemap-style">
+          <option value="streets">Calles (OpenStreetMap)</option>
+          <option value="topo">Topográfico / relieve</option>
+        </select>
+      </div>
+
+      <div class="settings-block">
+        <div class="settings-row">
+          <span class="settings-row-label">
+            <span class="settings-row-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 7l4 4-6 6-4-4a5.66 5.66 0 0 1 6-6z"/><path d="M3 21l3.5-3.5"/><path d="M17 3a11 11 0 0 1 4 4M14 6a7 7 0 0 1 4 4"/></svg></span>
+            <span class="settings-row-text">Imagen NASA GIBS (color real)</span>
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="satellite-toggle" />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </label>
+        </div>
+        <div class="field" style="margin-top:8px;"><input type="date" id="satellite-date" /></div>
+      </div>
+
+      <div class="settings-block">
+        <div class="field-row" style="margin-bottom:8px;">
+          <label for="date-range" style="font-size:12.5px; color:var(--text-secondary);">Ventana temporal</label>
+        </div>
+        <select id="date-range">
+          <option value="1">Último día</option>
+          <option value="3">Últimos 3 días</option>
+          <option value="7" selected>Últimos 7 días</option>
+          <option value="14">Últimos 14 días</option>
+          <option value="30">Últimos 30 días</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- ---------- Herramientas ---------- -->
+    <div class="panel-section">
+      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 1 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.1 2.1-2.6-.7-.7-2.6z"/></svg></span> Herramientas</div>
+
+      <div class="settings-row">
+        <span class="settings-row-label">
+          <span class="settings-row-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.2"/></svg></span>
+          <span class="settings-row-text">
+            Cámaras cercanas (DGT + Windy)
+            <span class="settings-row-hint">Carga cámaras en la vista actual - haz zoom o desplázate para actualizar</span>
+          </span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="webcams-toggle" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="tool-experimental collapsed" id="fire-spread-tool">
+        <button class="tool-experimental-header" id="fire-spread-tool-toggle">
+          <span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2c1 3-3 4-3 8a3 3 0 0 0 6 0c0-1-.5-2-1-2.5.5 2 .5 4-1 5.5a4 4 0 0 1-4-4c0-3 2-4 2-7-2 1-4 4-4 7a5 5 0 0 0 10 0c0-5-3-6-5-7z"/></svg></span> Simulación de propagación</span>
+          <span class="badge-experimental">Experimental</span>
+          <span class="tool-experimental-chevron">▾</span>
+        </button>
+        <div class="tool-experimental-body">
+          <div class="legend-hint" style="margin-top:6px;">Pulsa "Colocar origen" y luego haz clic en el mapa donde se inició el incendio. Arrastra el control para recorrer la previsión de viento de 24h.</div>
+          <div class="btn-row" style="margin-top:8px;">
+            <button id="fire-spread-place">Colocar origen</button>
+            <button id="fire-spread-clear">Borrar</button>
+          </div>
+          <div id="fire-spread-slider-row" class="fire-spread-slider-row" style="display:none;">
+            <input type="range" id="fire-spread-slider" min="0" max="23" step="1" value="0" />
+            <span id="fire-spread-hour-label" class="fire-spread-hour-label">+1h</span>
+          </div>
+          <div id="fire-spread-info" class="fire-spread-info"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- Alertas ---------- -->
+    <div class="panel-section">
+      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span> Alertas</div>
+
+      <div class="settings-row">
+        <span class="settings-row-label">
+          <span class="settings-row-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="10" r="3"/><path d="M12 21s7-6.5 7-11a7 7 0 1 0-14 0c0 4.5 7 11 7 11z"/></svg></span>
+          <span class="settings-row-text">
+            Alertas de proximidad
+            <span class="badge-experimental" style="margin-top:3px;">Experimental</span>
+            <span class="settings-row-hint">Te avisa si tu ubicación entra en la zona de propagación prevista de un incendio activo, o si surge un nuevo incendio crítico. Requiere permiso de ubicación y notificaciones - solo funciona con esta pestaña abierta (sin cuenta, sin notificaciones push reales).</span>
+          </span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="location-alerts-toggle" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+      <div id="location-alerts-status" class="legend-hint" style="margin-top:8px;"></div>
+    </div>
+
+    <!-- ---------- Datos ---------- -->
+    <div class="panel-section">
+      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></span> Datos</div>
+      <div class="btn-row">
+        <button id="reload">Recargar mapa</button>
+      </div>
+      <div id="status"></div>
+      <div id="stale-data-warning" class="stale-data-warning" style="display:none;"></div>
+    </div>
+
+    <div class="panel-section">
+      <a href="/sources.html" class="status-page-link">&rarr; Ver todas las fuentes</a>
+    </div>
+  </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/hull.js@1.0.6/dist/hull.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

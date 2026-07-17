@@ -1,0 +1,176 @@
+/* ==========================================================================
+   Wildfire Monitor Spain — shared design tokens + top navigation
+   Single source of truth for the dark glass theme used by index.html,
+   status.html and sources.html. Reconciled from what used to be two
+   independently-drifting :root blocks (index.html's, which was the more
+   complete/mature set, and status.html's, whose --ok/--degraded/--disrupted/
+   --skipped semantic colors now live here too since sources.html needs them
+   as well).
+   ========================================================================== */
+
+:root {
+  /* Page background - solid, used by full-page layouts (status.html, sources.html) */
+  --bg-page: #0e1015;
+
+  /* Floating glass surfaces - map panel, sidebar, popups (translucent, blurred) */
+  --bg-panel: rgba(17, 19, 24, 0.86);
+
+  /* Solid elevated surfaces - cards, rows, inputs, buttons, table containers */
+  --bg-elevated: #1b1e25;
+  --bg-elevated-hover: #23272f;
+
+  --border-soft: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  --text-primary: #eef0f3;
+  --text-secondary: #9aa0ab;
+  --text-muted: #6b7280;
+
+  --accent: #ff6a3d;
+  --accent-dim: rgba(255, 106, 61, 0.35);
+
+  --recent: hsl(0, 90%, 55%);
+  --oldest: hsl(50, 90%, 55%);
+
+  /* Health/status semantics - shared by status.html's day grid and
+     sources.html's status badges */
+  --ok: #4ade80;
+  --degraded: #facc15;
+  --disrupted: #f87171;
+  --skipped: #52525b;
+
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+}
+
+/* ---------- Light theme override (opt-in via the header toggle) ----------
+   Same token names, so every component that already reads var(--x) adapts
+   automatically - no component-level light/dark branching needed. Accent
+   and the risk/status semantic colors (defined elsewhere as fixed hex, not
+   tokens) stay IDENTICAL across themes on purpose - those meanings must not
+   shift with the theme. */
+:root[data-theme="light"] {
+  --bg-page: #f4f5f7;
+  --bg-panel: rgba(255, 255, 255, 0.88);
+  --bg-elevated: #ffffff;
+  --bg-elevated-hover: #eef0f3;
+
+  --border-soft: rgba(15, 18, 25, 0.09);
+  --border-strong: rgba(15, 18, 25, 0.18);
+
+  --text-primary: #14161a;
+  --text-secondary: #52565f;
+  --text-muted: #7b7f8a;
+
+  /* Same accent hue, slightly deeper for AA contrast against white/light
+     surfaces (the dark-mode #ff6a3d is a hair too light on white). */
+  --accent: #e5551f;
+  --accent-dim: rgba(229, 85, 31, 0.16);
+
+  --recent: hsl(0, 80%, 50%);
+  --oldest: hsl(45, 85%, 45%);
+}
+
+/* ---------- Top tab bar (shared across all three pages) ---------- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 16px;
+  background: var(--bg-page);
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-ui);
+}
+.topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 18px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+/* Neutral by default - only animates/turns accent-colored when JS confirms
+   there's at least one active (not cooling/archived) incident right now, so
+   a pulsing red dot actually means something instead of always pulsing. */
+.topbar-brand .pulse, .panel-header .pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+.topbar-brand .pulse.is-active, .panel-header .pulse.is-active {
+  background: var(--accent);
+  box-shadow: 0 0 0 0 var(--accent-dim);
+  animation: topbar-pulse 2s infinite;
+}
+@keyframes topbar-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--accent-dim); }
+  70%  { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.topbar-tabs {
+  display: flex;
+  gap: 2px;
+}
+.topbar-tab {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.topbar-tab:hover {
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+}
+.topbar-tab.active {
+  color: var(--text-primary);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.theme-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.theme-toggle:hover { border-color: var(--border-strong); color: var(--text-primary); }
+
+/* When the topbar sits above the full-bleed map, the page below needs its
+   height reduced so the map area still fills the remaining viewport, and the
+   floating sidebar/panel (position: absolute) need a positioned ancestor
+   scoped to that area only - otherwise their "top: 14px" would sit under the
+   topbar instead of just below it. */
+body.has-topbar-map {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+body.has-topbar-map #map-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+body.has-topbar-map #map { position: absolute; inset: 0; }
