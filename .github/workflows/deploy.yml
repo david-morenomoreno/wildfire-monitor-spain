@@ -22,15 +22,16 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf "%s" "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" | sed 's/\r$//' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null
           printf "%s %s\n" "${{ secrets.VPS_HOST }}" "${{ secrets.VPS_HOST_KEY }}" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy on server
         shell: bash
         run: |
-          ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" << 'EOF'
+          ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" << 'EOF'
             set -e
             cd /opt/wildfire-monitor-spain
             PREVIOUS_COMMIT=$(git rev-parse HEAD)
