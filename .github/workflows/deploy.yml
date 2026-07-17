@@ -1,0 +1,56 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf "%s" "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf "%s %s\n" "${{ secrets.VPS_HOST }}" "${{ secrets.VPS_HOST_KEY }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy on server
+        shell: bash
+        run: |
+          ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" << 'EOF'
+            set -e
+            cd /opt/wildfire-monitor-spain
+            PREVIOUS_COMMIT=$(git rev-parse HEAD)
+            git fetch --all --prune
+            git reset --hard origin/main
+
+            if ! docker compose up -d --build; then
+              echo "Deployment failed, rolling back to ${PREVIOUS_COMMIT}"
+              git reset --hard "${PREVIOUS_COMMIT}"
+              docker compose up -d --build
+              exit 1
+            fi
+
+            sleep 5
+            RUNNING=$(docker compose ps --status running --format '{{.Service}}' | sort | tr '\n' ',')
+            if [[ "$RUNNING" != "backend,db,frontend," ]]; then
+              echo "Expected backend,db,frontend running; got: ${RUNNING}"
+              docker compose logs --tail=200
+              exit 1
+            fi
+
+            docker image prune -f
+          EOF
