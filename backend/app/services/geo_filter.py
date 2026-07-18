@@ -51,9 +51,11 @@ not as the primary mechanism.
 
 import json
 import logging
+import math
 from functools import reduce
 from pathlib import Path
 
+import httpx
 from shapely.geometry import Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
@@ -109,3 +111,103 @@ def is_in_spain(latitude: float, longitude: float) -> bool:
     """
     spain_shape = _load_spain_shape()
     return spain_shape.contains(Point(longitude, latitude))
+
+
+# --- Water-body false-positive filtering -----------------------------------
+#
+# WHY THIS EXISTS: VIIRS/MODIS thermal-anomaly detections can trigger over
+# open water (sun glint off waves, offshore platforms/ships, sensor noise) -
+# these are real satellite outputs, not ingestion bugs, but they're physically
+# impossible as wildfires and show up as isolated stray points inside lakes,
+# reservoirs, or the sea. They also cause the frontend's dashed
+# incident-connector lines (drawIncidentConnectors in app.js) to draw a
+# nonsensical "fire jumped into the middle of the ocean" link, since that
+# feature assumes an isolated 1-2 point group is a real spotted ember, not a
+# sensor artifact.
+#
+# Reuses the same EEA Corine Land Cover ArcGIS `query` service already proven
+# live in fire_spread.py's fetch_water_rings (water body codes 511/512/521/
+# 522/523 = rivers/lakes/lagoons/estuaries/sea). That function fetches a small
+# radius around ONE point per fire-spread prediction; filtering every ingested
+# detection needs a different shape - confirmed live (2026-07-19) that
+# querying geometry for the FULL firms_bbox in one request 500s (the service
+# can't return that much water geometry - e.g. the entire Mediterranean coast
+# - in a single response), while a 1x1 degree tile reliably returns in under a
+# second. So water geometry is fetched and cached per 1-degree tile, lazily,
+# the first time a detection lands in that tile - cheap since Spain only
+# spans roughly 8x9 tiles and water geography never changes within a process
+# lifetime.
+CORINE_QUERY_URL = "https://image.discomap.eea.europa.eu/arcgis/rest/services/Corine/CLC2018_WM/MapServer/0/query"
+WATER_CLC_CODES = "'511','512','521','522','523'"
+WATER_TILE_DEG = 1.0
+
+_water_tile_cache: dict[tuple[int, int], BaseGeometry | None] = {}
+
+
+def _water_tile_key(latitude: float, longitude: float) -> tuple[int, int]:
+    return (math.floor(latitude / WATER_TILE_DEG), math.floor(longitude / WATER_TILE_DEG))
+
+
+def _fetch_water_tile(tile_lat: int, tile_lon: int) -> BaseGeometry | None:
+    lat0, lon0 = tile_lat * WATER_TILE_DEG, tile_lon * WATER_TILE_DEG
+    try:
+        response = httpx.get(
+            CORINE_QUERY_URL,
+            params={
+                "geometry": f"{lon0},{lat0},{lon0 + WATER_TILE_DEG},{lat0 + WATER_TILE_DEG}",
+                "geometryType": "esriGeometryEnvelope",
+                "spatialRel": "esriSpatialRelIntersects",
+                "where": f"Code_18 IN ({WATER_CLC_CODES})",
+                "outFields": "Code_18",
+                "returnGeometry": "true",
+                "inSR": 4326,
+                "outSR": 4326,
+                "f": "json",
+            },
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        features = response.json().get("features", [])
+    except Exception:
+        logger.warning(
+            "Water tile fetch failed for tile (%s, %s) - treating as no water data for this tile",
+            tile_lat, tile_lon, exc_info=True,
+        )
+        return None
+
+    polys = []
+    for feature in features:
+        for ring in feature.get("geometry", {}).get("rings", []):
+            if len(ring) < 3:
+                continue
+            # ArcGIS gives [lon, lat] pairs, already matching shapely's (x, y).
+            poly = Polygon(ring)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty:
+                continue
+            if poly.geom_type == "GeometryCollection":
+                polys.extend(g for g in poly.geoms if g.geom_type in ("Polygon", "MultiPolygon") and not g.is_empty)
+            elif poly.geom_type in ("Polygon", "MultiPolygon"):
+                polys.append(poly)
+    if not polys:
+        return None
+    return reduce(lambda a, b: a.union(b), polys)
+
+
+def is_over_water(latitude: float, longitude: float) -> bool:
+    """
+    True if (latitude, longitude) falls inside a real water body (river,
+    lake, reservoir, lagoon, or sea) per Corine Land Cover - i.e. this
+    detection is very likely a satellite false positive, not a real fire.
+    Fails open (returns False - keep the point) if the tile fetch itself
+    fails, since silently dropping real detections on a flaky network call
+    would be worse than occasionally letting one bad point through.
+    """
+    key = _water_tile_key(latitude, longitude)
+    if key not in _water_tile_cache:
+        _water_tile_cache[key] = _fetch_water_tile(*key)
+    shape = _water_tile_cache[key]
+    if shape is None:
+        return False
+    return shape.contains(Point(longitude, latitude))

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app import state
 from app.config import settings
 from app.models import FireDetection
-from app.services.geo_filter import is_in_spain
+from app.services.geo_filter import is_in_spain, is_over_water
 from app.services.health import record_check
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,7 @@ def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = Non
     day_range = day_range or settings.firms_day_range
     count = 0
     skipped_outside_spain = 0
+    skipped_over_water = 0
     for source in settings.firms_sources:
         rows = fetch_firms_rows(source, day_range, end_date)
         for row in rows:
@@ -89,6 +90,17 @@ def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = Non
             # stored, rather than only hiding them in the UI afterwards.
             if not is_in_spain(latitude, longitude):
                 skipped_outside_spain += 1
+                continue
+
+            # VIIRS/MODIS thermal anomalies can trigger over open water (sun
+            # glint, offshore platforms/ships, sensor noise) - these are real
+            # satellite outputs, not an ingestion bug, but they're physically
+            # impossible as wildfires and show up as isolated stray points
+            # inside lakes/reservoirs/the sea (and the nonsensical "fire
+            # jumped into the ocean" dashed connector lines that come with
+            # them - see geo_filter.py's is_over_water docstring).
+            if is_over_water(latitude, longitude):
+                skipped_over_water += 1
                 continue
 
             # MODIS CSVs use "brightness"/"bright_t31"; VIIRS uses "bright_ti4"/"bright_ti5".
@@ -121,5 +133,7 @@ def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = Non
             "Skipped %d FIRMS row(s) inside firms_bbox but outside Spain's real border",
             skipped_outside_spain,
         )
+    if skipped_over_water:
+        logger.info("Skipped %d FIRMS row(s) landing inside a real water body (likely sensor false positive)", skipped_over_water)
     db.commit()
     return count
