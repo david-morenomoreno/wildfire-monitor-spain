@@ -18,20 +18,26 @@ logger = logging.getLogger(__name__)
 FIRMS_BASE_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
 
 
-def build_firms_url(source: str, day_range: int) -> str:
+def build_firms_url(source: str, day_range: int, end_date: str | None = None) -> str:
     if not settings.firms_map_key:
         raise RuntimeError(
             "FIRMS_MAP_KEY is not set. Request a free key at "
             "https://firms.modaps.eosdis.nasa.gov/api/"
         )
-    return (
+    url = (
         f"{FIRMS_BASE_URL}/{settings.firms_map_key}/{source}"
         f"/{settings.firms_bbox}/{day_range}"
     )
+    # FIRMS' area/csv endpoint caps day_range at 10; passing an end_date
+    # (YYYY-MM-DD) lets a caller walk further back in 10-day windows to
+    # backfill a longer history - see backend/scripts/backfill_history.py.
+    if end_date:
+        url = f"{url}/{end_date}"
+    return url
 
 
-def fetch_firms_rows(source: str, day_range: int) -> list[dict]:
-    url = build_firms_url(source, day_range)
+def fetch_firms_rows(source: str, day_range: int, end_date: str | None = None) -> list[dict]:
+    url = build_firms_url(source, day_range, end_date)
     response = httpx.get(url, timeout=30.0)
     response.raise_for_status()
     reader = csv.DictReader(io.StringIO(response.text))
@@ -44,14 +50,14 @@ def _parse_acquired_at(row: dict) -> datetime:
     return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H%M")
 
 
-def ingest_firms(db: Session, day_range: int | None = None) -> int:
+def ingest_firms(db: Session, day_range: int | None = None, end_date: str | None = None) -> int:
     """
     Fetch current FIRMS detections for Spain across all configured satellite
     sources and upsert them. Returns row count processed (across all sources).
     """
     state.mark_attempt("firms")
     try:
-        count = _ingest_firms(db, day_range)
+        count = _ingest_firms(db, day_range, end_date)
     except Exception as exc:
         record_check(db, "firms", "disrupted", str(exc))
         raise
@@ -59,12 +65,12 @@ def ingest_firms(db: Session, day_range: int | None = None) -> int:
     return count
 
 
-def _ingest_firms(db: Session, day_range: int | None) -> int:
+def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = None) -> int:
     day_range = day_range or settings.firms_day_range
     count = 0
     skipped_outside_spain = 0
     for source in settings.firms_sources:
-        rows = fetch_firms_rows(source, day_range)
+        rows = fetch_firms_rows(source, day_range, end_date)
         for row in rows:
             try:
                 latitude = float(row["latitude"])
