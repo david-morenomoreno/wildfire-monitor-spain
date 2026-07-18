@@ -75,20 +75,31 @@ function setStatus(text) {
   statusEl.textContent = text;
 }
 
-// Red for very recent, yellow by RECENCY_FIXED_SPAN_HOURS old - a FIXED
-// absolute scale (matches how other fire-monitoring maps, e.g. Bseed WATCH,
-// color detections: <12h/<24h/<48h/<72h buckets), not relative to whatever
-// date-range window happens to be selected. The earlier relative version
-// meant an 18h-old detection still looked deep red with "Last 7 days"
-// selected (18/168 ≈ 0.11) - recency should mean the same thing regardless
-// of how wide a window you're browsing.
-const RECENCY_FIXED_SPAN_HOURS = 72;
+// FIXED absolute age buckets (not relative to whatever date-range window
+// happens to be selected - an 18h-old detection should look the same whether
+// you're browsing "Last 24h" or "Last 7 days"). This now actually matches the
+// <12h/<24h/<48h/<72h discrete-bucket convention other fire-monitoring maps
+// use (e.g. Bseed WATCH/Pyrofire) that this comment already referenced before
+// this change - the previous version only ever interpolated red-to-yellow
+// across the full 72h span, which (a) never reached anything past yellow, so
+// "72h old" and "6h old" were both indistinguishable shades of orange-red in
+// the middle of the range, and (b) couldn't represent >72h detections as
+// anything other than that same washed-out yellow. Four visually distinct
+// hues instead of one continuous gradient make both the recent/stale
+// contrast AND a fire's spread direction (red edge = where it's currently
+// active) easier to read at a glance - matching RECENCY_LEGEND below.
+const RECENCY_LEGEND = [
+  { maxHours: 12, color: "#ef4444", label: "< 12 h" },
+  { maxHours: 24, color: "#f97316", label: "12-24 h" },
+  { maxHours: 48, color: "#eab308", label: "24-48 h" },
+  { maxHours: 72, color: "#3b82f6", label: "48-72 h" },
+];
+const RECENCY_STALE_COLOR = "#6b7280"; // older than the oldest bucket (72h+) - clearly "cold", not another shade of the active-fire palette
 
 function recencyColor(acquiredAtIso) {
   const ageHours = (Date.now() - new Date(acquiredAtIso).getTime()) / 3600000;
-  const fraction = Math.max(0, Math.min(1, ageHours / RECENCY_FIXED_SPAN_HOURS));
-  const hue = fraction * 50; // 0 = red, 50 = yellow
-  return `hsl(${hue}, 90%, 50%)`;
+  const bucket = RECENCY_LEGEND.find((b) => ageHours <= b.maxHours);
+  return bucket ? bucket.color : RECENCY_STALE_COLOR;
 }
 
 // Groups nearby point detections into a grid cell purely to cap how many SVG
@@ -459,44 +470,120 @@ function areaSummaryHtml(growth) {
   );
 }
 
-// Small inline sparkline: cumulative detection count over the last 48h,
-// bucketed into 4h steps - a quick "is this accelerating or leveling off"
-// glance without needing a full chart library for one line.
-const SPARKLINE_WINDOW_HOURS = 48;
-const SPARKLINE_BUCKET_HOURS = 4;
-const SPARKLINE_WIDTH = 280;
-const SPARKLINE_HEIGHT = 40;
+// Daily activity chart: new detections PER CALENDAR DAY across the
+// incident's FULL lifetime (first detection -> now), not a fixed 48h/4h
+// window - a fire active 10 days showed almost nothing in the old 48h
+// sparkline, which made a slow-burning multi-week incident look brand new.
+// Bucketing by day (not hour) directly answers "how did this grow day by
+// day" rather than an hour-granularity view nobody asked for.
+//
+// Built from the incident's own timeline events (event_type "detection"),
+// which are already fetched in full (unfiltered by the map's date-range
+// selector - see showIncidentDetail) for the chronology list - reusing that
+// same data here avoids a second network round-trip.
+const DAILY_CHART_WIDTH = 280;
+const DAILY_CHART_HEIGHT = 60;
+const DAILY_CHART_MAX_BARS = 21; // ~3 weeks before bars get too thin to read; INCIDENTS_WINDOW_HOURS caps real incidents at 30 days anyway
 
-function sparklineHtml(timestamps) {
-  if (!timestamps || timestamps.length < 2) return "";
-  const numBuckets = SPARKLINE_WINDOW_HOURS / SPARKLINE_BUCKET_HOURS;
-  const nowMs = Date.now();
-  const windowStartMs = nowMs - SPARKLINE_WINDOW_HOURS * 3600000;
-  const sorted = timestamps.map((t) => new Date(t).getTime()).sort((a, b) => a - b);
+// The current backend templates (services/incidents.py) both start a
+// "detection" event's TITLE with the count - "N detección(es) nueva(s)" or
+// "N detección(es) en el cluster inicial." A handful of older incidents in
+// the DB predate that copy (confirmed live: incident 234 has an event titled
+// plain "First detection", with the count only in its DESCRIPTION -
+// "122 detection(s) in the initial cluster.") - checking description too
+// means those older rows still count instead of silently vanishing from the
+// very first day of the chart.
+function detectionEventCount(event) {
+  const fromTitle = /^(\d+)/.exec(event.title || "");
+  if (fromTitle) return Number(fromTitle[1]);
+  const fromDescription = /^(\d+)/.exec(event.description || "");
+  return fromDescription ? Number(fromDescription[1]) : 0;
+}
 
-  // Cumulative count as of each bucket boundary, counting everything up to
-  // that point (including detections from before the 48h window) so the
-  // line reflects the fire's real running total, not just this window's slice.
-  const counts = [];
-  for (let i = 0; i <= numBuckets; i++) {
-    const boundaryMs = windowStartMs + i * SPARKLINE_BUCKET_HOURS * 3600000;
-    counts.push(sorted.filter((t) => t <= boundaryMs).length);
+function dailyDetectionCounts(events) {
+  const perDay = new Map(); // "YYYY-MM-DD" -> count
+  events
+    .filter((e) => e.event_type === "detection")
+    .forEach((e) => {
+      const day = e.occurred_at.slice(0, 10);
+      perDay.set(day, (perDay.get(day) || 0) + detectionEventCount(e));
+    });
+  if (perDay.size === 0) return [];
+
+  // Fill in zero-count days between the first and last so gaps in activity
+  // are visible as gaps, not silently skipped/compressed out of the axis.
+  const days = Array.from(perDay.keys()).sort();
+  const first = new Date(days[0] + "T00:00:00Z");
+  const last = new Date(days[days.length - 1] + "T00:00:00Z");
+  const series = [];
+  for (let d = new Date(first); d <= last; d.setUTCDate(d.getUTCDate() + 1)) {
+    const key = d.toISOString().slice(0, 10);
+    series.push({ day: key, count: perDay.get(key) || 0 });
   }
-  const maxCount = Math.max(...counts, 1);
-  const points = counts
-    .map((count, i) => {
-      const x = (i / numBuckets) * SPARKLINE_WIDTH;
-      const y = SPARKLINE_HEIGHT - (count / maxCount) * (SPARKLINE_HEIGHT - 4) - 2;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
+  // Long-running incidents (up to INCIDENTS_WINDOW_HOURS = 30 days) would
+  // otherwise render unreadably thin bars - keep only the most recent
+  // DAILY_CHART_MAX_BARS days rather than silently mis-scaling every bar.
+  return series.slice(-DAILY_CHART_MAX_BARS);
+}
+
+function dayLabel(dayKey) {
+  return new Date(dayKey + "T00:00:00Z").toLocaleDateString("es-ES", { day: "numeric", month: "short" });
+}
+
+// Reserved headroom above the bars for the peak day's direct value label -
+// selective (only the peak, not every bar) per the app's dataviz conventions.
+const DAILY_CHART_LABEL_HEADROOM = 16;
+const DAILY_CHART_BAR_AREA = DAILY_CHART_HEIGHT - DAILY_CHART_LABEL_HEADROOM;
+
+function dailyActivityChartHtml(events) {
+  const series = dailyDetectionCounts(events);
+  if (series.length < 2) return "";
+
+  const maxCount = Math.max(...series.map((d) => d.count), 1);
+  const peakIndex = series.reduce((best, d, i) => (d.count > series[best].count ? i : best), 0);
+  const barGap = 3;
+  const barWidth = DAILY_CHART_WIDTH / series.length - barGap;
+  const todayKey = new Date().toISOString().slice(0, 10);
+
+  const bars = series
+    .map((d, i) => {
+      // Minimum visible height even for a 0-count day - a bar that's
+      // literally invisible reads as "no data" (a rendering gap), not "zero
+      // activity that day", which is itself meaningful information here.
+      const barHeight = Math.max(3, (d.count / maxCount) * DAILY_CHART_BAR_AREA);
+      const x = i * (barWidth + barGap);
+      const y = DAILY_CHART_HEIGHT - barHeight;
+      // Today's bar (or the most recent day with data) stays full-strength;
+      // earlier days step down in opacity - the same "recent = stronger
+      // signal" language the map's own recency colors already use, applied
+      // here as intensity instead of hue since this is one series, not a
+      // category per bar.
+      const isLatest = d.day === todayKey || i === series.length - 1;
+      const opacity = isLatest ? 1 : 0.45 + 0.4 * (i / (series.length - 1));
+      const peakLabel =
+        i === peakIndex && d.count > 0
+          ? `<text x="${(x + barWidth / 2).toFixed(1)}" y="${Math.max(10, y - 5).toFixed(1)}" text-anchor="middle" class="daily-chart-peak-label">${d.count}</text>`
+          : "";
+      return (
+        `<rect class="daily-chart-bar" data-label="${dayLabel(d.day)}" data-count="${d.count}" ` +
+        `x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}" ` +
+        `fill="var(--accent)" opacity="${opacity.toFixed(2)}" rx="2.5"/>` +
+        peakLabel
+      );
     })
-    .join(" ");
+    .join("");
+
+  const firstLabel = dayLabel(series[0].day);
+  const lastLabel = dayLabel(series[series.length - 1].day);
 
   return (
     `<div class="sparkline-wrap">` +
-    `<div class="sparkline-label">Detecciones · últimas 48h</div>` +
-    `<svg viewBox="0 0 ${SPARKLINE_WIDTH} ${SPARKLINE_HEIGHT}" class="sparkline-svg" preserveAspectRatio="none">` +
-    `<polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>` +
+    `<div class="sparkline-label">Detecciones por día</div>` +
+    `<svg viewBox="0 0 ${DAILY_CHART_WIDTH} ${DAILY_CHART_HEIGHT}" class="sparkline-svg daily-chart-svg" preserveAspectRatio="none">` +
+    `<line x1="0" y1="${DAILY_CHART_HEIGHT - 0.5}" x2="${DAILY_CHART_WIDTH}" y2="${DAILY_CHART_HEIGHT - 0.5}" stroke="var(--border-soft)" stroke-width="1"/>` +
+    bars +
     `</svg>` +
+    `<div class="recency-labels"><span>${firstLabel}</span><span>${lastLabel}</span></div>` +
     `</div>`
   );
 }
@@ -892,9 +979,10 @@ function ensureLinearGradient(svgRoot, id, stops) {
   return true;
 }
 
-// Red (latest detection in this group) -> yellow (earliest), matching the
-// same convention as the legend and every other recency color in the app
-// (red = most recent). Scaled to the group's OWN date range rather than the
+// Red (latest detection in this group) -> blue (earliest), matching the same
+// RECENCY_LEGEND endpoints the dots use (red = most recent, blue = ~72h old)
+// so the polygon backdrop and the dots on top of it read as one consistent
+// color language. Scaled to the group's OWN date range rather than the
 // display window - so a fire spanning just a couple of days still shows
 // visible contrast, not near-identical hues.
 function regionGradientStops(group) {
@@ -902,12 +990,12 @@ function regionGradientStops(group) {
   const min = Math.min(...times);
   const max = Math.max(...times);
   if (min === max) {
-    const solid = `hsl(25, 90%, 50%)`; // single-timestamp group: flat mid-tone
+    const solid = RECENCY_LEGEND[1].color; // single-timestamp group: flat mid-tone
     return [[0, solid], [100, solid]];
   }
   return [
-    [0, "hsl(0, 90%, 50%)"], // newest = red
-    [100, "hsl(50, 90%, 50%)"], // oldest = yellow
+    [0, RECENCY_LEGEND[0].color], // newest = red
+    [100, RECENCY_LEGEND[RECENCY_LEGEND.length - 1].color], // oldest (within the group's own span) = blue
   ];
 }
 
@@ -970,18 +1058,13 @@ function renderMap() {
   const filteredOutPoints = new Set();
 
   proximityGroups.forEach((group, idx) => {
-    if (group.length < 3) return; // need at least a triangle for a meaningful hull
-
-    // Identity (name, timeline, matched incident, filters) is decided once
-    // for the WHOLE chain-linked group - a fire that jumped a real gap is
-    // still one incident. Only the polygon SHAPE is re-clustered below.
-    const earliest = group.reduce((oldest, f) =>
-      new Date(f.acquired_at) < new Date(oldest.acquired_at) ? f : oldest
-    );
-    const mostRecent = group.reduce(
-      (latest, f) => (new Date(f.acquired_at) > new Date(latest) ? f.acquired_at : latest),
-      group[0].acquired_at
-    );
+    // Filtering must run BEFORE the <3-points hull bail-out below - a fire
+    // with only 1-2 detections (common for a lower detection_count incident)
+    // never reaches the hull-building code, so checking filters only after
+    // that bail-out meant those small incidents' dots always rendered
+    // regardless of the sidebar's risk/status checkboxes - confirmed live:
+    // "Solo crítico + activo" narrowed the sidebar list correctly but left
+    // plenty of non-matching dots showing on the map.
     const groupLat = group.reduce((sum, f) => sum + f.latitude, 0) / group.length;
     const groupLon = group.reduce((sum, f) => sum + f.longitude, 0) / group.length;
     const matchedIncident = findMatchingIncident(groupLat, groupLon);
@@ -995,6 +1078,19 @@ function renderMap() {
       group.forEach((f) => filteredOutPoints.add(f));
       return;
     }
+
+    if (group.length < 3) return; // need at least a triangle for a meaningful hull
+
+    // Identity (name, timeline, matched incident, filters) is decided once
+    // for the WHOLE chain-linked group - a fire that jumped a real gap is
+    // still one incident. Only the polygon SHAPE is re-clustered below.
+    const earliest = group.reduce((oldest, f) =>
+      new Date(f.acquired_at) < new Date(oldest.acquired_at) ? f : oldest
+    );
+    const mostRecent = group.reduce(
+      (latest, f) => (new Date(f.acquired_at) > new Date(latest) ? f.acquired_at : latest),
+      group[0].acquired_at
+    );
     group.forEach((f) => pointsInHullGroups.add(f));
 
     // Burnt-area estimate + growth trend computed once for the WHOLE incident
@@ -1085,11 +1181,21 @@ function renderMap() {
       });
       halo.addTo(markersLayer);
 
+      // Kept deliberately faint (vs. the old 0.48/0.62) - at full-zoom this
+      // fill sits directly underneath the individual recency-colored dots
+      // (see INDIVIDUAL_DOT_ZOOM below), and since both use the SAME red-to-
+      // yellow hue scale, a strong fill made hot (red) dots blend into an
+      // already-red backdrop - confirmed live: a dense recent cluster read as
+      // one solid orange blob with no visible hot/cool contrast. A faint tint
+      // still communicates "this is the fire's extent" without competing with
+      // the dots for the same color signal - matching how Copernicus's own
+      // EMSR grading maps use a flat, muted burnt-area fill with small vivid
+      // point markers on top, rather than color-coding the fill itself.
       const polygon = L.polygon(hull, {
         color: HOTSPOT_STROKE,
         weight: strokeWeight,
         fillColor: "#888", // placeholder until the gradient is attached below
-        fillOpacity: lowZoom ? 0.62 : 0.48,
+        fillOpacity: lowZoom ? 0.32 : 0.22,
       });
       // Popup/geocode reflects the whole incident's stats (earliest/most
       // recent/matched incident across the full chain-linked group), not
@@ -1206,9 +1312,18 @@ const RISK_SHAPE_SVG = {
     '<svg viewBox="0 0 14 14" width="9" height="9" class="icon"><path d="M4.5 1h5L13 4.5v5L9.5 13h-5L1 9.5v-5z" fill="currentColor"/></svg>',
 };
 
-function riskBadgeHtml(riskLevel) {
+// risk_level is the fire's PEAK severity (backend's _severity() score never
+// decays - see services/incidents.py) - it does NOT reflect whether the fire
+// is still active. Without this, a long-cooling incident that was critical
+// at its worst still shows a solid red "CRÍTICO" badge indefinitely, reading
+// as an ongoing emergency rather than history. Muting the badge (dim +
+// grayscale) once status isn't "active" keeps the information (this WAS a
+// critical fire) without it competing visually with genuinely active ones.
+function riskBadgeHtml(riskLevel, status) {
   const shape = RISK_SHAPE_SVG[riskLevel] || "";
-  return `<span class="risk-badge risk-${riskLevel}">${shape} ${RISK_LABELS[riskLevel] || riskLevel}</span>`;
+  const inactiveClass = status && status !== "active" ? " risk-badge-inactive" : "";
+  const title = status && status !== "active" ? ` title="Gravedad máxima alcanzada - el incidente ya no está activo"` : "";
+  return `<span class="risk-badge risk-${riskLevel}${inactiveClass}"${title}>${shape} ${RISK_LABELS[riskLevel] || riskLevel}</span>`;
 }
 
 function relativeTime(iso) {
@@ -1219,16 +1334,33 @@ function relativeTime(iso) {
   return `hace ${Math.round(hours / 24)} d`;
 }
 
+// Same official-EFFIS-first, hull-estimate-fallback rule as the detail view
+// (showIncidentDetail) - kept as its own helper since the list card and the
+// detail card both need it. incidentEstimatesById is only populated by the
+// most recent renderMap() pass, so a brand-new incident (or one outside the
+// current map viewport/zoom) simply won't have a hectares figure yet here -
+// that's a one-refresh lag, not a bug, and it self-corrects on the next pass.
+function incidentAreaHa(incident) {
+  const growth = incidentEstimatesById.get(incident.id) || null;
+  if (incident.area_ha != null) return { areaHa: incident.area_ha, isOfficial: true };
+  if (growth && growth.areaHa >= 0.1) return { areaHa: growth.areaHa, isOfficial: false };
+  return null;
+}
+
 function incidentCardHtml(incident) {
   const name = incident.locality || `Foco sin nombre #${incident.id}`;
   const place = incident.province ? `${name} · ${incident.province}` : name;
+  const area = incidentAreaHa(incident);
+  const areaLine = area
+    ? `${ICONS.flame} ${Math.round(area.areaHa).toLocaleString()} ha${area.isOfficial ? "" : " (estimado)"} · `
+    : `${ICONS.flame} `;
   return (
     `<div class="incident-card-top">` +
     `<div class="incident-card-title">${place}</div>` +
-    `${riskBadgeHtml(incident.risk_level)}` +
+    `${riskBadgeHtml(incident.risk_level, incident.status)}` +
     `</div>` +
     `<div class="incident-card-meta">` +
-    `${ICONS.flame} ${incident.detection_count} detecci${incident.detection_count > 1 ? "ones" : "ón"} · ${STATUS_LABELS[incident.status] || incident.status}<br/>` +
+    `${areaLine}${incident.detection_count} detecci${incident.detection_count > 1 ? "ones" : "ón"} · ${STATUS_LABELS[incident.status] || incident.status}<br/>` +
     `${ICONS.clock} ${relativeTime(incident.last_detected_at)}` +
     `</div>`
   );
@@ -1364,15 +1496,99 @@ function timelineEventImageUrl(event) {
   return null;
 }
 
+// One icon per event_type (services/incidents.py, copernicus.py,
+// telegram.py, regional_incidents/sync.py) so the timeline is scannable by
+// shape/color, not just by reading every line of text - matches the same
+// "don't rely on a single visual channel" approach as the risk badges'
+// shapes (RISK_SHAPE_SVG).
+const EVENT_TYPE_ICON = {
+  detection: ICONS.flame,
+  status_change: ICONS.clock,
+  telegram_message: ICONS.send,
+  satellite_imagery: ICONS.camera,
+  regional_status: ICONS.shield,
+};
+
+// Consecutive same-day "detection" events (see dailyDetectionCounts' regex
+// note on why these titles are parseable) collapse into one summary line -
+// a fire with several rebuild passes a day previously showed as 4-5 nearly
+// identical "N detección(es) nueva(s)" rows in a row, drowning out the
+// milestone events (status changes, imagery, mentions) around them. The
+// very first event ("Primera detección") stays its own line always, since
+// it's the one detection event that's actually a distinct milestone.
+function groupTimelineEvents(events) {
+  const grouped = [];
+  events.forEach((event, i) => {
+    const isFirstDetection = i === 0 && event.event_type === "detection";
+    const day = (event.occurred_at || "").slice(0, 10);
+    const prev = grouped[grouped.length - 1];
+    if (
+      !isFirstDetection &&
+      event.event_type === "detection" &&
+      prev &&
+      prev.event_type === "detection" &&
+      !prev.isFirstDetection &&
+      prev.day === day
+    ) {
+      prev.detectionSum += detectionEventCount(event);
+      prev.title = `${prev.detectionSum} detección(es) nueva(s)`;
+      prev.occurred_at = event.occurred_at; // keep the latest timestamp in the merged range
+      return;
+    }
+    grouped.push({
+      ...event,
+      day,
+      isFirstDetection,
+      detectionSum: event.event_type === "detection" ? detectionEventCount(event) : 0,
+    });
+  });
+  return grouped;
+}
+
 function timelineItemHtml(event) {
-  const imageUrl = timelineEventImageUrl(event);
+  // Satellite scenes get their own carousel above the timeline (see
+  // satelliteCarouselHtml) - showing the same full-size image again inline
+  // here would just duplicate it and add scroll length for no new signal.
+  const imageUrl = event.event_type === "satellite_imagery" ? null : timelineEventImageUrl(event);
+  const icon = EVENT_TYPE_ICON[event.event_type] || "";
   return (
     `<div class="timeline-item">` +
-    `<span class="timeline-dot"></span>` +
+    `<span class="timeline-dot timeline-dot-${event.event_type || "default"}">${icon}</span>` +
     `<div class="timeline-time">${event.occurred_at}</div>` +
     `<div class="timeline-title">${event.title}</div>` +
     (event.description ? `<div class="timeline-desc">${event.description}</div>` : "") +
     (imageUrl ? `<img src="${imageUrl}" class="timeline-thumb" />` : "") +
+    `</div>`
+  );
+}
+
+// Horizontal, swipeable filmstrip of every Copernicus scene for this
+// incident, in chronological order - a direct visual "how did the burn scar
+// change over time" view, instead of scrolling through a mixed event list
+// where images are interleaved with unrelated detection/status/Telegram rows.
+function satelliteCarouselHtml(events) {
+  const scenes = events.filter((e) => e.event_type === "satellite_imagery");
+  if (scenes.length === 0) return "";
+
+  const slides = scenes
+    .map((event) => {
+      const imageUrl = timelineEventImageUrl(event);
+      if (!imageUrl) return "";
+      const cloudMatch = /\((\d+)% nubes\)/.exec(event.title || "");
+      const dateLabel = new Date(event.occurred_at).toLocaleDateString("es-ES", { day: "numeric", month: "short" });
+      return (
+        `<div class="satellite-slide">` +
+        `<img src="${imageUrl}" loading="lazy" />` +
+        `<div class="satellite-slide-caption">${dateLabel}${cloudMatch ? ` · ${cloudMatch[1]}% nubes` : ""}</div>` +
+        `</div>`
+      );
+    })
+    .join("");
+
+  return (
+    `<div class="satellite-carousel-wrap">` +
+    `<div class="satellite-carousel-label">${ICONS.camera} Evolución vía satélite (${scenes.length})</div>` +
+    `<div class="satellite-carousel">${slides}</div>` +
     `</div>`
   );
 }
@@ -1411,7 +1627,7 @@ async function showIncidentDetail(incident) {
     `<div class="incident-detail-title">${name}</div>` +
     (incident.province ? `<div class="incident-detail-sub">${incident.province}</div>` : "") +
     `<div class="incident-detail-badges">` +
-    `${riskBadgeHtml(incident.risk_level)}` +
+    `${riskBadgeHtml(incident.risk_level, incident.status)}` +
     `<span class="risk-badge" style="background:var(--bg-elevated); color:var(--text-secondary);">${STATUS_LABELS[incident.status] || incident.status}</span>` +
     (growth ? growthBadgeHtml(growth) : "") +
     `</div>` +
@@ -1422,8 +1638,15 @@ async function showIncidentDetail(incident) {
       ? `<div class="incident-metric"><div class="incident-metric-value">${Math.round(areaHa).toLocaleString()}</div><div class="incident-metric-label">Hectáreas${hasOfficialArea ? "" : " (estimado)"}</div></div>`
       : `<div class="incident-metric"><div class="incident-metric-value" style="font-size:15px;">${relativeTime(incident.last_detected_at)}</div><div class="incident-metric-label">Última actualización</div></div>`) +
     `</div>` +
-    (growth ? sparklineHtml(growth.timestamps) : "") +
+    // Placeholder - filled in once the full-history timeline loads below.
+    // The old version rendered this synchronously from `growth.timestamps`
+    // (only whatever's currently loaded on the map under the active
+    // date-range filter), which is why a 10-day-old incident's chart looked
+    // almost empty when the map was showing "last 48h" - this now always
+    // reflects the incident's REAL full history regardless of that filter.
+    `<div id="daily-chart-slot"></div>` +
     `</div>` +
+    `<div id="satellite-carousel-slot"></div>` +
     `<button class="timeline-toggle" id="timeline-toggle">` +
     `<span>Ver cronología</span><span class="timeline-toggle-chevron">▾</span>` +
     `</button>` +
@@ -1443,9 +1666,13 @@ async function showIncidentDetail(incident) {
     // map/sidebar list itself, just not a single incident's own detail.
     const res = await fetch(`${apiBaseUrl}/api/incidents/${incident.id}/timeline`);
     const events = await res.json();
+
+    document.getElementById("daily-chart-slot").innerHTML = dailyActivityChartHtml(events);
+    document.getElementById("satellite-carousel-slot").innerHTML = satelliteCarouselHtml(events);
+
     const list = document.getElementById("timeline-list");
     list.innerHTML = events.length
-      ? events.map(timelineItemHtml).join("")
+      ? groupTimelineEvents(events).map(timelineItemHtml).join("")
       : `<div class="sidebar-empty">Sin eventos registrados para este incidente.</div>`;
   } catch (err) {
     document.getElementById("timeline-list").innerHTML =
@@ -1857,21 +2084,56 @@ document.getElementById("quick-filter-critical").addEventListener("click", (e) =
 // satellite previews) - event-delegated on document since these images are
 // inserted dynamically via innerHTML long after page load, so a listener
 // bound directly to each <img> at creation time would miss ones added later.
-function openLightbox(src) {
+//
+// `images` is an array of {src, caption} - when it has more than one entry
+// (the satellite carousel's own scenes, in order - see the click handler
+// below), prev/next arrows and arrow-key navigation let you step through the
+// whole sequence without closing and reopening the lightbox each time, which
+// is the point of viewing them "in the middle, zoomed in" in the first
+// place rather than the small inline filmstrip.
+function openLightbox(images, startIndex) {
+  let index = startIndex || 0;
   const overlay = document.createElement("div");
   overlay.id = "lightbox-overlay";
-  overlay.innerHTML = `<button class="lightbox-close" aria-label="Close">&times;</button><img src="${src}" />`;
-  overlay.addEventListener("click", () => overlay.remove());
-  document.addEventListener(
-    "keydown",
-    function onEscape(e) {
-      if (e.key === "Escape") {
-        overlay.remove();
-        document.removeEventListener("keydown", onEscape);
-      }
-    },
-    { once: false }
-  );
+
+  function render() {
+    const { src, caption } = images[index];
+    const showNav = images.length > 1;
+    overlay.innerHTML =
+      `<button class="lightbox-close" aria-label="Cerrar">&times;</button>` +
+      (showNav ? `<button class="lightbox-nav lightbox-prev" aria-label="Anterior">&#8249;</button>` : "") +
+      `<div class="lightbox-image-wrap"><img src="${src}" />` +
+      (caption ? `<div class="lightbox-caption">${caption}${showNav ? ` · ${index + 1}/${images.length}` : ""}</div>` : "") +
+      `</div>` +
+      (showNav ? `<button class="lightbox-nav lightbox-next" aria-label="Siguiente">&#8250;</button>` : "");
+  }
+  render();
+
+  function go(delta) {
+    index = (index + delta + images.length) % images.length;
+    render();
+  }
+
+  overlay.addEventListener("click", (e) => {
+    if (e.target.closest(".lightbox-nav")) {
+      go(e.target.closest(".lightbox-prev") ? -1 : 1);
+      return;
+    }
+    if (e.target.closest(".lightbox-image-wrap")) return; // clicking the image/caption itself shouldn't close it
+    overlay.remove();
+    document.removeEventListener("keydown", onKeydown);
+  });
+  function onKeydown(e) {
+    if (e.key === "Escape") {
+      overlay.remove();
+      document.removeEventListener("keydown", onKeydown);
+    } else if (e.key === "ArrowLeft" && images.length > 1) {
+      go(-1);
+    } else if (e.key === "ArrowRight" && images.length > 1) {
+      go(1);
+    }
+  }
+  document.addEventListener("keydown", onKeydown);
   document.body.appendChild(overlay);
 }
 
@@ -1882,11 +2144,60 @@ function openLightbox(src) {
 document.addEventListener(
   "click",
   (e) => {
+    const satelliteSlideImg = e.target.closest(".satellite-slide img");
+    if (satelliteSlideImg) {
+      // Gallery = every scene in THIS incident's carousel (not the whole
+      // page), positioned at the one actually clicked.
+      const slides = Array.from(satelliteSlideImg.closest(".satellite-carousel").querySelectorAll(".satellite-slide"));
+      const images = slides.map((slide) => ({
+        src: slide.querySelector("img").src,
+        caption: slide.querySelector(".satellite-slide-caption").textContent,
+      }));
+      openLightbox(images, slides.indexOf(satelliteSlideImg.closest(".satellite-slide")));
+      return;
+    }
     const img = e.target.closest(".timeline-thumb, .telegram-thumb, .satellite-thumb, .webcam-thumb");
-    if (img) openLightbox(img.src);
+    if (img) openLightbox([{ src: img.src }], 0);
   },
   true
 );
+
+// Shared hover tooltip for the daily activity chart's bars - a real
+// positioned tooltip (built once, reused) reads far better than the native
+// SVG <title> hover-delay/tiny-font look the first version used, and (unlike
+// <title>) also works via touch on mobile through the same delegated
+// listener (see the "click" fallback below).
+const dailyChartTooltip = document.createElement("div");
+dailyChartTooltip.className = "daily-chart-tooltip";
+document.body.appendChild(dailyChartTooltip);
+
+function showDailyChartTooltip(bar, evt) {
+  dailyChartTooltip.textContent = `${bar.dataset.label}: ${bar.dataset.count} detecci${bar.dataset.count === "1" ? "ón" : "ones"}`;
+  dailyChartTooltip.style.left = `${evt.clientX}px`;
+  dailyChartTooltip.style.top = `${evt.clientY - 10}px`;
+  dailyChartTooltip.classList.add("visible");
+}
+
+document.addEventListener("mouseover", (e) => {
+  const bar = e.target.closest(".daily-chart-bar");
+  if (bar) showDailyChartTooltip(bar, e);
+});
+document.addEventListener("mousemove", (e) => {
+  if (e.target.closest(".daily-chart-bar")) {
+    dailyChartTooltip.style.left = `${e.clientX}px`;
+    dailyChartTooltip.style.top = `${e.clientY - 10}px`;
+  }
+});
+document.addEventListener("mouseout", (e) => {
+  if (e.target.closest(".daily-chart-bar")) dailyChartTooltip.classList.remove("visible");
+});
+// Touch devices get no mouseover - tap shows the tooltip briefly instead.
+document.addEventListener("touchstart", (e) => {
+  const bar = e.target.closest(".daily-chart-bar");
+  if (!bar) return;
+  showDailyChartTooltip(bar, e.touches[0]);
+  setTimeout(() => dailyChartTooltip.classList.remove("visible"), 1500);
+});
 
 // ---------- Keyboard shortcuts (for repeat users who keep this open for
 // hours - firefighters/analysts, not just casual visitors) ----------
@@ -2127,7 +2438,20 @@ async function checkStaleData() {
   }
 }
 
+// Renders the recency legend from RECENCY_LEGEND itself (rather than
+// hand-duplicating the same 4 colors/labels in index.html) so the on-screen
+// legend can never silently drift out of sync with the actual dot colors.
+function renderRecencyLegend() {
+  const el = document.getElementById("recency-legend");
+  if (!el) return;
+  const items = [...RECENCY_LEGEND.map((b) => ({ color: b.color, label: b.label })), { color: RECENCY_STALE_COLOR, label: "72 h+" }];
+  el.innerHTML = items
+    .map((item) => `<span class="recency-swatch"><span class="recency-swatch-dot" style="background:${item.color};"></span>${item.label}</span>`)
+    .join("");
+}
+
 (async function init() {
+  renderRecencyLegend();
   await loadConfig();
   await loadFires();
   checkStaleData();

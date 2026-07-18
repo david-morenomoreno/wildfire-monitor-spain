@@ -95,23 +95,32 @@
     }
     .legend-hint { margin-top: 6px; font-size: 11px; color: var(--text-muted); }
 
-    .recency-bar {
-      display: block;
-      height: 6px;
-      border-radius: 4px;
-      margin-top: 8px;
-      background: linear-gradient(to right, var(--recent), var(--oldest));
-      box-shadow: 0 0 8px rgba(255, 106, 61, 0.25);
-    }
-    .recency-labels {
+    /* Discrete recency-bucket swatches (see RECENCY_LEGEND in app.js) -
+       replaces the old single red-to-yellow gradient bar, which could only
+       ever interpolate between two hues and never represented anything
+       older than 72h as anything but a washed-out yellow. */
+    .recency-legend {
       display: flex;
-      justify-content: space-between;
+      gap: 10px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+    .recency-swatch {
+      display: flex;
+      align-items: center;
+      gap: 5px;
       font-size: 10px;
       color: var(--text-muted);
-      margin-top: 4px;
       font-family: var(--font-mono);
       text-transform: uppercase;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.03em;
+    }
+    .recency-swatch-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      box-shadow: 0 0 4px rgba(0, 0, 0, 0.25);
     }
 
     /* Form controls */
@@ -601,6 +610,10 @@
     .risk-moderate { background: rgba(250, 204, 21, 0.18); color: #facc15; }
     .risk-high { background: rgba(251, 146, 60, 0.2); color: #fb923c; }
     .risk-critical { background: rgba(248, 113, 113, 0.22); color: #f87171; }
+    /* risk_level is peak severity, not current state (see riskBadgeHtml in
+       app.js) - desaturate + dim once an incident is cooling/archived so it
+       reads as "was critical" rather than an ongoing emergency. */
+    .risk-badge-inactive { background: var(--bg-elevated); color: var(--text-secondary); filter: grayscale(0.6); opacity: 0.75; }
 
     /* Growth-rate badge - same semantic colors as risk (green/orange/red),
        "new" reuses the neutral chip style since there isn't enough history
@@ -662,6 +675,39 @@
       margin-bottom: 4px;
     }
     .sparkline-svg { width: 100%; height: 36px; display: block; }
+    /* Taller than the plain sparkline (60px viewBox vs 36px CSS height) - see
+       DAILY_CHART_HEIGHT in app.js, which reserves headroom above the bars
+       for the peak-day direct label. */
+    .daily-chart-svg { height: 56px; overflow: visible; }
+    .daily-chart-bar {
+      transition: opacity 0.1s ease;
+      cursor: pointer;
+    }
+    .daily-chart-bar:hover { opacity: 1 !important; }
+    .daily-chart-peak-label {
+      font-size: 9px;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      fill: var(--text-secondary);
+    }
+    .daily-chart-tooltip {
+      position: fixed;
+      transform: translate(-50%, -100%);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+      color: var(--text-primary);
+      font-size: 11px;
+      font-family: var(--font-mono);
+      padding: 4px 8px;
+      border-radius: 6px;
+      pointer-events: none;
+      opacity: 0;
+      z-index: 4000;
+      white-space: nowrap;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      transition: opacity 0.1s ease;
+    }
+    .daily-chart-tooltip.visible { opacity: 1; }
 
     .stale-data-warning {
       margin-top: 8px;
@@ -693,26 +739,41 @@
     .timeline-toggle-chevron { transition: transform 0.15s ease; font-size: 11px; }
     .timeline-toggle.expanded .timeline-toggle-chevron { transform: rotate(180deg); }
 
-    .timeline-list { padding: 14px 16px 14px 20px; display: none; }
+    .timeline-list { padding: 14px 16px 14px 22px; display: none; }
     .timeline-list.expanded { display: block; }
     .timeline-item {
       position: relative;
-      padding-left: 18px;
+      padding-left: 20px;
       padding-bottom: 16px;
       border-left: 2px solid var(--border-soft);
-      margin-left: 5px;
+      margin-left: 7px;
     }
     .timeline-item:last-child { border-left-color: transparent; padding-bottom: 0; }
+    /* One color per event_type (see EVENT_TYPE_ICON in app.js) so the
+       timeline is scannable by dot color/icon shape at a glance, not just by
+       reading each line - detection (fire) is the accent color everything
+       else already uses; the rest get their own distinct hue so a milestone
+       (status change, imagery, mention) doesn't blend into a run of routine
+       detection-count updates. */
     .timeline-dot {
       position: absolute;
-      left: -7px;
-      top: 2px;
-      width: 12px;
-      height: 12px;
+      left: -11px;
+      top: -2px;
+      width: 18px;
+      height: 18px;
       border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       background: var(--accent);
       border: 2px solid var(--bg-elevated);
+      color: #fff;
     }
+    .timeline-dot .icon { width: 10px; height: 10px; }
+    .timeline-dot-status_change { background: #64748b; }
+    .timeline-dot-telegram_message { background: #2dd4bf; }
+    .timeline-dot-satellite_imagery { background: #38bdf8; }
+    .timeline-dot-regional_status { background: #a78bfa; }
     .timeline-time {
       font-family: var(--font-mono);
       font-size: 10px;
@@ -726,6 +787,45 @@
       max-width: 100%;
       border-radius: 8px;
       border: 1px solid var(--border-soft);
+    }
+
+    /* ---------- Satellite imagery carousel (incident detail) ---------- */
+    .satellite-carousel-wrap { padding: 0 16px 14px; }
+    .satellite-carousel-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+    }
+    .satellite-carousel {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      scroll-snap-type: x mandatory;
+      padding-bottom: 4px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .satellite-slide {
+      flex: 0 0 auto;
+      width: 200px;
+      scroll-snap-align: start;
+    }
+    .satellite-slide img {
+      display: block;
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+    }
+    .satellite-slide-caption {
+      margin-top: 4px;
+      font-size: 10.5px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
     }
 
     /* ---------- Telegram mentions (popup + timeline) ---------- */
@@ -912,6 +1012,28 @@
       cursor: pointer;
       line-height: 1;
     }
+    .lightbox-image-wrap { cursor: default; text-align: center; }
+    .lightbox-caption {
+      margin-top: 10px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+    }
+    .lightbox-nav {
+      background: rgba(255, 255, 255, 0.08);
+      border: none;
+      color: var(--text-primary);
+      font-size: 36px;
+      line-height: 1;
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      cursor: pointer;
+      flex-shrink: 0;
+      margin: 0 16px;
+      transition: background 0.15s ease;
+    }
+    .lightbox-nav:hover { background: rgba(255, 255, 255, 0.18); }
 
     .status-page-link { font-size: 11.5px; color: var(--accent); text-decoration: none; }
     .status-page-link:hover { text-decoration: underline; }
@@ -1005,14 +1127,14 @@
           </div>
         </div>
         <div class="filter-group">
-          <button class="quick-filter-btn" id="quick-filter-critical">Solo crítico + activo</button>
+          <button class="quick-filter-btn active" id="quick-filter-critical">Solo crítico + activo</button>
         </div>
         <div class="filter-group">
           <div class="filter-group-label">Nivel de riesgo</div>
           <div class="chip-row">
-            <label class="chip chip-risk-low"><input type="checkbox" class="filter-risk" value="low" checked /><span>Bajo</span></label>
-            <label class="chip chip-risk-moderate"><input type="checkbox" class="filter-risk" value="moderate" checked /><span>Moderado</span></label>
-            <label class="chip chip-risk-high"><input type="checkbox" class="filter-risk" value="high" checked /><span>Alto</span></label>
+            <label class="chip chip-risk-low"><input type="checkbox" class="filter-risk" value="low" /><span>Bajo</span></label>
+            <label class="chip chip-risk-moderate"><input type="checkbox" class="filter-risk" value="moderate" /><span>Moderado</span></label>
+            <label class="chip chip-risk-high"><input type="checkbox" class="filter-risk" value="high" /><span>Alto</span></label>
             <label class="chip chip-risk-critical"><input type="checkbox" class="filter-risk" value="critical" checked /><span>Crítico</span></label>
           </div>
         </div>
@@ -1020,8 +1142,8 @@
           <div class="filter-group-label">Estado del incidente</div>
           <div class="chip-row">
             <label class="chip"><input type="checkbox" class="filter-status" value="active" checked /><span>Activo</span></label>
-            <label class="chip"><input type="checkbox" class="filter-status" value="cooling" checked /><span>En enfriamiento</span></label>
-            <label class="chip"><input type="checkbox" class="filter-status" value="archived" checked /><span>Archivado</span></label>
+            <label class="chip"><input type="checkbox" class="filter-status" value="cooling" /><span>En enfriamiento</span></label>
+            <label class="chip"><input type="checkbox" class="filter-status" value="archived" /><span>Archivado</span></label>
           </div>
         </div>
         <div class="filter-group">
@@ -1056,9 +1178,8 @@
           <div class="legend-item"><span class="legend-ring"></span>Foco de detección</div>
           <div class="legend-item"><span class="legend-dot"></span>Reportes de usuarios</div>
         </div>
-        <div class="legend-hint">Cada foco tiene siempre el mismo tamaño; el color indica su antigüedad (rojo = reciente, amarillo = antiguo), así se aprecia la dirección de avance del incendio. El polígono sombreado marca el perímetro estimado del área afectada.</div>
-        <div class="recency-bar"></div>
-        <div class="recency-labels"><span>Reciente</span><span>Antiguo (72h+)</span></div>
+        <div class="legend-hint">Cada foco tiene siempre el mismo tamaño; el color indica su antigüedad en franjas horarias (más reciente = colores cálidos), así se aprecia la dirección de avance del incendio. El polígono sombreado marca el perímetro estimado del área afectada.</div>
+        <div class="recency-legend" id="recency-legend"></div>
       </div>
 
       <div class="settings-block">
