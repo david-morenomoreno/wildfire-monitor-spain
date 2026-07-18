@@ -8,8 +8,10 @@ container uses (DATABASE_URL, FIRMS_MAP_KEY, ...):
     cd backend && python -m scripts.backfill_history --days 14
 
 What it does, in order:
-  1. FIRMS  - NASA's area/csv endpoint caps day_range at 10, so this walks
-              backwards in 10-day windows (using the end_date param) to
+  1. FIRMS  - this project's map key caps area/csv's day_range at 5 (confirmed
+              live 2026-07-18 - NASA's docs say 10, but a day_range=10 request
+              against this key returns "Invalid day range. Expects [1..5].").
+              Walks backwards in 5-day windows (using the end_date param) to
               cover the full requested window.
   2. EFFIS  - the WFS feed has no date filter; it always returns whatever
               JRC currently publishes, so this just runs once.
@@ -35,7 +37,11 @@ from app.services.incidents import rebuild_incidents
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("backfill")
 
-FIRMS_MAX_DAY_RANGE = 10
+# NASA's docs say area/csv accepts day_range up to 10, but this project's
+# FIRMS_MAP_KEY was confirmed live (2026-07-18) to cap out at 5 - a
+# day_range=10 request returns "Invalid day range. Expects [1..5]." Some
+# keys/plans apparently get a lower cap, so this walks back in 5-day windows.
+FIRMS_MAX_DAY_RANGE = 5
 
 
 def backfill_firms(db, total_days: int) -> int:
@@ -59,20 +65,35 @@ def main() -> None:
 
     db = SessionLocal()
     try:
-        firms_count = backfill_firms(db, args.days)
-        logger.info("FIRMS total: %d rows processed", firms_count)
+        try:
+            firms_count = backfill_firms(db, args.days)
+            logger.info("FIRMS total: %d rows processed", firms_count)
+        except Exception:
+            logger.exception("FIRMS backfill failed - continuing with remaining steps")
 
-        effis_count = ingest_effis(db)
-        logger.info("EFFIS: %d features processed (no date filter available)", effis_count)
+        try:
+            effis_count = ingest_effis(db)
+            logger.info("EFFIS: %d features processed (no date filter available)", effis_count)
+        except Exception:
+            # JRC's WFS backend has been observed failing server-side
+            # (Oracle Spatial connection errors) independent of anything
+            # this project controls - see effis.py's module docstring.
+            logger.exception("EFFIS ingest failed - continuing with remaining steps")
 
-        touched = rebuild_incidents(db)
-        logger.info("Incident rebuild: %d incidents touched", touched)
+        try:
+            touched = rebuild_incidents(db)
+            logger.info("Incident rebuild: %d incidents touched", touched)
+        except Exception:
+            logger.exception("Incident rebuild failed - continuing with remaining steps")
 
-        copernicus_results = discover_for_active_incidents(db)
-        if copernicus_results:
-            logger.info("Copernicus discovery: %s", copernicus_results)
-        else:
-            logger.info("Copernicus discovery: skipped (not configured or no active incidents)")
+        try:
+            copernicus_results = discover_for_active_incidents(db)
+            if copernicus_results:
+                logger.info("Copernicus discovery: %s", copernicus_results)
+            else:
+                logger.info("Copernicus discovery: skipped (not configured or no active incidents)")
+        except Exception:
+            logger.exception("Copernicus discovery failed")
     finally:
         db.close()
 
