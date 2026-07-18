@@ -40,7 +40,11 @@ services:
   frontend:
     build: ./frontend
     environment:
-      API_BASE_URL: http://localhost:8000
+      # Sent to the BROWSER via GET /config (see frontend/server.js) - must be
+      # an address the client can reach, not the container's own localhost.
+      # Defaults to localhost for local dev; production must override this in
+      # .env to the server's public host (see .env.example).
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8000}
       PORT: 3000
     ports:
       - "3000:3000"
