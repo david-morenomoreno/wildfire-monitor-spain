@@ -18,6 +18,7 @@ from app.models import (
     Webcam,
 )
 from app.services.copernicus import is_configured as copernicus_is_configured
+from app.services.eumetsat import is_configured as eumetsat_is_configured
 from app.services.telegram import is_configured as telegram_is_configured
 from app.services.webcams.registry import WEBCAM_SOURCES
 
@@ -99,6 +100,27 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": f"{scene_count} scenes discovered across all incidents",
             "refresh_url": "/api/copernicus/discover-all",
             "last_success_at": last_success.get("copernicus"),
+        }
+    )
+
+    eumetsat_count = db.query(FireDetection).filter(FireDetection.source == "EUMETSAT").count()
+    eumetsat_configured = eumetsat_is_configured()
+    eumetsat_seconds = state.seconds_since_last_attempt("eumetsat")
+    eumetsat_status = (
+        "needs setup"
+        if not eumetsat_configured
+        else "active" if (eumetsat_seconds is not None or eumetsat_count > 0) else "not yet polled"
+    )
+    sources.append(
+        {
+            "key": "eumetsat",
+            "category": "satellite",
+            "name": "EUMETSAT MTG Active Fire Monitoring",
+            "url": "https://user.eumetsat.int/catalogue/EO:EUM:DAT:0682",
+            "status": eumetsat_status,
+            "detail": f"{eumetsat_count} detections stored",
+            "refresh_url": "/api/fires/refresh/eumetsat?force=true",
+            "last_success_at": last_success.get("eumetsat"),
         }
     )
 

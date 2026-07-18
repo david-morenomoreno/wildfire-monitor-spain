@@ -7,6 +7,7 @@ from app.database import SessionLocal
 from app.services.admin_bulletins.sync import sync_all_regions
 from app.services.copernicus import discover_for_active_incidents
 from app.services.effis import ingest_effis
+from app.services.eumetsat import ingest_eumetsat
 from app.services.firms import ingest_firms
 from app.services.incidents import rebuild_incidents
 from app.services.regional_incidents.sync import sync_all_regions as sync_all_regional_incidents
@@ -34,6 +35,17 @@ def _run_effis_job():
         logger.info("EFFIS ingest: %d rows", count)
     except Exception:
         logger.exception("EFFIS ingest failed")
+    finally:
+        db.close()
+
+
+def _run_eumetsat_job():
+    db = SessionLocal()
+    try:
+        count = ingest_eumetsat(db)
+        logger.info("EUMETSAT ingest: %d fire pixels", count)
+    except Exception:
+        logger.exception("EUMETSAT ingest failed")
     finally:
         db.close()
 
@@ -117,6 +129,12 @@ def start_scheduler() -> BackgroundScheduler:
         "interval",
         minutes=settings.fetch_interval_minutes,
         id="effis_ingest",
+    )
+    scheduler.add_job(
+        _run_eumetsat_job,
+        "interval",
+        minutes=settings.eumetsat_poll_interval_minutes,
+        id="eumetsat_ingest",
     )
     scheduler.add_job(
         _run_incident_rebuild_job,

@@ -78,6 +78,26 @@ class Settings(BaseSettings):
         "function evaluatePixel(s) { return [2.5*s.B04, 2.5*s.B03, 2.5*s.B02]; }"
     )
 
+    # EUMETSAT MTG/FCI Active Fire Monitoring (geostationary, ~10-min full-disk
+    # cadence) - complements FIRMS/EFFIS's polar-orbiting few-passes-a-day
+    # coverage. OAuth2 client_credentials via HTTP Basic, free account at
+    # https://api.eumetsat.int/api-key/. Ingestion is skipped (not an error)
+    # when either credential is blank - see services/eumetsat.py.
+    eumetsat_consumer_key: str = ""
+    eumetsat_consumer_secret: str = ""
+    eumetsat_token_url: str = "https://api.eumetsat.int/token"
+    eumetsat_search_url: str = "https://api.eumetsat.int/data/search-products/1.0.0/os"
+    # "Active Fire Monitoring (netCDF) - MTG - 0 degree" - confirmed LIVE
+    # (2026-07-18) to return real per-cycle products via the search API.
+    # MSG's older equivalent (EO:EUM:DAT:MSG:FIRC / FRP-SEVIRI, the ID shown
+    # on EUMETSAT's own product page) returns "Collection not found" against
+    # the Data Store - MTG has operationally superseded it.
+    eumetsat_collection_id: str = "EO:EUM:DAT:0682"
+    # Wider than the poll interval itself so a slow/failed previous poll
+    # doesn't leave a gap of missed products uncovered.
+    eumetsat_lookback_minutes: int = 30
+    eumetsat_poll_interval_minutes: int = 15
+
     # Regional live-incident feeds (e.g. Castilla y León's INCYL) - unlike
     # admin_bulletins (periodic PDF/CSV documents), these are near-real-time
     # per-fire operational status, so poll closer to the satellite cadence.

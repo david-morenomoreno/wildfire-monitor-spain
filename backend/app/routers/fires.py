@@ -10,19 +10,22 @@ from app.database import get_db
 from app.models import FireDetection
 from app.schemas import FireDetectionOut
 from app.services.effis import ingest_effis
+from app.services.eumetsat import ingest_eumetsat
 from app.services.firms import ingest_firms
 
 router = APIRouter(prefix="/api/fires", tags=["fires"])
 
 
-def _cooldown_response(source: str, key: str) -> Optional[dict]:
+def _cooldown_response(source: str, key: str, interval_minutes: int | None = None) -> Optional[dict]:
     """
     Manual refreshes share the same cooldown as the scheduler so clicking
     "Refresh" repeatedly (or the scheduler firing right before it) doesn't
-    burn through FIRMS'/EFFIS' request quota for no new data.
+    burn through FIRMS'/EFFIS'/EUMETSAT's request quota for no new data.
+    Defaults to fetch_interval_minutes (FIRMS/EFFIS's shared cadence); pass
+    interval_minutes explicitly for a source scheduled on its own interval.
     """
     elapsed = state.seconds_since_last_attempt(key)
-    cooldown = settings.fetch_interval_minutes * 60
+    cooldown = (interval_minutes if interval_minutes is not None else settings.fetch_interval_minutes) * 60
     if elapsed is not None and elapsed < cooldown:
         return {
             "source": source,
@@ -82,3 +85,21 @@ def refresh_effis(
     except Exception as exc:  # EFFIS endpoint is best-effort/experimental
         raise HTTPException(status_code=502, detail=f"EFFIS fetch failed: {exc}") from exc
     return {"source": "EFFIS", "skipped": False, "ingested": count}
+
+
+@router.post("/refresh/eumetsat")
+def refresh_eumetsat(
+    force: bool = Query(False, description="Bypass the refresh cooldown and hit EUMETSAT regardless"),
+    db: Session = Depends(get_db),
+):
+    if not force:
+        skipped = _cooldown_response("EUMETSAT", "eumetsat", settings.eumetsat_poll_interval_minutes)
+        if skipped:
+            return skipped
+    try:
+        count = ingest_eumetsat(db)
+    except RuntimeError as exc:  # e.g. netCDF variable names didn't match a real product - see eumetsat.py
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"EUMETSAT fetch failed: {exc}") from exc
+    return {"source": "EUMETSAT", "skipped": False, "ingested": count}
