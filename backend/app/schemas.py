@@ -45,6 +45,15 @@ class FireIncidentOut(BaseModel):
     has_satellite_imagery: bool = False
 
 
+class RankedIncidentOut(FireIncidentOut):
+    # Added on top of FireIncidentOut purely for the rankings view - position
+    # within the requested sort/window, and duration as a ready-to-render
+    # number (first/last_detected_at are already on the base model, but the
+    # frontend shouldn't have to redo this arithmetic for every row).
+    rank: int
+    duration_hours: float
+
+
 class IncidentEventOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -150,6 +159,30 @@ class RegionalIncidentOut(BaseModel):
     personnel_summary: Optional[str] = None
     matched_incident_id: Optional[int] = None
     updated_at: datetime
+
+
+class IncidentDetectionSourceCount(BaseModel):
+    source: str
+    count: int
+
+
+class IncidentReportOut(BaseModel):
+    """
+    Everything this app tracks about one FireIncident, assembled server-side
+    so the frontend's per-incident report page can render a full dossier from
+    a single request instead of the 5-6 separate calls the map sidebar makes
+    lazily (timeline, regional status, satellite scenes, Telegram mentions).
+    """
+
+    incident: FireIncidentOut
+    duration_hours: float
+    timeline: list[IncidentEventOut] = []
+    regional_status: list[RegionalIncidentOut] = []
+    satellite_scenes: list[SatelliteSceneOut] = []
+    telegram_messages: list[TelegramMessageOut] = []
+    # Best-effort - see _detection_source_breakdown in routers/incidents.py
+    # for why this is a proximity re-query rather than a stored FK.
+    detection_sources: list[IncidentDetectionSourceCount] = []
 
 
 class WebcamOut(BaseModel):

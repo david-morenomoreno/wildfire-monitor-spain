@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Wildfire Monitor Spain — Ranking &amp; informes de incidentes</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script>
+    document.documentElement.dataset.theme = localStorage.getItem("wm-theme") || "dark";
+  </script>
+  <link rel="stylesheet" href="/shared.css" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg-page);
+      color: var(--text-primary);
+      font-family: var(--font-ui);
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 28px 24px 60px; }
+
+    .page-head { margin-bottom: 20px; }
+    .page-head h1 { font-size: 19px; margin: 0 0 6px; font-weight: 650; }
+    .page-head .subtitle { color: var(--text-muted); font-size: 13px; margin: 0; line-height: 1.5; }
+
+    /* ---------- Controls ---------- */
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin: 20px 0 22px;
+    }
+    .control-group { display: flex; flex-direction: column; gap: 4px; }
+    .control-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+    .control-select {
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border-soft);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 12.5px;
+      font-family: var(--font-ui);
+      outline: none;
+      cursor: pointer;
+      transition: border-color 0.15s ease;
+    }
+    .control-select:hover, .control-select:focus { border-color: var(--border-strong); }
+    .scope-note {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--text-muted);
+      max-width: 320px;
+      text-align: right;
+      line-height: 1.4;
+    }
+
+    /* ---------- Ranking table ---------- */
+    .ranking-table { display: flex; flex-direction: column; gap: 6px; }
+    .ranking-row {
+      display: grid;
+      grid-template-columns: 34px 1fr auto auto auto;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .ranking-row:hover { border-color: var(--border-strong); background: var(--bg-elevated-hover); }
+    .ranking-row:nth-child(1) .ranking-rank { color: #facc15; }
+    .ranking-row:nth-child(2) .ranking-rank { color: #d1d5db; }
+    .ranking-row:nth-child(3) .ranking-rank { color: #d97757; }
+    .ranking-rank {
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-align: center;
+    }
+    .ranking-name-block { min-width: 0; }
+    .ranking-name {
+      font-size: 13.5px;
+      font-weight: 650;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .ranking-place {
+      margin-top: 2px;
+      font-size: 11px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .ranking-metric { text-align: right; }
+    .ranking-metric-value {
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+      font-variant-numeric: tabular-nums;
+    }
+    .ranking-metric-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+    }
+    .ranking-sources { display: flex; gap: 5px; }
+    .source-chip {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-elevated-hover);
+      color: var(--text-muted);
+      border: 1px solid var(--border-soft);
+    }
+    .source-chip.present { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-dim); }
+    .source-chip svg { width: 12px; height: 12px; }
+
+    .risk-badge {
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 3px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .risk-low { background: rgba(74, 222, 128, 0.18); color: #4ade80; }
+    .risk-moderate { background: rgba(250, 204, 21, 0.18); color: #facc15; }
+    .risk-high { background: rgba(251, 146, 60, 0.2); color: #fb923c; }
+    .risk-critical { background: rgba(248, 113, 113, 0.22); color: #f87171; }
+    .risk-badge-inactive { background: var(--bg-elevated); color: var(--text-secondary); filter: grayscale(0.6); opacity: 0.75; }
+
+    .empty { padding: 40px; text-align: center; color: var(--text-muted); }
+
+    /* ---------- Report (detail) view ---------- */
+    #report-view { display: none; }
+    #report-view.active { display: block; }
+    #ranking-view.hidden { display: none; }
+
+    .report-back {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 12.5px;
+      font-weight: 600;
+      font-family: var(--font-ui);
+      cursor: pointer;
+      padding: 0;
+      margin-bottom: 16px;
+    }
+    .report-back:hover { color: var(--text-primary); }
+
+    .report-header {
+      padding: 20px 22px;
+      border-radius: 14px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+      margin-bottom: 16px;
+    }
+    .report-title { font-size: 22px; font-weight: 700; }
+    .report-subtitle { margin-top: 4px; font-size: 13px; color: var(--text-muted); }
+    .report-badges { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+
+    .report-metrics {
+      margin-top: 18px;
+      display: flex;
+      gap: 28px;
+      flex-wrap: wrap;
+    }
+    .report-metric { display: flex; flex-direction: column; }
+    .report-metric-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }
+    .report-metric-label {
+      margin-top: 3px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .report-section {
+      padding: 18px 22px;
+      border-radius: 14px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+      margin-bottom: 16px;
+    }
+    .report-section-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 4px;
+    }
+    .report-section-empty { font-size: 12px; color: var(--text-muted); font-style: italic; margin-top: 6px; }
+
+    /* Detection source breakdown */
+    .source-breakdown { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .source-breakdown-row { display: flex; align-items: center; gap: 10px; }
+    .source-breakdown-label {
+      width: 90px;
+      flex-shrink: 0;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    .source-breakdown-bar-wrap { flex: 1; height: 8px; border-radius: 4px; background: var(--bg-elevated-hover); overflow: hidden; }
+    .source-breakdown-bar { height: 100%; background: var(--accent); border-radius: 4px; }
+    .source-breakdown-count { width: 40px; text-align: right; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+
+    /* Regional operational status */
+    .regional-status-card {
+      margin-top: 10px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--bg-elevated-hover);
+      border: 1px solid var(--border-soft);
+    }
+    .regional-status-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .regional-status-pill {
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(45, 212, 191, 0.16);
+      color: #2dd4bf;
+    }
+    .regional-status-place { font-size: 12px; color: var(--text-secondary); }
+    .personnel-grid {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 8px;
+    }
+    .personnel-item {
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-soft);
+    }
+    .personnel-item-value { font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--text-primary); }
+    .personnel-item-label { margin-top: 2px; font-size: 10px; color: var(--text-muted); line-height: 1.3; }
+    .personnel-total {
+      margin-top: 8px;
+      font-size: 11.5px;
+      color: var(--text-secondary);
+    }
+    .regional-dates { margin-top: 8px; font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+
+    /* Timeline */
+    .timeline-list { padding: 6px 4px 4px 10px; }
+    .timeline-item {
+      position: relative;
+      padding-left: 20px;
+      padding-bottom: 16px;
+      border-left: 2px solid var(--border-soft);
+      margin-left: 7px;
+    }
+    .timeline-item:last-child { border-left-color: transparent; padding-bottom: 0; }
+    .timeline-dot {
+      position: absolute;
+      left: -11px;
+      top: -2px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--accent);
+      border: 2px solid var(--bg-elevated);
+      color: #fff;
+    }
+    .timeline-dot .icon { width: 10px; height: 10px; }
+    .timeline-dot-status_change { background: #64748b; }
+    .timeline-dot-telegram_message { background: #2dd4bf; }
+    .timeline-dot-satellite_imagery { background: #38bdf8; }
+    .timeline-dot-regional_status { background: #a78bfa; }
+    .timeline-time { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+    .timeline-title { font-size: 12.5px; font-weight: 600; color: var(--text-primary); margin-top: 2px; }
+    .timeline-desc { font-size: 11.5px; color: var(--text-secondary); margin-top: 2px; }
+    .timeline-thumb { display: block; margin-top: 8px; max-width: 100%; border-radius: 8px; border: 1px solid var(--border-soft); }
+
+    /* Satellite carousel */
+    .satellite-carousel {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      scroll-snap-type: x mandatory;
+      padding-bottom: 4px;
+      margin-top: 12px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .satellite-slide { flex: 0 0 auto; width: 200px; scroll-snap-align: start; }
+    .satellite-slide img {
+      display: block;
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+      cursor: pointer;
+    }
+    .satellite-slide-caption { margin-top: 4px; font-size: 10.5px; color: var(--text-muted); font-family: var(--font-mono); }
+
+    /* Telegram mentions */
+    .telegram-item { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+    .telegram-item:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+    .telegram-item-time { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+    .telegram-item-text { margin-top: 4px; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+    .telegram-thumb { display: block; margin-top: 6px; max-width: 100%; max-height: 160px; border-radius: 8px; border: 1px solid var(--border-soft); object-fit: cover; cursor: pointer; }
+
+    /* Full-size image lightbox (shared by satellite + telegram thumbs) */
+    .lightbox-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.82);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 5000;
+      cursor: zoom-out;
+    }
+    .lightbox-backdrop.active { display: flex; }
+    .lightbox-backdrop img { max-width: 92vw; max-height: 92vh; border-radius: 10px; }
+
+    @media (max-width: 640px) {
+      .ranking-row { grid-template-columns: 26px 1fr auto; }
+      .ranking-sources { display: none; }
+      .scope-note { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="topbar">
+    <span class="topbar-brand"><span class="pulse"></span>Wildfire Monitor</span>
+    <div class="topbar-tabs">
+      <a class="topbar-tab" href="/index.html">Mapa</a>
+      <a class="topbar-tab active" href="/ranking.html">Ranking</a>
+      <a class="topbar-tab" href="/sources.html">Fuentes</a>
+    </div>
+    <button class="theme-toggle" id="theme-toggle" title="Cambiar a modo claro" aria-label="Cambiar tema">🌙</button>
+  </nav>
+
+  <div class="wrap">
+    <div id="ranking-view">
+      <div class="page-head">
+        <h1>Ranking de incendios</h1>
+        <p class="subtitle">
+          Clasificación de los incendios registrados por este monitor, ordenados por gravedad, superficie quemada,
+          número de detecciones o duración. Pulsa un incendio para ver su informe completo.
+        </p>
+      </div>
+
+      <div class="controls">
+        <div class="control-group">
+          <span class="control-label">Ordenar por</span>
+          <select class="control-select" id="sort-select">
+            <option value="severity">Gravedad (compuesta)</option>
+            <option value="area">Superficie quemada (ha)</option>
+            <option value="detections">Nº de detecciones</option>
+            <option value="duration">Duración</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <span class="control-label">Periodo</span>
+          <select class="control-select" id="days-select">
+            <option value="">Todo el histórico</option>
+            <option value="30">Últimos 30 días</option>
+            <option value="7">Últimos 7 días</option>
+          </select>
+        </div>
+        <div class="scope-note" id="scope-note"></div>
+      </div>
+
+      <div id="ranking-content"><div class="empty">Cargando…</div></div>
+    </div>
+
+    <div id="report-view">
+      <button class="report-back" id="report-back">&larr; Volver al ranking</button>
+      <div id="report-content"></div>
+    </div>
+  </div>
+
+  <div class="lightbox-backdrop" id="lightbox">
+    <img id="lightbox-img" src="" alt="" />
+  </div>
+
+  <script src="/ranking.js"></script>
+</body>
+</html>
