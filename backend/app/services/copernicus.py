@@ -151,10 +151,16 @@ def discover_for_incident(db: Session, incident: FireIncident) -> int:
     Returns the count of new scenes stored.
     """
     bbox = _bbox_for_incident(incident)
-    # +1 day past last detection: imagery captured just after the last
-    # thermal detection can still usefully show the burn scar/smoke plume.
+    # -1 day before first detection / +1 day past last detection: confirmed
+    # live (2026-07-20) that a real Sentinel-2 pass can fall within hours of
+    # ignition but still technically BEFORE first_detected_at (e.g. La
+    # Mierla: first hotspot at 12:08, a real pass at 11:09-11:20 the same
+    # day) - a search starting exactly at first_detected_at excluded that
+    # scene outright. The pre-fire side is also useful on its own (an early
+    # smoke-plume/pre-burn reference), not just a rounding buffer.
+    start = incident.first_detected_at - timedelta(days=1)
     end = incident.last_detected_at + timedelta(days=1)
-    features = search_scenes(bbox, incident.first_detected_at, end)
+    features = search_scenes(bbox, start, end)
 
     existing_ids = {
         scene_id
