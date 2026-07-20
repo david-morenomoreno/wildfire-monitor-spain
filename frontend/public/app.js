@@ -1,7 +1,13 @@
 const statusEl = document.getElementById("status");
 let apiBaseUrl = "http://localhost:8000";
 
-const map = L.map("map").setView([40.0, -3.7], 6); // centered on Spain
+// Default zoom control (topleft) sits exactly under #incident-sidebar (also
+// anchored top:14px/left:14px, full height) - blocked its clicks entirely,
+// mouse-wheel zoom was the only way in. #panel (the right control panel)
+// only anchors top:14px, not bottom, so bottomright is the one corner
+// neither overlay panel covers.
+const map = L.map("map", { zoomControl: false }).setView([40.0, -3.7], 6); // centered on Spain
+L.control.zoom({ position: "bottomright" }).addTo(map);
 
 const osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   attribution: "&copy; OpenStreetMap contributors",
@@ -16,6 +22,18 @@ currentBaseLayer.addTo(map);
 
 const markersLayer = L.layerGroup().addTo(map);
 const webcamsLayer = L.layerGroup();
+
+// Shared canvas renderer for hotspot dots. Leaflet's default SVG renderer
+// creates one DOM node per circleMarker, which starts to choke once you get
+// into the thousands of simultaneously-rendered shapes (a full-Spain,
+// 30-day view can hold 10k+ raw detections - see the /api/fires point counts
+// this was tuned against). Canvas draws every dot into a single <canvas>
+// element instead, so plotting every real detection at every zoom level
+// (rather than decimating into grid-cell blobs at low zoom, which used to
+// hide the fire's spread-direction "comet tail" density Pyrofire shows) stays
+// smooth. Created once and reused so every hotspot dot shares one canvas
+// instead of Leaflet allocating a new one per marker.
+const hotspotRenderer = L.canvas({ padding: 0.5 });
 
 // NASA GIBS true-color satellite imagery (no API key needed). "best" auto-picks
 // the least cloudy available product for the requested date; GoogleMapsCompatible_Level9
@@ -102,64 +120,76 @@ function recencyColor(acquiredAtIso) {
   return bucket ? bucket.color : RECENCY_STALE_COLOR;
 }
 
-// Groups nearby point detections into a grid cell purely to cap how many SVG
-// dots get drawn at country/region-wide zoom levels (lastFires isn't
-// viewport-filtered, so a wide view can hold several thousand detections).
-// This is a PERFORMANCE decimation, not a visual "bigger cluster = bigger
-// circle" encoding - every rendered dot still gets the same fixed radius (see
-// HOTSPOT_DOT_RADIUS) and is colored by its bucket's most recent detection, so
-// dot size never hints at detection count. Grid size shrinks as you zoom in,
-// so a close-up view separates out individual hotspots instead of always
-// merging them into the same few blobs, until INDIVIDUAL_DOT_ZOOM removes
-// bucketing altogether and plots every raw detection.
-function gridDegForZoom(zoom) {
-  if (zoom >= 13) return 0.01;
-  if (zoom >= 11) return 0.02;
-  if (zoom >= 9) return 0.05;
-  if (zoom >= 7) return 0.1;
-  return 0.3;
+// Distinct marker SHAPE per satellite source, layered on top of the existing
+// recency COLOR - otherwise a EUMETSAT (geostationary, ~2km native pixel) or
+// Sentinel-3 (polar-orbiting, its own separate overpass schedule from FIRMS'
+// VIIRS/MODIS) detection is visually indistinguishable from a FIRMS one,
+// even though they're different instruments with different confidence
+// characteristics. FIRMS is by far the highest-volume source (thousands of
+// points - see hotspotRenderer above) and stays on the canvas circleMarker
+// path; EUMETSAT/Sentinel-3 have far fewer detections at any given time, so
+// a plain DOM divIcon (fixed CSS pixel shape, no canvas path needed) is
+// simple and cheap at their scale. Returns null for FIRMS/anything else -
+// callers fall back to the existing circleMarker in that case.
+const SOURCE_SHAPE_SIZE = HOTSPOT_DOT_RADIUS * 2 + 2;
+
+function sourceShapeIcon(source, fillColor, ringColor, ringWeight) {
+  const s = SOURCE_SHAPE_SIZE;
+  const border = `${ringWeight}px solid ${ringColor}`;
+  let html;
+  if (source === "EUMETSAT") {
+    // Triangle via a CSS border trick - no SVG/canvas path needed for a fixed-size DOM shape.
+    html =
+      `<div style="width:0;height:0;` +
+      `border-left:${s / 2}px solid transparent;border-right:${s / 2}px solid transparent;` +
+      `border-bottom:${s}px solid ${fillColor};filter:drop-shadow(0 0 0.5px ${ringColor});"></div>`;
+  } else if (source === "SENTINEL3") {
+    html = `<div style="width:${s}px;height:${s}px;background:${fillColor};border:${border};transform:rotate(45deg);box-sizing:border-box;"></div>`;
+  } else {
+    return null;
+  }
+  return L.divIcon({ className: "", html, iconSize: [s, s], iconAnchor: [s / 2, s / 2] });
 }
 
-function clusterPointFires(fires, gridDeg) {
-  const buckets = new Map();
-  fires.forEach((fire) => {
-    const key = `${Math.round(fire.latitude / gridDeg)}_${Math.round(fire.longitude / gridDeg)}`;
-    if (!buckets.has(key)) {
-      buckets.set(key, { points: [], mostRecent: fire.acquired_at });
-    }
-    const bucket = buckets.get(key);
-    bucket.points.push([fire.latitude, fire.longitude]);
-    if (new Date(fire.acquired_at) > new Date(bucket.mostRecent)) {
-      bucket.mostRecent = fire.acquired_at;
-    }
-  });
-  return Array.from(buckets.values()).map((bucket) => {
-    const latSum = bucket.points.reduce((sum, p) => sum + p[0], 0);
-    const lonSum = bucket.points.reduce((sum, p) => sum + p[1], 0);
-    return {
-      latitude: latSum / bucket.points.length,
-      longitude: lonSum / bucket.points.length,
-      count: bucket.points.length,
-      acquired_at: bucket.mostRecent,
-      points: bucket.points,
-    };
+// Builds either a shaped divIcon marker (EUMETSAT/Sentinel-3) or the default
+// canvas circleMarker (FIRMS/everything else) for one raw fire detection -
+// used at every place a raw hotspot dot gets drawn, so source shape stays
+// consistent whether it's part of a loose fragment or the main dot layer.
+function hotspotMarker(fire, { radius, ringColor, ringWeight, renderer }) {
+  const fillColor = recencyColor(fire.acquired_at);
+  const icon = sourceShapeIcon(fire.source, fillColor, ringColor, ringWeight);
+  if (icon) {
+    return L.marker([fire.latitude, fire.longitude], { icon });
+  }
+  return L.circleMarker([fire.latitude, fire.longitude], {
+    renderer,
+    radius,
+    color: ringColor,
+    weight: ringWeight,
+    fillColor,
+    fillOpacity: 0.9,
   });
 }
 
-// Above this zoom, stop bucketing detections into grid-cell dots and plot
-// each raw hotspot as its own small dot instead (matching how other
-// fire-monitoring maps - e.g. Bseed WATCH - render FIRMS data: individual
-// points colored by age, not merged blobs). Bucketing hides the actual
-// density/shape texture of a fire's hotspot pattern; at this zoom there's
-// enough screen space to show every point without them fully overlapping.
-const INDIVIDUAL_DOT_ZOOM = 13;
+// NOTE: this used to grid-bucket nearby point detections into a single dot
+// per cell purely to cap how many SVG shapes got drawn at country/region-wide
+// zoom levels (lastFires isn't viewport-filtered, so a wide view can hold
+// several thousand detections). That performance decimation was the reason
+// zoomed-out views looked sparse - one blob per grid cell instead of the
+// dense, directional "comet tail" of individual colored dots other
+// fire-monitoring tools (e.g. Pyrofire) show at every zoom. Switching hotspot
+// dots to Leaflet's canvas renderer (see hotspotRenderer above) removes the
+// need for it entirely: a single canvas element handles the full real point
+// count (measured up to ~11.5k for a 30-day full-Spain view) smoothly, so
+// every raw detection now renders as its own small dot at every zoom level -
+// see the single rendering pass in renderMap() below.
 
 // Groups fires by real-world proximity (chain-linkage union-find), not by a
 // fixed grid cell - so hotspots that belong to the same spreading fire merge
 // into ONE region regardless of how the display grid happens to slice them.
-// This is what backs the affected-area polygon and its single geocode button,
-// as opposed to clusterPointFires() above which is purely a zoom-dependent
-// dot-count decimation for rendering performance.
+// This is what backs the affected-area polygon and its single geocode button -
+// unrelated to how individual hotspot dots are plotted (every raw detection
+// gets its own dot now; see hotspotRenderer above).
 const REGION_LINK_DEG = 0.03; // ~3km: hotspots this close are treated as the same fire event
 
 // Mirrors the backend's INCIDENT_REASSOCIATION_DEG (services/incidents.py) -
@@ -172,25 +202,6 @@ const REGION_LINK_DEG = 0.03; // ~3km: hotspots this close are treated as the sa
 // estimate) purely because the incident's centroid drifted toward the
 // midpoint between its now-merged parts.
 const INCIDENT_REASSOCIATION_DEG = 0.15;
-
-// Chain-linkage clustering (single-linkage) can connect two visually distant
-// blobs into one group via a sparse "stepping stone" path of intermediate
-// points, even when there's a real empty gap between them - and since a
-// single concave hull can only describe ONE connected shape, it's then
-// forced to draw an artificial thin bridge/isthmus across that gap to
-// include every point. REGION_LINK_DEG stays as-is for incident identity
-// (matches the backend's FireIncident clustering, and a fire that jumped a
-// gap is still meaningfully "one incident"), but polygon DRAWING re-clusters
-// each incident's points at this tighter distance, so a real gap renders as
-// two separate polygons instead of one bridged shape. Tuned empirically
-// against a real bridged incident (Asín, Zaragoza - a 122-detection group
-// with two dense patches ~4km apart joined by a handful of stray points):
-// REGION_LINK_DEG/2 (0.015) still chained all 122 into one shape; 0.007
-// (~780m, comfortably above VIIRS' ~375m pixel spacing so a genuinely
-// continuous burn front stays intact - confirmed on Bédar's 745-detection
-// blob, which barely fragments at this threshold) correctly separated it
-// into its real sub-clusters.
-const HULL_SUBCLUSTER_DEG = 0.007;
 
 function groupFiresByProximity(fires, thresholdDeg) {
   const n = fires.length;
@@ -297,14 +308,26 @@ function polygonPerimeter(points) {
   return sum;
 }
 
-// A handful of chain-linked points that are individually close enough to
-// pass HULL_SUBCLUSTER_DEG, but spread out along a line, still forms a valid
-// triangle/polygon - just a degenerate needle-thin one (near-zero area for
-// its perimeter), which is exactly the "artificial bridge" look this guards
-// against. Polsby-Popper compactness (4*pi*area / perimeter^2) is 1.0 for a
-// circle and drops toward 0 for a sliver; a real fire-shaped blob comfortably
-// clears this even when it's fairly elongated (e.g. a valley-following fire).
+// A handful of points strung out along a near-straight line still forms a
+// valid hull - just a degenerate needle-thin one (near-zero area for its
+// perimeter). Polsby-Popper compactness (4*pi*area / perimeter^2) is 1.0 for
+// a circle and drops toward 0 for a sliver; a real fire-shaped blob
+// comfortably clears this even when it's fairly elongated (e.g. a
+// valley-following fire or a long connecting corridor between two denser
+// patches).
 const MIN_HULL_COMPACTNESS = 0.06;
+
+// A compact-enough triangle from just 3-4 points a couple hundred meters
+// apart still passes MIN_HULL_COMPACTNESS but reads as a stray, meaningless
+// sliver of "shape" rather than a real fire extent (confirmed live
+// 2026-07-20: several such tiny triangles/wedges scattered around a real
+// incident, each from a handful of nearby points, that added visual noise
+// without conveying anything a plain dot cluster wouldn't already show).
+// Below this real-world area, skip the polygon entirely - the underlying
+// points still render as individual dots regardless (see visiblePointFires
+// below), so nothing about the data disappears, just the misleading "shape"
+// claim over too few points to support one.
+const MIN_HULL_AREA_HA = 3;
 
 function isHullReasonablyCompact(hull) {
   const perimeter = polygonPerimeter(hull);
@@ -357,60 +380,6 @@ function ringAreaHectares(ringLatLon) {
   } catch {
     return 0;
   }
-}
-
-function nearestPointPair(pointsA, pointsB) {
-  let best = null;
-  let bestDist = Infinity;
-  for (const a of pointsA) {
-    for (const b of pointsB) {
-      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
-      if (d < bestDist) {
-        bestDist = d;
-        best = [a, b];
-      }
-    }
-  }
-  return { pair: best, dist: bestDist };
-}
-
-// Connects an incident's spatially-separate fragments (each a raw
-// REGION_LINK_DEG proximityGroup - see renderMap) with a dashed line, via a
-// minimum spanning tree over nearest-point-pair distances so 3+ scattered
-// fragments get the fewest/shortest connectors instead of an all-pairs
-// tangle. Deliberately dashed/thin/lower-opacity, NOT a filled shape - this
-// is an honest "probably spread through here, no satellite pass caught it"
-// signal, not a claim about the actual burnt area in the gap.
-function drawIncidentConnectors(incidentFragmentPoints) {
-  incidentFragmentPoints.forEach((fragments) => {
-    if (fragments.length < 2) return;
-    const edges = [];
-    for (let i = 0; i < fragments.length; i++) {
-      for (let j = i + 1; j < fragments.length; j++) {
-        const { pair, dist } = nearestPointPair(fragments[i], fragments[j]);
-        if (pair) edges.push({ i, j, pair, dist });
-      }
-    }
-    edges.sort((a, b) => a.dist - b.dist);
-
-    const parent = fragments.map((_, i) => i);
-    const find = (x) => (parent[x] === x ? x : (parent[x] = find(parent[x])));
-
-    edges.forEach(({ i, j, pair }) => {
-      const ri = find(i);
-      const rj = find(j);
-      if (ri === rj) return; // already connected (directly or transitively) - skip, avoids redundant/crossing lines
-      parent[ri] = rj;
-      L.polyline(pair, {
-        color: HOTSPOT_STROKE,
-        weight: 2,
-        dashArray: "3,7",
-        opacity: 0.55,
-      })
-        .bindTooltip("Posible trayectoria de propagación - sin detecciones vía satélite en este tramo", { sticky: true })
-        .addTo(markersLayer);
-    });
-  });
 }
 
 // How many recent hours count as "the growth window" - the fire's area now
@@ -520,20 +489,63 @@ function dailyDetectionCounts(events) {
     const key = d.toISOString().slice(0, 10);
     series.push({ day: key, count: perDay.get(key) || 0 });
   }
+
+  // Pad with a real zero-detection day immediately before the first real one
+  // (always true - there were 0 detections for this incident the day before
+  // its very first one) so the line/area visibly rises FROM zero instead of
+  // starting mid-height at the chart's left edge.
+  const dayBefore = new Date(first);
+  dayBefore.setUTCDate(dayBefore.getUTCDate() - 1);
+  series.unshift({ day: dayBefore.toISOString().slice(0, 10), count: 0 });
+
+  // Same on the trailing end, but ONLY if that day has actually elapsed with
+  // zero detections - the day after "today" hasn't happened yet, so padding
+  // a still-active, still-growing fire with a fake "tomorrow = 0" would
+  // falsely imply it had already stopped.
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const dayAfter = new Date(last);
+  dayAfter.setUTCDate(dayAfter.getUTCDate() + 1);
+  const dayAfterKey = dayAfter.toISOString().slice(0, 10);
+  if (dayAfterKey < todayKey) series.push({ day: dayAfterKey, count: 0 });
+
   // Long-running incidents (up to INCIDENTS_WINDOW_HOURS = 30 days) would
   // otherwise render unreadably thin bars - keep only the most recent
   // DAILY_CHART_MAX_BARS days rather than silently mis-scaling every bar.
   return series.slice(-DAILY_CHART_MAX_BARS);
 }
 
+// Catmull-Rom -> cubic Bezier smoothing for an OPEN line (unlike the map's
+// own smoothRing/catmull helpers, which smooth a closed polygon loop) - each
+// segment only looks at its own two immediate neighbors, so it can't
+// overshoot past a local min/max the way a naive global spline could.
+function smoothLinePath(points) {
+  if (points.length < 3) return `M ${points.map((p) => p.join(",")).join(" L ")}`;
+  let d = `M ${points[0][0]},${points[0][1]} `;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[Math.max(0, i - 1)];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[Math.min(points.length - 1, i + 2)];
+    const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6];
+    const c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
+    d += `C ${c1[0].toFixed(1)},${c1[1].toFixed(1)} ${c2[0].toFixed(1)},${c2[1].toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)} `;
+  }
+  return d;
+}
+
 function dayLabel(dayKey) {
   return new Date(dayKey + "T00:00:00Z").toLocaleDateString("es-ES", { day: "numeric", month: "short" });
 }
 
-// Reserved headroom above the bars for the peak day's direct value label -
-// selective (only the peak, not every bar) per the app's dataviz conventions.
+// Reserved headroom above the line for the peak day's direct value label -
+// selective (only the peak, not every point) per the app's dataviz conventions.
 const DAILY_CHART_LABEL_HEADROOM = 16;
-const DAILY_CHART_BAR_AREA = DAILY_CHART_HEIGHT - DAILY_CHART_LABEL_HEADROOM;
+const DAILY_CHART_PLOT_AREA = DAILY_CHART_HEIGHT - DAILY_CHART_LABEL_HEADROOM;
+// How many date ticks to show under the axis regardless of how many days the
+// series spans - a 21-day incident showing only its first/last day made every
+// day in between impossible to identify without hovering each point. Evenly
+// spaced (not one per day) so labels never overlap in the 280px-wide sidebar.
+const DAILY_CHART_MAX_TICKS = 5;
 
 function dailyActivityChartHtml(events) {
   const series = dailyDetectionCounts(events);
@@ -541,49 +553,58 @@ function dailyActivityChartHtml(events) {
 
   const maxCount = Math.max(...series.map((d) => d.count), 1);
   const peakIndex = series.reduce((best, d, i) => (d.count > series[best].count ? i : best), 0);
-  const barGap = 3;
-  const barWidth = DAILY_CHART_WIDTH / series.length - barGap;
-  const todayKey = new Date().toISOString().slice(0, 10);
+  const stepX = DAILY_CHART_WIDTH / (series.length - 1);
+  const xAt = (i) => i * stepX;
+  const yAt = (count) => DAILY_CHART_HEIGHT - (count / maxCount) * DAILY_CHART_PLOT_AREA;
 
-  const bars = series
+  const points = series.map((d, i) => [xAt(i), yAt(d.count)]);
+  const linePath = smoothLinePath(points);
+  const areaPath = `${linePath} L ${xAt(series.length - 1).toFixed(1)},${DAILY_CHART_HEIGHT} L 0,${DAILY_CHART_HEIGHT} Z`;
+
+  const dots = series
     .map((d, i) => {
-      // Minimum visible height even for a 0-count day - a bar that's
-      // literally invisible reads as "no data" (a rendering gap), not "zero
-      // activity that day", which is itself meaningful information here.
-      const barHeight = Math.max(3, (d.count / maxCount) * DAILY_CHART_BAR_AREA);
-      const x = i * (barWidth + barGap);
-      const y = DAILY_CHART_HEIGHT - barHeight;
-      // Today's bar (or the most recent day with data) stays full-strength;
-      // earlier days step down in opacity - the same "recent = stronger
-      // signal" language the map's own recency colors already use, applied
-      // here as intensity instead of hue since this is one series, not a
-      // category per bar.
-      const isLatest = d.day === todayKey || i === series.length - 1;
-      const opacity = isLatest ? 1 : 0.45 + 0.4 * (i / (series.length - 1));
+      const x = xAt(i);
+      const y = yAt(d.count);
       const peakLabel =
         i === peakIndex && d.count > 0
-          ? `<text x="${(x + barWidth / 2).toFixed(1)}" y="${Math.max(10, y - 5).toFixed(1)}" text-anchor="middle" class="daily-chart-peak-label">${d.count}</text>`
+          ? `<text x="${x.toFixed(1)}" y="${Math.max(10, y - 7).toFixed(1)}" text-anchor="middle" class="daily-chart-peak-label">${d.count}</text>`
           : "";
+      // Same class/data-* attributes the existing shared tooltip (see
+      // showDailyChartTooltip) already reads - point markers just replace
+      // bars as the hoverable element, no tooltip logic changes needed.
       return (
-        `<rect class="daily-chart-bar" data-label="${dayLabel(d.day)}" data-count="${d.count}" ` +
-        `x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}" ` +
-        `fill="var(--accent)" opacity="${opacity.toFixed(2)}" rx="2.5"/>` +
+        `<circle class="daily-chart-bar" data-label="${dayLabel(d.day)}" data-count="${d.count}" ` +
+        `cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3"/>` +
         peakLabel
       );
     })
     .join("");
 
-  const firstLabel = dayLabel(series[0].day);
-  const lastLabel = dayLabel(series[series.length - 1].day);
+  // Evenly spaced tick indices, always including the first and last day -
+  // Set dedupes in case DAILY_CHART_MAX_TICKS >= series.length (short spans
+  // just get one tick per day).
+  const tickCount = Math.min(DAILY_CHART_MAX_TICKS, series.length);
+  const tickIndices = Array.from(
+    new Set(Array.from({ length: tickCount }, (_, i) => Math.round((i * (series.length - 1)) / (tickCount - 1))))
+  );
+  const ticks = tickIndices
+    .map((i) => {
+      const x = xAt(i);
+      const anchor = i === 0 ? "start" : i === series.length - 1 ? "end" : "middle";
+      return `<text x="${x.toFixed(1)}" y="10" text-anchor="${anchor}" class="daily-chart-tick-label">${dayLabel(series[i].day)}</text>`;
+    })
+    .join("");
 
   return (
     `<div class="sparkline-wrap">` +
     `<div class="sparkline-label">Detecciones por día</div>` +
     `<svg viewBox="0 0 ${DAILY_CHART_WIDTH} ${DAILY_CHART_HEIGHT}" class="sparkline-svg daily-chart-svg" preserveAspectRatio="none">` +
     `<line x1="0" y1="${DAILY_CHART_HEIGHT - 0.5}" x2="${DAILY_CHART_WIDTH}" y2="${DAILY_CHART_HEIGHT - 0.5}" stroke="var(--border-soft)" stroke-width="1"/>` +
-    bars +
+    `<path d="${areaPath}" fill="var(--accent)" opacity="0.16" stroke="none"/>` +
+    `<path d="${linePath}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` +
+    dots +
     `</svg>` +
-    `<div class="recency-labels"><span>${firstLabel}</span><span>${lastLabel}</span></div>` +
+    `<div class="daily-chart-ticks"><svg viewBox="0 0 ${DAILY_CHART_WIDTH} 16" class="daily-chart-ticks-svg" preserveAspectRatio="none">${ticks}</svg></div>` +
     `</div>`
   );
 }
@@ -1000,25 +1021,15 @@ function regionGradientStops(group) {
 }
 
 // Pure rendering pass over already-fetched data - re-run on zoom changes
-// without re-hitting the API, since clustering depends on the current zoom.
+// without re-hitting the API, since polygon halo/stroke weight still depend
+// on the current zoom (see lowZoom below), even though hotspot dots
+// themselves no longer do.
 function renderMap() {
   markersLayer.clearLayers();
   incidentEstimatesById.clear();
   const hours = getSelectedDays() * 24;
   const zoom = map.getZoom();
-  const gridDeg = gridDegForZoom(zoom);
   const lowZoom = zoom < LOW_ZOOM_POLYGON_ONLY;
-
-  // One entry per incident id -> array of point-lists, one per spatially-
-  // separate fragment (each a raw-tight REGION_LINK_DEG proximityGroup - see
-  // below). An incident whose fragments are far enough apart to render as
-  // separate shapes gets a dashed connector line drawn between them after
-  // the main loop (see drawIncidentConnectors below) - confirmed live this
-  // session that leaving a stark visual gap between two parts of the SAME
-  // fire (e.g. La Mierla's main blob + a satellite pass ~6km away a few
-  // hours later) reads as "two unrelated fires" rather than one spreading
-  // one.
-  const incidentFragmentPoints = new Map();
 
   const pointFires = [];
   lastFires.forEach((fire) => {
@@ -1054,7 +1065,6 @@ function renderMap() {
   // doesn't fragment into dozens of small overlapping shapes that swallow
   // clicks meant for the markers on top of them.
   const proximityGroups = groupFiresByProximity(pointFires, REGION_LINK_DEG);
-  const pointsInHullGroups = new Set();
   const filteredOutPoints = new Set();
 
   proximityGroups.forEach((group, idx) => {
@@ -1071,9 +1081,9 @@ function renderMap() {
 
     // Stretch goal: apply the same sidebar filters to matched polygons, so
     // narrowing to e.g. "Critical" in the sidebar also hides its map shape
-    // (and, below, its underlying detections in the clustered/isolated-marker
-    // views). Groups with no matched incident (no backend FireIncident to
-    // filter on) always render, same as before this feature existed.
+    // (and, below, its underlying raw-detection dots). Groups with no
+    // matched incident (no backend FireIncident to filter on) always render,
+    // same as before this feature existed.
     if (matchedIncident && !incidentPassesFilters(matchedIncident, getActiveFilters())) {
       group.forEach((f) => filteredOutPoints.add(f));
       return;
@@ -1091,7 +1101,6 @@ function renderMap() {
       (latest, f) => (new Date(f.acquired_at) > new Date(latest) ? f.acquired_at : latest),
       group[0].acquired_at
     );
-    group.forEach((f) => pointsInHullGroups.add(f));
 
     // Burnt-area estimate + growth trend computed once for the WHOLE incident
     // (not per visual sub-shape) - see estimateIncidentGrowth. Cached by
@@ -1100,183 +1109,104 @@ function renderMap() {
     const growth = matchedIncident ? estimateIncidentGrowth(group) : null;
     if (matchedIncident && growth) incidentEstimatesById.set(matchedIncident.id, growth);
 
-    // Records one fragment (a hull polygon OR a loose 1-2 point leftover -
-    // see below) for the connector-drawing pass after the main loop. Pushing
-    // per-SUBGROUP (not once per outer group) matters: a loose leftover that
-    // fell just outside HULL_SUBCLUSTER_DEG of its own outer group's main
-    // hull needs a connector just as much as a genuinely separate outer
-    // group does - confirmed live (La Mierla: 2 stray points near Embalse de
-    // Beleño stayed unconnected because they were still technically part of
-    // the same outer group as the main polygon, just not its hull).
-    const registerFragment = (points) => {
-      if (!matchedIncident) return;
-      if (!incidentFragmentPoints.has(matchedIncident.id)) incidentFragmentPoints.set(matchedIncident.id, []);
-      incidentFragmentPoints.get(matchedIncident.id).push(points);
-    };
+    // ONE hull over the WHOLE chain-linked group, not a re-clustered hull per
+    // dense sub-pocket stitched together with connector lines - confirmed
+    // live (2026-07-20) against real data that concaveHull() already traces
+    // a single continuous shape along a sparse connecting corridor (e.g.
+    // Luesia's Asín/Orés chain, La Mierla's Villares de Jadraque arm) at the
+    // SAME concavity already tuned for the dense core - the previous
+    // sub-clustering step was what split those into separate blobs joined by
+    // a dashed line, not a limitation of the hull algorithm itself. This is a
+    // deliberate reversal of this file's older "never bridge a real gap"
+    // stance - the user looked at real incidents, drew the single continuous
+    // shape they expected, and confirmed that's the desired behavior even
+    // though it does mean the fill can span ground no single detection
+    // actually confirmed (same honesty trade-off EFFIS's own rapid-mapping
+    // perimeters already make).
+    //
+    // KNOWN CAVEAT: unlike the old per-fragment connector, this doesn't know
+    // about real water bodies - if the traced corridor's shortest path
+    // crosses a lake/reservoir, the fill will cover it too (no hole cut out).
+    // Revisit with a server-side "subtract real water geometry from this
+    // hull" step (reusing services/geo_filter.py's water-tile fetch, already
+    // proven via /api/geo/segment-crosses-water) if that turns out to matter
+    // in practice.
+    const points = group.map((f) => [f.latitude, f.longitude]);
+    const rawHull = concaveHull(points);
+    if (!rawHull || !isHullReasonablyCompact(rawHull)) return;
+    const hull = smoothRing(rawHull);
+    // Too small a real-world area to be a meaningful shape - see
+    // MIN_HULL_AREA_HA. The group's own points still render as plain dots
+    // regardless (see visiblePointFires below), just without a polygon.
+    if (ringAreaHectares(hull) < MIN_HULL_AREA_HA) return;
 
-    // Re-cluster at a tighter distance purely for drawing: see
-    // HULL_SUBCLUSTER_DEG above. A real gap between two parts of the same
-    // chain-linked fire renders as two (or more) separate polygons instead of
-    // one hull bridged across empty space.
-    const allSubgroups = groupFiresByProximity(group, HULL_SUBCLUSTER_DEG);
-    const subgroups = allSubgroups.filter((sg) => sg.length >= 3);
-
-    // Subgroups with only 1-2 points can't form a meaningful hull (a
-    // triangle from 2 far-apart points is a degenerate sliver, not a real
-    // shape) - this genuinely happens with MODIS detections (confirmed live:
-    // La Mierla, Guadalajara had a satellite pass ~6km from its main cluster
-    // whose 3-4 points sit ~900m-1km apart, just outside HULL_SUBCLUSTER_DEG
-    // (~780m, tuned tight specifically to avoid the Asín bridging-artifact
-    // regression - loosening it back up to fit MODIS' coarser spacing was
-    // tried and rejected: at 0.01 deg it already re-merged 120 of Asín's 122
-    // points into one bridged blob). Rather than force an unreliable shape,
-    // these render as their own small highlighted markers, still linked to
-    // the SAME incident's popup/growth data - so the map still visually
-    // communicates "this is part of the same fire", just not as a polygon.
-    const looseSubgroups = allSubgroups.filter((sg) => sg.length < 3);
-    looseSubgroups.forEach((subgroup) => {
-      registerFragment(subgroup.map((f) => [f.latitude, f.longitude]));
-      subgroup.forEach((fire) => {
-        const marker = L.circleMarker([fire.latitude, fire.longitude], {
-          radius: HOTSPOT_DOT_RADIUS + 2,
-          color: matchedIncident ? "#ff6a3d" : HOTSPOT_STROKE, // accent ring = "linked to an incident"
-          weight: matchedIncident ? 2.5 : 1,
-          fillColor: recencyColor(fire.acquired_at),
-          fillOpacity: 0.9,
-        });
-        if (matchedIncident) {
-          attachGeocode(marker, group, earliest, mostRecent, matchedIncident, growth);
-        } else {
-          marker.bindPopup(`<div class="card-meta">Detectado &nbsp;${fire.acquired_at}</div>`);
-        }
-        marker.addTo(markersLayer);
-      });
+    // A thin dark outline (the old HOTSPOT_STROKE) reads fine against plain
+    // OSM tiles, but gets visually lost once dot markers sit on top of it -
+    // the polygon's extent stopped being readable at a glance. A bold white
+    // halo underneath a solid, fairly thick dark line gives a contour that
+    // reads against any basemap color AND against the dots sitting on top
+    // of it. Now that dots render at a small FIXED radius everywhere (no
+    // more size-scaled cluster circles obscuring the interior), the
+    // polygon's fill is the primary "this is the fire's shape" signal at
+    // every zoom, so it's kept bold and solid rather than fading out or
+    // going dashed as you zoom in.
+    const gradientId = `region-gradient-${idx}`;
+    const haloWeight = lowZoom ? 6 : 5.5;
+    const strokeWeight = lowZoom ? 3 : 2.5;
+    const halo = L.polygon(hull, {
+      color: "#ffffff",
+      weight: haloWeight,
+      opacity: 0.9,
+      fill: false,
     });
+    halo.addTo(markersLayer);
 
-    subgroups.forEach((subgroup, subIdx) => {
-      const points = subgroup.map((f) => [f.latitude, f.longitude]);
-      const rawHull = concaveHull(points);
-      if (!rawHull || !isHullReasonablyCompact(rawHull)) return;
-      const hull = smoothRing(rawHull);
-      registerFragment(points);
-
-      // A thin dark outline (the old HOTSPOT_STROKE) reads fine against plain
-      // OSM tiles, but gets visually lost once dot markers sit on top of it -
-      // the polygon's extent stopped being readable at a glance. A bold white
-      // halo underneath a solid, fairly thick dark line gives a contour that
-      // reads against any basemap color AND against the dots sitting on top
-      // of it. Now that dots render at a small FIXED radius everywhere (no
-      // more size-scaled cluster circles obscuring the interior), the
-      // polygon's fill is the primary "this is the fire's shape" signal at
-      // every zoom, so it's kept bold and solid rather than fading out or
-      // going dashed as you zoom in.
-      const gradientId = `region-gradient-${idx}-${subIdx}`;
-      const haloWeight = lowZoom ? 6 : 5.5;
-      const strokeWeight = lowZoom ? 3 : 2.5;
-      const halo = L.polygon(hull, {
-        color: "#ffffff",
-        weight: haloWeight,
-        opacity: 0.9,
-        fill: false,
-      });
-      halo.addTo(markersLayer);
-
-      // Kept deliberately faint (vs. the old 0.48/0.62) - at full-zoom this
-      // fill sits directly underneath the individual recency-colored dots
-      // (see INDIVIDUAL_DOT_ZOOM below), and since both use the SAME red-to-
-      // yellow hue scale, a strong fill made hot (red) dots blend into an
-      // already-red backdrop - confirmed live: a dense recent cluster read as
-      // one solid orange blob with no visible hot/cool contrast. A faint tint
-      // still communicates "this is the fire's extent" without competing with
-      // the dots for the same color signal - matching how Copernicus's own
-      // EMSR grading maps use a flat, muted burnt-area fill with small vivid
-      // point markers on top, rather than color-coding the fill itself.
-      const polygon = L.polygon(hull, {
-        color: HOTSPOT_STROKE,
-        weight: strokeWeight,
-        fillColor: "#888", // placeholder until the gradient is attached below
-        fillOpacity: lowZoom ? 0.32 : 0.22,
-      });
-      // Popup/geocode reflects the whole incident's stats (earliest/most
-      // recent/matched incident across the full chain-linked group), not
-      // just this visual sub-shape's own slice of it.
-      attachGeocode(polygon, group, earliest, mostRecent, matchedIncident, growth);
-      polygon.addTo(markersLayer);
-
-      const svgRoot = polygon.getElement() && polygon.getElement().ownerSVGElement;
-      if (ensureLinearGradient(svgRoot, gradientId, regionGradientStops(subgroup))) {
-        polygon.setStyle({ fillColor: `url(#${gradientId})` });
-      }
+    // Kept deliberately faint (vs. the old 0.48/0.62) - every raw detection
+    // dot now renders on top of this fill at every zoom (see the
+    // visiblePointFires rendering pass below), and since both use the SAME
+    // red-to-yellow hue scale, a strong fill made hot (red) dots blend into an
+    // already-red backdrop - confirmed live: a dense recent cluster read as
+    // one solid orange blob with no visible hot/cool contrast. A faint tint
+    // still communicates "this is the fire's extent" without competing with
+    // the dots for the same color signal - matching how Copernicus's own
+    // EMSR grading maps use a flat, muted burnt-area fill with small vivid
+    // point markers on top, rather than color-coding the fill itself.
+    const polygon = L.polygon(hull, {
+      color: HOTSPOT_STROKE,
+      weight: strokeWeight,
+      fillColor: "#888", // placeholder until the gradient is attached below
+      fillOpacity: lowZoom ? 0.32 : 0.22,
     });
+    attachGeocode(polygon, group, earliest, mostRecent, matchedIncident, growth);
+    polygon.addTo(markersLayer);
+
+    const svgRoot = polygon.getElement() && polygon.getElement().ownerSVGElement;
+    if (ensureLinearGradient(svgRoot, gradientId, regionGradientStops(group))) {
+      polygon.setStyle({ fillColor: `url(#${gradientId})` });
+    }
   });
-
-  drawIncidentConnectors(incidentFragmentPoints);
 
   // Detections belonging to a polygon hidden by the sidebar filters (above)
   // shouldn't reappear as loose clustered/isolated dots either.
   const visiblePointFires = pointFires.filter((f) => !filteredOutPoints.has(f));
 
-  if (lowZoom) {
-    // The region polygons above are the primary visual at this zoom - only
-    // isolated detections that didn't form a region (fewer than 3 nearby)
-    // still get a small marker, same fixed radius as every other dot.
-    visiblePointFires
-      .filter((f) => !pointsInHullGroups.has(f))
-      .forEach((fire) => {
-        L.circleMarker([fire.latitude, fire.longitude], {
-          radius: HOTSPOT_DOT_RADIUS,
-          color: HOTSPOT_STROKE,
-          weight: 1,
-          fillColor: recencyColor(fire.acquired_at),
-          fillOpacity: 0.85,
-        })
-          .bindPopup(`<div class="card-meta">Detectado &nbsp;${fire.acquired_at}</div>`)
-          .addTo(markersLayer);
-      });
-  } else if (zoom >= INDIVIDUAL_DOT_ZOOM) {
-    // Plot every raw detection as its own small fixed-radius dot - shows the
-    // actual hotspot density/shape texture (matches how other fire-monitoring
-    // maps render FIRMS/VIIRS data), not just a handful of blobs. Each dot
-    // keeps its own recency color rather than a cluster-averaged one, so the
-    // color gradient across dots reads as spread direction over time.
-    visiblePointFires.forEach((fire) => {
-      L.circleMarker([fire.latitude, fire.longitude], {
-        radius: HOTSPOT_DOT_RADIUS,
-        color: HOTSPOT_STROKE,
-        weight: 1,
-        fillColor: recencyColor(fire.acquired_at),
-        fillOpacity: 0.9,
-      })
-        .bindPopup(`<div class="card-meta">Detectado &nbsp;${fire.acquired_at}</div>`)
-        .addTo(markersLayer);
-    });
-  } else {
-    // Between LOW_ZOOM_POLYGON_ONLY and INDIVIDUAL_DOT_ZOOM, bucket nearby
-    // detections purely to cap the number of SVG dots drawn (lastFires isn't
-    // viewport-filtered, so a region-wide view can hold thousands of points).
-    // This is decimation for rendering performance only - every bucket still
-    // renders at the SAME fixed radius as an individual dot, never bigger, so
-    // dot size never encodes detection count. Color still comes from the
-    // bucket's most recent detection, so the red-to-yellow gradient across
-    // buckets still reads as spread direction, just at coarser granularity
-    // than the fully zoomed-in per-point view.
-    clusterPointFires(visiblePointFires, gridDeg).forEach((cluster) => {
-      const fillColor = recencyColor(cluster.acquired_at);
-      const popupHtml =
-        `<div class="card-title">${cluster.count} detecci${cluster.count > 1 ? "ones" : "ón"} cercana${cluster.count > 1 ? "s" : ""}</div>` +
-        `<div class="card-meta">Más reciente &nbsp;${cluster.acquired_at}</div>`;
-
-      L.circleMarker([cluster.latitude, cluster.longitude], {
-        radius: HOTSPOT_DOT_RADIUS,
-        color: HOTSPOT_STROKE,
-        weight: 1,
-        fillColor,
-        fillOpacity: 0.9,
-      })
-        .bindPopup(popupHtml)
-        .addTo(markersLayer);
-    });
-  }
+  // Plot every raw detection as its own small fixed-radius dot, at every
+  // zoom level - shows the actual hotspot density/shape texture (matches how
+  // other fire-monitoring maps, e.g. Pyrofire, render FIRMS/VIIRS data:
+  // hundreds of individual colored dots forming a directional "comet tail",
+  // not a handful of merged blobs). Each dot keeps its own recency color
+  // rather than a cluster-averaged one, so the color gradient across dots
+  // reads as spread direction over time - including at low zoom, where this
+  // used to be lost to grid-cell decimation (see the note above
+  // groupFiresByProximity). Rendered on the shared canvas renderer
+  // (hotspotRenderer) rather than Leaflet's default SVG so plotting every
+  // point - even the full-Spain, 30-day case (~11.5k detections measured
+  // live) - stays smooth instead of choking on thousands of DOM nodes.
+  visiblePointFires.forEach((fire) => {
+    hotspotMarker(fire, { radius: HOTSPOT_DOT_RADIUS, ringColor: HOTSPOT_STROKE, ringWeight: 1, renderer: hotspotRenderer })
+      .bindPopup(`<div class="card-meta">Detectado &nbsp;${fire.acquired_at}</div>`)
+      .addTo(markersLayer);
+  });
 
   lastReports.forEach((report) => {
     if (report.latitude == null || report.longitude == null) return;

@@ -676,19 +676,33 @@
     }
     .sparkline-svg { width: 100%; height: 36px; display: block; }
     /* Taller than the plain sparkline (60px viewBox vs 36px CSS height) - see
-       DAILY_CHART_HEIGHT in app.js, which reserves headroom above the bars
+       DAILY_CHART_HEIGHT in app.js, which reserves headroom above the line
        for the peak-day direct label. */
     .daily-chart-svg { height: 56px; overflow: visible; }
     .daily-chart-bar {
-      transition: opacity 0.1s ease;
+      fill: var(--accent);
+      stroke: var(--bg-panel);
+      stroke-width: 1.5;
+      transition: r 0.1s ease;
       cursor: pointer;
     }
-    .daily-chart-bar:hover { opacity: 1 !important; }
+    .daily-chart-bar:hover { r: 4.5; }
     .daily-chart-peak-label {
       font-size: 9px;
       font-family: var(--font-mono);
       font-weight: 600;
       fill: var(--text-secondary);
+    }
+    /* Evenly-spaced date ticks under the timeline (see DAILY_CHART_MAX_TICKS
+       in app.js) - previously only the first/last day were labeled with no
+       CSS separating them, reading as one run-together string ("15 jul18
+       jul"); this replaces that with a real axis instead of two bare spans. */
+    .daily-chart-ticks { margin-top: 2px; }
+    .daily-chart-ticks-svg { width: 100%; height: 16px; display: block; overflow: visible; }
+    .daily-chart-tick-label {
+      font-size: 9px;
+      font-family: var(--font-mono);
+      fill: var(--text-muted);
     }
     .daily-chart-tooltip {
       position: fixed;
