@@ -315,7 +315,26 @@ function polygonPerimeter(points) {
 // comfortably clears this even when it's fairly elongated (e.g. a
 // valley-following fire or a long connecting corridor between two denser
 // patches).
-const MIN_HULL_COMPACTNESS = 0.06;
+//
+// Originally 0.06, tuned back when a hull was built per dense sub-cluster
+// (see the "ONE hull over the WHOLE chain-linked group" comment above the
+// renderMap() hull call). Now that a single hull spans an incident's entire
+// chain-linked shape - dense core plus long, thin connecting corridors to
+// outlying detections, by design - the whole-group shape is naturally less
+// circular than a lone dense blob, even for a real, large, well-established
+// fire. Confirmed live (2026-07-20): La Mierla (Guadalajara, 2994
+// detections, clearly a real multi-week fire with its own dense core plus a
+// Villares-de-Jadraque connecting arm) computed a whole-group compactness of
+// ~0.057 - just under the old 0.06 - which silently dropped its polygon
+// entirely (raw dots still rendered, no shape, no click-through to the
+// incident). A genuinely degenerate case checked the same way - Sahagún
+// (incident 237), just 3 points where two sit ~300m apart and the third
+// ~3km off, forming a real needle-thin sliver triangle - computed ~0.049.
+// 0.05 sits between the two: still rejects Sahagún's sliver, no longer
+// rejects La Mierla's real elongated/branching extent (and Luesia, another
+// real multi-week fire with a similar branching shape, already cleared both
+// values comfortably at ~0.072).
+const MIN_HULL_COMPACTNESS = 0.05;
 
 // A compact-enough triangle from just 3-4 points a couple hundred meters
 // apart still passes MIN_HULL_COMPACTNESS but reads as a stray, meaningless
@@ -379,6 +398,44 @@ function ringAreaHectares(ringLatLon) {
     return turf.area(turf.polygon([coords])) / 10000;
   } catch {
     return 0;
+  }
+}
+
+// GeoJSON coordinates are nested arrays of [lon, lat] pairs - a Polygon's
+// coordinates are "array of rings" (exterior + optional holes), a
+// MultiPolygon's are "array of polygons, each an array of rings". Both
+// nestings already match what L.polygon() itself accepts (it auto-detects
+// simple ring vs ring-with-holes vs multipolygon by nesting depth), so the
+// only conversion needed is swapping each [lon, lat] leaf pair to Leaflet's
+// [lat, lon] order - recursing until a leaf (an array of two numbers) is hit.
+function geojsonCoordsToLatLngs(coords) {
+  if (Array.isArray(coords[0]) && typeof coords[0][0] === "number") {
+    return coords.map(([lon, lat]) => [lat, lon]);
+  }
+  return coords.map(geojsonCoordsToLatLngs);
+}
+
+// Calls the backend's real-water-body subtraction (see routers/geo.py's
+// POST /api/geo/subtract-water, services/geo_filter.py's
+// water_geometry_near) to cut any real lake/reservoir the hull's shortest
+// path crosses out as a hole or notch - the KNOWN CAVEAT documented above.
+// Returns null ("nothing to change, keep rendering the plain hull") on ANY
+// failure - network error, non-OK response, or the backend simply finding
+// no water nearby - so a flaky call or a slow first-time Corine tile fetch
+// can only skip this refinement, never break the hull rendering itself.
+async function waterSubtractedHullLatLngs(hullLatLon) {
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/geo/subtract-water`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ points: hullLatLon }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.subtracted || !data.geometry) return null;
+    return geojsonCoordsToLatLngs(data.geometry.coordinates);
+  } catch {
+    return null;
   }
 }
 
@@ -637,13 +694,30 @@ function geocodeCacheKey(lat, lon) {
   return `${lat.toFixed(2)},${lon.toFixed(2)}`;
 }
 
+// In-flight request de-duplication: an incident with thousands of raw
+// detections (e.g. La Mierla, ~2994 points) now attaches this SAME
+// per-incident data (geocode/telegram/regional/satellite) to every one of
+// its dots, not just its polygon - see incidentInfoByFire in renderMap().
+// Without this, every dot mounted in the same synchronous pass would race to
+// fetch before the first request resolves and populates the cache, firing
+// one duplicate network call per dot instead of one per incident. Callers
+// that arrive after the first one just await the SAME pending promise.
+const pendingGeocode = new Map();
+
 async function getGeocode(lat, lon) {
   const key = geocodeCacheKey(lat, lon);
   if (geocodeCache.has(key)) return geocodeCache.get(key);
-  const res = await fetch(`${apiBaseUrl}/api/geocode?lat=${lat}&lon=${lon}`);
-  const data = await res.json();
-  geocodeCache.set(key, data);
-  return data;
+  if (pendingGeocode.has(key)) return pendingGeocode.get(key);
+  const promise = (async () => {
+    const res = await fetch(`${apiBaseUrl}/api/geocode?lat=${lat}&lon=${lon}`);
+    return res.json();
+  })().then((data) => {
+    geocodeCache.set(key, data);
+    pendingGeocode.delete(key);
+    return data;
+  });
+  pendingGeocode.set(key, promise);
+  return promise;
 }
 
 const X_LOGO_SVG =
@@ -676,12 +750,22 @@ const ICONS = {
 // geocodeCache below) so re-opening the same polygon's popup doesn't re-fetch.
 const telegramCache = new Map();
 
+// See pendingGeocode above for why this de-duplication exists.
+const pendingTelegram = new Map();
+
 async function getTelegramMentions(incidentId) {
   if (telegramCache.has(incidentId)) return telegramCache.get(incidentId);
-  const res = await fetch(`${apiBaseUrl}/api/telegram/messages?incident_id=${incidentId}`);
-  const data = await res.json();
-  telegramCache.set(incidentId, data);
-  return data;
+  if (pendingTelegram.has(incidentId)) return pendingTelegram.get(incidentId);
+  const promise = (async () => {
+    const res = await fetch(`${apiBaseUrl}/api/telegram/messages?incident_id=${incidentId}`);
+    return res.json();
+  })().then((data) => {
+    telegramCache.set(incidentId, data);
+    pendingTelegram.delete(incidentId);
+    return data;
+  });
+  pendingTelegram.set(incidentId, promise);
+  return promise;
 }
 
 // Cache of official regional-government status records matched to an
@@ -689,12 +773,22 @@ async function getTelegramMentions(incidentId) {
 // popup doesn't re-fetch.
 const regionalCache = new Map();
 
+// See pendingGeocode above for why this de-duplication exists.
+const pendingRegional = new Map();
+
 async function getRegionalStatus(incidentId) {
   if (regionalCache.has(incidentId)) return regionalCache.get(incidentId);
-  const res = await fetch(`${apiBaseUrl}/api/regional-incidents?incident_id=${incidentId}`);
-  const data = await res.json();
-  regionalCache.set(incidentId, data);
-  return data;
+  if (pendingRegional.has(incidentId)) return pendingRegional.get(incidentId);
+  const promise = (async () => {
+    const res = await fetch(`${apiBaseUrl}/api/regional-incidents?incident_id=${incidentId}`);
+    return res.json();
+  })().then((data) => {
+    regionalCache.set(incidentId, data);
+    pendingRegional.delete(incidentId);
+    return data;
+  });
+  pendingRegional.set(incidentId, promise);
+  return promise;
 }
 
 // Mirrors the tone of the backend's _personnel_description
@@ -739,12 +833,22 @@ function regionalSectionHtml(records) {
 // still fetched/cached separately by the browser via its own <img> src).
 const satelliteCache = new Map();
 
+// See pendingGeocode above for why this de-duplication exists.
+const pendingSatellite = new Map();
+
 async function getSatelliteScenes(incidentId) {
   if (satelliteCache.has(incidentId)) return satelliteCache.get(incidentId);
-  const res = await fetch(`${apiBaseUrl}/api/copernicus/scenes?incident_id=${incidentId}`);
-  const data = await res.json();
-  satelliteCache.set(incidentId, data);
-  return data;
+  if (pendingSatellite.has(incidentId)) return pendingSatellite.get(incidentId);
+  const promise = (async () => {
+    const res = await fetch(`${apiBaseUrl}/api/copernicus/scenes?incident_id=${incidentId}`);
+    return res.json();
+  })().then((data) => {
+    satelliteCache.set(incidentId, data);
+    pendingSatellite.delete(incidentId);
+    return data;
+  });
+  pendingSatellite.set(incidentId, promise);
+  return promise;
 }
 
 function satelliteSectionHtml(scenes) {
@@ -1067,6 +1171,16 @@ function renderMap() {
   const proximityGroups = groupFiresByProximity(pointFires, REGION_LINK_DEG);
   const filteredOutPoints = new Set();
 
+  // Every raw detection dot's link back to its incident, populated below for
+  // ALL proximity groups regardless of whether that group ends up drawing a
+  // polygon - a hull can be skipped for plenty of legitimate reasons (fewer
+  // than 3 points, failing the compactness/area gates just below), but the
+  // incident match itself doesn't depend on any of that. Without this, a dot
+  // belonging to a matched incident whose polygon didn't render lost ANY
+  // link back to its sidebar/timeline entry - see the bare "Detectado" popup
+  // this used to fall back to in the visiblePointFires loop below.
+  const incidentInfoByFire = new Map();
+
   proximityGroups.forEach((group, idx) => {
     // Filtering must run BEFORE the <3-points hull bail-out below - a fire
     // with only 1-2 detections (common for a lower detection_count incident)
@@ -1089,11 +1203,12 @@ function renderMap() {
       return;
     }
 
-    if (group.length < 3) return; // need at least a triangle for a meaningful hull
-
     // Identity (name, timeline, matched incident, filters) is decided once
     // for the WHOLE chain-linked group - a fire that jumped a real gap is
-    // still one incident. Only the polygon SHAPE is re-clustered below.
+    // still one incident. Only the polygon SHAPE is re-clustered below. Computed
+    // BEFORE the <3-points hull bail-out (unlike before) so a dot belonging to
+    // a tiny or otherwise hull-less group still carries its incident identity -
+    // see incidentInfoByFire below.
     const earliest = group.reduce((oldest, f) =>
       new Date(f.acquired_at) < new Date(oldest.acquired_at) ? f : oldest
     );
@@ -1108,6 +1223,18 @@ function renderMap() {
     // point group) can look it up too.
     const growth = matchedIncident ? estimateIncidentGrowth(group) : null;
     if (matchedIncident && growth) incidentEstimatesById.set(matchedIncident.id, growth);
+
+    // Every point in this group can now be given the SAME rich, incident-linked
+    // popup a polygon would get (see visiblePointFires below) regardless of
+    // whether a polygon actually renders for it - a matched incident should
+    // never lose its click-through to the sidebar/timeline just because its
+    // hull failed the compactness/area gates below or it's too small (<3
+    // points) to hull at all.
+    if (matchedIncident) {
+      group.forEach((f) => incidentInfoByFire.set(f, { group, earliest, mostRecent, matchedIncident, growth }));
+    }
+
+    if (group.length < 3) return; // need at least a triangle for a meaningful hull
 
     // ONE hull over the WHOLE chain-linked group, not a re-clustered hull per
     // dense sub-pocket stitched together with connector lines - confirmed
@@ -1153,37 +1280,60 @@ function renderMap() {
     const gradientId = `region-gradient-${idx}`;
     const haloWeight = lowZoom ? 6 : 5.5;
     const strokeWeight = lowZoom ? 3 : 2.5;
-    const halo = L.polygon(hull, {
-      color: "#ffffff",
-      weight: haloWeight,
-      opacity: 0.9,
-      fill: false,
-    });
-    halo.addTo(markersLayer);
 
-    // Kept deliberately faint (vs. the old 0.48/0.62) - every raw detection
-    // dot now renders on top of this fill at every zoom (see the
-    // visiblePointFires rendering pass below), and since both use the SAME
-    // red-to-yellow hue scale, a strong fill made hot (red) dots blend into an
-    // already-red backdrop - confirmed live: a dense recent cluster read as
-    // one solid orange blob with no visible hot/cool contrast. A faint tint
-    // still communicates "this is the fire's extent" without competing with
-    // the dots for the same color signal - matching how Copernicus's own
-    // EMSR grading maps use a flat, muted burnt-area fill with small vivid
-    // point markers on top, rather than color-coding the fill itself.
-    const polygon = L.polygon(hull, {
-      color: HOTSPOT_STROKE,
-      weight: strokeWeight,
-      fillColor: "#888", // placeholder until the gradient is attached below
-      fillOpacity: lowZoom ? 0.32 : 0.22,
-    });
-    attachGeocode(polygon, group, earliest, mostRecent, matchedIncident, growth);
-    polygon.addTo(markersLayer);
+    // Draws the halo + gradient-filled polygon for a given ring/multi-ring
+    // shape, and returns both layers so the caller can remove them again -
+    // shared by the initial plain-hull render below AND by the
+    // water-subtracted replacement (see waterSubtractedHullLatLngs above),
+    // so both paths get IDENTICAL styling with no drift between them.
+    const drawHullShape = (latlngsForLeaflet) => {
+      const shapeHalo = L.polygon(latlngsForLeaflet, {
+        color: "#ffffff",
+        weight: haloWeight,
+        opacity: 0.9,
+        fill: false,
+      });
+      shapeHalo.addTo(markersLayer);
 
-    const svgRoot = polygon.getElement() && polygon.getElement().ownerSVGElement;
-    if (ensureLinearGradient(svgRoot, gradientId, regionGradientStops(group))) {
-      polygon.setStyle({ fillColor: `url(#${gradientId})` });
-    }
+      // Kept deliberately faint (vs. the old 0.48/0.62) - every raw detection
+      // dot now renders on top of this fill at every zoom (see the
+      // visiblePointFires rendering pass below), and since both use the SAME
+      // red-to-yellow hue scale, a strong fill made hot (red) dots blend into an
+      // already-red backdrop - confirmed live: a dense recent cluster read as
+      // one solid orange blob with no visible hot/cool contrast. A faint tint
+      // still communicates "this is the fire's extent" without competing with
+      // the dots for the same color signal - matching how Copernicus's own
+      // EMSR grading maps use a flat, muted burnt-area fill with small vivid
+      // point markers on top, rather than color-coding the fill itself.
+      const shapePolygon = L.polygon(latlngsForLeaflet, {
+        color: HOTSPOT_STROKE,
+        weight: strokeWeight,
+        fillColor: "#888", // placeholder until the gradient is attached below
+        fillOpacity: lowZoom ? 0.32 : 0.22,
+      });
+      attachGeocode(shapePolygon, group, earliest, mostRecent, matchedIncident, growth);
+      shapePolygon.addTo(markersLayer);
+
+      const svgRoot = shapePolygon.getElement() && shapePolygon.getElement().ownerSVGElement;
+      if (ensureLinearGradient(svgRoot, gradientId, regionGradientStops(group))) {
+        shapePolygon.setStyle({ fillColor: `url(#${gradientId})` });
+      }
+      return { shapeHalo, shapePolygon };
+    };
+
+    let { shapeHalo, shapePolygon } = drawHullShape(hull);
+
+    // Fire-and-forget: the plain hull above is already on the map (nothing
+    // waits on this network round-trip), and if a real lake/reservoir turns
+    // out to sit inside it, swap in the water-subtracted version in place.
+    // Any failure (see waterSubtractedHullLatLngs) simply leaves the plain
+    // hull rendered - never a broken or missing shape.
+    waterSubtractedHullLatLngs(hull).then((cutLatLngs) => {
+      if (!cutLatLngs) return;
+      markersLayer.removeLayer(shapeHalo);
+      markersLayer.removeLayer(shapePolygon);
+      ({ shapeHalo, shapePolygon } = drawHullShape(cutLatLngs));
+    });
   });
 
   // Detections belonging to a polygon hidden by the sidebar filters (above)
@@ -1203,9 +1353,29 @@ function renderMap() {
   // point - even the full-Spain, 30-day case (~11.5k detections measured
   // live) - stays smooth instead of choking on thousands of DOM nodes.
   visiblePointFires.forEach((fire) => {
-    hotspotMarker(fire, { radius: HOTSPOT_DOT_RADIUS, ringColor: HOTSPOT_STROKE, ringWeight: 1, renderer: hotspotRenderer })
-      .bindPopup(`<div class="card-meta">Detectado &nbsp;${fire.acquired_at}</div>`)
-      .addTo(markersLayer);
+    const marker = hotspotMarker(fire, {
+      radius: HOTSPOT_DOT_RADIUS,
+      ringColor: HOTSPOT_STROKE,
+      ringWeight: 1,
+      renderer: hotspotRenderer,
+    });
+    // A dot whose fire belongs to a matched incident gets the SAME rich,
+    // incident-linked popup (name, timeline button, growth, telegram/satellite
+    // sections) the polygon gets via attachGeocode - not just a bare
+    // "Detectado {date}" line with no way back to the sidebar/timeline. This
+    // matters even when a polygon DOES render for the incident (clicking a
+    // dot instead of the shape underneath it still surfaces the same info),
+    // and matters MOST when no polygon rendered at all (compactness/area
+    // gates above, or fewer than 3 points) - previously that always meant a
+    // complete dead end back to the incident, regardless of how well-known
+    // or large the fire actually was.
+    const info = incidentInfoByFire.get(fire);
+    if (info) {
+      attachGeocode(marker, info.group, info.earliest, info.mostRecent, info.matchedIncident, info.growth);
+    } else {
+      marker.bindPopup(`<div class="card-meta">Detectado &nbsp;${fire.acquired_at}</div>`);
+    }
+    marker.addTo(markersLayer);
   });
 
   lastReports.forEach((report) => {
