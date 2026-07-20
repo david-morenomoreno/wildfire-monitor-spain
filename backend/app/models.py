@@ -63,6 +63,30 @@ class LocalityCache(Base):
     fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class PlaceGeocodeCache(Base):
+    """
+    Forward-geocoding results (Nominatim /search: place name -> coordinates),
+    cached by the normalized query string. Used as a best-effort fallback for
+    regional incident sources (e.g. INFOCAM) that publish a municipality and
+    province but no coordinates - so repeated syncs of the same handful of
+    places don't re-hit Nominatim's rate-limited free API. latitude/longitude
+    stay null when the lookup itself found nothing, so a repeat lookup for a
+    known-unresolvable place also skips the network call rather than
+    fabricating a location.
+    """
+
+    __tablename__ = "place_geocode_cache"
+    __table_args__ = (
+        UniqueConstraint("query_normalized", name="uq_place_geocode_query"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    query_normalized = Column(String(500), nullable=False)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class FireIncident(Base):
     """
     A stable, server-side identity for a real-world fire event - built by

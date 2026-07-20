@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 from datetime import datetime
@@ -5,12 +6,54 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.models import FireIncident, IncidentEvent, RegionalIncident, RegionalIncidentSource as RegionalIncidentSourceModel
+from app.services.geocode import forward_geocode
 from app.services.health import record_check
 from app.services.incidents import REGION_LINK_DEG
 from app.services.regional_incidents.base import RegionalFireRecord, RegionalIncidentSource
 from app.services.regional_incidents.registry import REGION_SOURCES
 
 logger = logging.getLogger(__name__)
+
+# Forward-geocoding a municipality name only resolves to that place's
+# administrative/village centroid, not the fire's actual location - which can
+# legitimately be several km away inside a large rural municipio, and can
+# diverge further from a FireIncident's own centroid (itself reverse-geocoded
+# from satellite detections, using Nominatim's independent "nearest named
+# place" heuristic). Confirmed live: INFOCAM's "La Mierla" (Guadalajara)
+# geocodes to a point ~17.6km from the matching FireIncident's centroid, well
+# outside REGION_LINK_DEG (~3.3km, tuned for tight satellite-detection
+# clustering) but still clearly closer than any other nearby incident
+# (~28.7km). So geocoded-only coordinates use a wider, separate tolerance
+# here rather than loosening REGION_LINK_DEG itself (which stays tight for
+# its own, unrelated clustering job).
+GEOCODED_MATCH_TOLERANCE_DEG = 0.2
+
+
+def _fill_missing_coordinates(db: Session, record: RegionalFireRecord) -> tuple[RegionalFireRecord, bool]:
+    """
+    Best-effort forward geocoding for sources that publish a municipality and
+    province but no coordinates at all (e.g. INFOCAM's FIDIAS site never
+    publishes lat/lon anywhere). Generic across any regional source so a new
+    source lacking coordinates gets this fallback for free, rather than each
+    source having to implement its own geocoding. Leaves lat/lon as None
+    (never fabricates a location) when the municipality is missing or
+    Nominatim can't resolve it. Returns (record, was_geocoded) so callers can
+    apply a wider match tolerance for geocoded-only coordinates.
+    """
+    if record.latitude is not None and record.longitude is not None:
+        return record, False
+    if not record.municipality:
+        return record, False
+
+    query = ", ".join(
+        part for part in (record.municipality, record.province, "Spain") if part
+    )
+    resolved = forward_geocode(db, query)
+    if resolved is None:
+        return record, False
+
+    latitude, longitude = resolved
+    return dataclasses.replace(record, latitude=latitude, longitude=longitude), True
 
 
 def _get_or_create_source(db: Session, source: RegionalIncidentSource) -> RegionalIncidentSourceModel:
@@ -26,7 +69,9 @@ def _get_or_create_source(db: Session, source: RegionalIncidentSource) -> Region
     return row
 
 
-def _find_matching_incident(db: Session, lat: float | None, lon: float | None) -> int | None:
+def _find_matching_incident(
+    db: Session, lat: float | None, lon: float | None, tolerance_deg: float = REGION_LINK_DEG
+) -> int | None:
     """Best-effort match to a FireIncident by centroid proximity - the region's own
     coordinates are authoritative, so this is more reliable than Telegram's
     text-based matching, but still not guaranteed (satellite detections and
@@ -34,7 +79,7 @@ def _find_matching_incident(db: Session, lat: float | None, lon: float | None) -
     if lat is None or lon is None:
         return None
     incidents = db.query(FireIncident).filter(FireIncident.status != "archived").all()
-    best_id, best_dist = None, REGION_LINK_DEG
+    best_id, best_dist = None, tolerance_deg
     for incident in incidents:
         dist = ((incident.centroid_lat - lat) ** 2 + (incident.centroid_lon - lon) ** 2) ** 0.5
         if dist <= best_dist:
@@ -79,6 +124,7 @@ def sync_region(db: Session, region_code: str) -> int:
     # which joins/duplicates rows) - dedupe before upserting, or a batch with
     # two "new" rows sharing an external_id violates the unique constraint.
     records = list({record.external_id: record for record in fetched}.values())
+    geocoded_records = [_fill_missing_coordinates(db, record) for record in records]
 
     existing = {
         row.external_id: row
@@ -87,12 +133,13 @@ def sync_region(db: Session, region_code: str) -> int:
 
     changed_count = 0
     now = datetime.utcnow()
-    for record in records:
+    for record, was_geocoded in geocoded_records:
+        match_tolerance = GEOCODED_MATCH_TOLERANCE_DEG if was_geocoded else REGION_LINK_DEG
         existing_row = existing.get(record.external_id)
         personnel_json = json.dumps(record.personnel_summary)
 
         if existing_row is None:
-            matched_id = _find_matching_incident(db, record.latitude, record.longitude)
+            matched_id = _find_matching_incident(db, record.latitude, record.longitude, match_tolerance)
             row = RegionalIncident(
                 source_id=source_row.id,
                 external_id=record.external_id,
@@ -143,7 +190,9 @@ def sync_region(db: Session, region_code: str) -> int:
         existing_row.raw_json = json.dumps(record.raw, default=str)
         existing_row.updated_at = now
         if existing_row.matched_incident_id is None:
-            existing_row.matched_incident_id = _find_matching_incident(db, record.latitude, record.longitude)
+            existing_row.matched_incident_id = _find_matching_incident(
+                db, record.latitude, record.longitude, match_tolerance
+            )
 
         if status_changed and existing_row.matched_incident_id is not None:
             db.add(

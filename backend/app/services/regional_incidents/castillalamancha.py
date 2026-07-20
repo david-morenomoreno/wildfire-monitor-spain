@@ -30,8 +30,10 @@ _ID_RE = re.compile(r"detalleIncendio\('(\d+)'\)")
 # page) - only Provincia / T. Municipal / Entidad Menor / Paraje as free text.
 # The linked infocam.castillalamancha.es site (Drupal, "Mapa de incendios")
 # only shows a static image, no ArcGIS/WMS layer or embedded JSON was found
-# behind it. So latitude/longitude are left None here rather than guessed
-# from municipality-level geocoding, per RegionalFireRecord's contract.
+# behind it. So latitude/longitude are left None here (this source stays
+# focused on parsing FIDIAS's own fields); sync.py applies a generic
+# best-effort forward-geocoding fallback (municipality + province ->
+# coordinates via Nominatim) for any regional source that reports None here.
 
 _LABELS = {
     "ESTADO:": "estado",
