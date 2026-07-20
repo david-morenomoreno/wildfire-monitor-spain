@@ -56,7 +56,7 @@ from functools import reduce
 from pathlib import Path
 
 import httpx
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
 logger = logging.getLogger(__name__)
@@ -211,3 +211,36 @@ def is_over_water(latitude: float, longitude: float) -> bool:
     if shape is None:
         return False
     return shape.contains(Point(longitude, latitude))
+
+
+def segment_crosses_water(lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+    """
+    True if the straight line between two points passes through a real water
+    body. NOT currently called by the frontend (app.js now draws one
+    continuous hull per incident directly - see its renderMap() comments -
+    rather than stitching separate hull fragments together, which is what
+    this was originally built for). Kept as a real, working, tested
+    endpoint (see routers/geo.py) for a likely follow-up: that single hull
+    can span a real lake/reservoir sitting inside a fire's spread corridor,
+    filling it in as if it burned - this is the piece needed to instead cut
+    real water geometry out of the hull as a hole. Reuses the same per-tile
+    Corine cache as is_over_water, so it's cheap after the first lookup in a
+    given area. Fails open (False) if a tile fetch fails, same reasoning as
+    is_over_water.
+    """
+    line = LineString([(lon1, lat1), (lon2, lat2)])
+    min_lat, max_lat = sorted((lat1, lat2))
+    min_lon, max_lon = sorted((lon1, lon2))
+    tile_lat = math.floor(min_lat / WATER_TILE_DEG)
+    while tile_lat * WATER_TILE_DEG <= max_lat:
+        tile_lon = math.floor(min_lon / WATER_TILE_DEG)
+        while tile_lon * WATER_TILE_DEG <= max_lon:
+            key = (tile_lat, tile_lon)
+            if key not in _water_tile_cache:
+                _water_tile_cache[key] = _fetch_water_tile(*key)
+            shape = _water_tile_cache[key]
+            if shape is not None and shape.intersects(line):
+                return True
+            tile_lon += 1
+        tile_lat += 1
+    return False

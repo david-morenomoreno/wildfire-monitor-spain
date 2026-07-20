@@ -12,6 +12,7 @@ from app.routers import (
     copernicus,
     fire_spread,
     fires,
+    geo,
     geocode,
     health,
     incidents,
@@ -40,6 +41,7 @@ app.add_middleware(
 app.include_router(fires.router)
 app.include_router(reports.router)
 app.include_router(geocode.router)
+app.include_router(geo.router)
 app.include_router(incidents.router)
 app.include_router(admin_bulletins.router)
 app.include_router(telegram.router)
