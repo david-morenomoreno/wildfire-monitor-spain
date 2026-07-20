@@ -12,6 +12,7 @@ from app.schemas import FireDetectionOut
 from app.services.effis import ingest_effis
 from app.services.eumetsat import ingest_eumetsat
 from app.services.firms import ingest_firms
+from app.services.sentinel3 import ingest_sentinel3
 
 router = APIRouter(prefix="/api/fires", tags=["fires"])
 
@@ -103,3 +104,19 @@ def refresh_eumetsat(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"EUMETSAT fetch failed: {exc}") from exc
     return {"source": "EUMETSAT", "skipped": False, "ingested": count}
+
+
+@router.post("/refresh/sentinel3")
+def refresh_sentinel3(
+    force: bool = Query(False, description="Bypass the refresh cooldown and hit Sentinel-3 regardless"),
+    db: Session = Depends(get_db),
+):
+    if not force:
+        skipped = _cooldown_response("SENTINEL3", "sentinel3", settings.sentinel3_poll_interval_minutes)
+        if skipped:
+            return skipped
+    try:
+        count = ingest_sentinel3(db)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Sentinel-3 fetch failed: {exc}") from exc
+    return {"source": "SENTINEL3", "skipped": False, "ingested": count}

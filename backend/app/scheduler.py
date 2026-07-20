@@ -11,6 +11,7 @@ from app.services.eumetsat import ingest_eumetsat
 from app.services.firms import ingest_firms
 from app.services.incidents import rebuild_incidents
 from app.services.regional_incidents.sync import sync_all_regions as sync_all_regional_incidents
+from app.services.sentinel3 import ingest_sentinel3
 from app.services.telegram import poll_all_channels
 from app.services.webcams.sync import sync_all_sources as sync_all_webcams
 
@@ -46,6 +47,17 @@ def _run_eumetsat_job():
         logger.info("EUMETSAT ingest: %d fire pixels", count)
     except Exception:
         logger.exception("EUMETSAT ingest failed")
+    finally:
+        db.close()
+
+
+def _run_sentinel3_job():
+    db = SessionLocal()
+    try:
+        count = ingest_sentinel3(db)
+        logger.info("Sentinel-3 SLSTR FRP ingest: %d fire pixels", count)
+    except Exception:
+        logger.exception("Sentinel-3 SLSTR FRP ingest failed")
     finally:
         db.close()
 
@@ -135,6 +147,12 @@ def start_scheduler() -> BackgroundScheduler:
         "interval",
         minutes=settings.eumetsat_poll_interval_minutes,
         id="eumetsat_ingest",
+    )
+    scheduler.add_job(
+        _run_sentinel3_job,
+        "interval",
+        minutes=settings.sentinel3_poll_interval_minutes,
+        id="sentinel3_ingest",
     )
     scheduler.add_job(
         _run_incident_rebuild_job,

@@ -19,6 +19,7 @@ from app.models import (
 )
 from app.services.copernicus import is_configured as copernicus_is_configured
 from app.services.eumetsat import is_configured as eumetsat_is_configured
+from app.services.sentinel3 import is_configured as sentinel3_is_configured
 from app.services.telegram import is_configured as telegram_is_configured
 from app.services.webcams.registry import WEBCAM_SOURCES
 
@@ -121,6 +122,27 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": f"{eumetsat_count} detections stored",
             "refresh_url": "/api/fires/refresh/eumetsat?force=true",
             "last_success_at": last_success.get("eumetsat"),
+        }
+    )
+
+    sentinel3_count = db.query(FireDetection).filter(FireDetection.source == "SENTINEL3").count()
+    sentinel3_configured = sentinel3_is_configured()
+    sentinel3_seconds = state.seconds_since_last_attempt("sentinel3")
+    sentinel3_status = (
+        "needs setup"
+        if not sentinel3_configured
+        else "active" if (sentinel3_seconds is not None or sentinel3_count > 0) else "not yet polled"
+    )
+    sources.append(
+        {
+            "key": "sentinel3",
+            "category": "satellite",
+            "name": "Sentinel-3 SLSTR Fire Radiative Power",
+            "url": "https://user.eumetsat.int/catalogue/EO:EUM:DAT:0417",
+            "status": sentinel3_status,
+            "detail": f"{sentinel3_count} detections stored",
+            "refresh_url": "/api/fires/refresh/sentinel3?force=true",
+            "last_success_at": last_success.get("sentinel3"),
         }
     )
 

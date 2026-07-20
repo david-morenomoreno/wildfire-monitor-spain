@@ -97,6 +97,44 @@ class Settings(BaseSettings):
     # doesn't leave a gap of missed products uncovered.
     eumetsat_lookback_minutes: int = 30
     eumetsat_poll_interval_minutes: int = 15
+    # Fallback only: used when fire_result has no flag_meanings/flag_values CF
+    # attributes to read the "fire" category names from directly (see
+    # _fire_flag_values in eumetsat.py) - comma-separated raw integer codes to
+    # treat as a fire detection. 0/1/2/3 = no fire/low/mid/high confidence per
+    # EUMETSAT's own "MTG-FCI: ATBD for Active Fire Monitoring Product"
+    # (EUM/MTG/DOC/10/0613 v2A, Table 4) - so 1,2,3 here is CONFIRMED, not a
+    # guess. A real full-disk product also showed a 5th code, 4, covering
+    # ~91% of the grid (vs. a few hundred pixels each for 1/2/3) - that's not
+    # in the ATBD's fire-type table at all and is excluded here on purpose;
+    # it almost certainly covers pixels the algorithm doesn't process (sea,
+    # bare soil, sun-glint, beyond the ~70deg satellite-zenith radius - see
+    # the ATBD's section 3.5 prerequisites), not a fire class. Including it
+    # previously (old default "3,4") matched ~28M pixels and made a single
+    # product take effectively forever to geolocate+insert.
+    eumetsat_fire_result_fallback_values: str = "1,2,3"
+
+    # Sentinel-3 SLSTR Fire Radiative Power (FRP) - polar-orbiting (Sentinel-3A
+    # + -3B, a DIFFERENT satellite pair from FIRMS' own VIIRS/MODIS), served
+    # through the same EUMETSAT Data Store account as eumetsat_consumer_key/
+    # secret above - no separate registration needed. Confirmed LIVE
+    # (2026-07-19): a single pass detected the Guadalajara/La Mierla megafire
+    # with 100s of fire pixels at the same time a third-party tool (Pyrofire)
+    # showed a dense hotspot cluster there, at a moment when EUMETSAT's own
+    # MTG product (eumetsat_collection_id above) found nothing nearby - a
+    # genuinely complementary source, not a duplicate.
+    sentinel3_collection_id: str = "EO:EUM:DAT:0417"
+    # Sentinel-3's per-pass revisit over any one spot is only ~1-4x/day (2
+    # satellites, not continuous like MTG) - wider lookback than the poll
+    # interval so a slow/failed previous poll doesn't leave a product
+    # uncovered, same reasoning as eumetsat_lookback_minutes.
+    sentinel3_lookback_minutes: int = 240
+    sentinel3_poll_interval_minutes: int = 60
+    # EUMETSAT's own confidence_class flag (0=lower,1=nominal,2=higher) is
+    # coarser than this - filtering on the underlying confidence(%) directly
+    # gives finer control. 70% chosen to match the ballpark of FIRMS' own
+    # "nominal" VIIRS confidence tier; UNVERIFIED against a false-positive
+    # rate study, adjust if Sentinel-3 detections look noisier than FIRMS'.
+    sentinel3_min_confidence_pct: float = 70.0
 
     # Regional live-incident feeds (e.g. Castilla y León's INCYL) - unlike
     # admin_bulletins (periodic PDF/CSV documents), these are near-real-time

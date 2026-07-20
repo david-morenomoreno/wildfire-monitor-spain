@@ -24,7 +24,7 @@ class FireDetection(Base):
     )
 
     id = Column(Integer, primary_key=True)
-    source = Column(String(20), nullable=False)  # "FIRMS" or "EFFIS"
+    source = Column(String(20), nullable=False)  # "FIRMS", "EFFIS", "EUMETSAT", or "SENTINEL3"
     external_id = Column(String(120), nullable=False)
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
