@@ -244,3 +244,37 @@ def segment_crosses_water(lat1: float, lon1: float, lat2: float, lon2: float) ->
             tile_lon += 1
         tile_lat += 1
     return False
+
+
+def water_geometry_near(min_lat: float, min_lon: float, max_lat: float, max_lon: float) -> BaseGeometry | None:
+    """
+    Union of whatever real water body geometry (Corine 511/512/521/522/523 -
+    rivers, lakes, reservoirs, lagoons, sea) intersects the given bounding
+    box, or None if no tile in that box has any water data at all (either
+    genuinely no water there, or every relevant tile fetch failed - both
+    treated the same: "nothing to subtract", never crash the caller).
+
+    This is the missing piece the module-level KNOWN CAVEAT comment in
+    app.js's renderMap() points at: segment_crosses_water can tell you a
+    single line crosses water, but cutting a whole hull polygon needs the
+    actual water geometry so shapely can compute polygon.difference(water).
+    Reuses the same per-tile Corine cache as is_over_water/
+    segment_crosses_water, so repeated calls over the same area (e.g. one
+    per incident hull on every map render) are cheap after the first.
+    """
+    tile_lat = math.floor(min_lat / WATER_TILE_DEG)
+    shapes: list[BaseGeometry] = []
+    while tile_lat * WATER_TILE_DEG <= max_lat:
+        tile_lon = math.floor(min_lon / WATER_TILE_DEG)
+        while tile_lon * WATER_TILE_DEG <= max_lon:
+            key = (tile_lat, tile_lon)
+            if key not in _water_tile_cache:
+                _water_tile_cache[key] = _fetch_water_tile(*key)
+            shape = _water_tile_cache[key]
+            if shape is not None:
+                shapes.append(shape)
+            tile_lon += 1
+        tile_lat += 1
+    if not shapes:
+        return None
+    return reduce(lambda a, b: a.union(b), shapes)
