@@ -19,6 +19,26 @@
     html, body, #map { height: 100%; margin: 0; }
     body { font-family: var(--font-ui); }
 
+    /* ---------- Leaflet zoom control ----------
+       #incident-sidebar is full-height on the left (top:14/left:14/bottom:14,
+       width 320) and #panel's content can grow taller than the viewport on
+       the right (top:14/right:14, no bottom set) - so both leaflet-bottom
+       corners, and the top-right corner, can have their bounding boxes
+       overlap Leaflet's default zoom control position. Pin the control with
+       `position: fixed` (escaping Leaflet's per-corner absolute containers)
+       into the open gap between the two panels, clear of both regardless of
+       viewport size or panel content height, and raise its z-index above
+       both panels (1000) so it also renders on top if it were ever visually
+       close. */
+    .leaflet-control-zoom {
+      position: fixed !important;
+      top: auto !important;
+      right: auto !important;
+      left: 362px; /* clears #incident-sidebar's right edge (14 + 320 = 334) by 28px */
+      bottom: 14px;
+      z-index: 1200;
+    }
+
     /* ---------- Control panel ---------- */
     #panel {
       position: absolute;
