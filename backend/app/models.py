@@ -296,6 +296,20 @@ class CopernicusEmsActivation(Base):
     closed = Column(Boolean, nullable=False, default=False)
     n_aois = Column(Integer, nullable=True)
     n_products = Column(Integer, nullable=True)
+    # From the detail endpoint (public-activations/?code=...), fetched once
+    # an activation matches an incident - see services/copernicus_ems.py.
+    # reason is the analyst's own incident description (why this activation
+    # was requested); activator is who requested it (e.g. Spain's CENEM);
+    # report_link is a public ArcGIS StoryMap - the closest thing to a
+    # rendered, browser-viewable map this API offers (the per-product
+    # layers[] files are raw full-resolution GeoTIFFs, not displayable
+    # inline); stats_json is the top-level impact-stats object (population/
+    # roads/built-up area affected), stored as-is since its keys vary by
+    # disaster type rather than being a fixed schema.
+    reason = Column(Text, nullable=True)
+    activator = Column(String(500), nullable=True)
+    report_link = Column(String(1000), nullable=True)
+    stats_json = Column(Text, nullable=True)
     matched_incident_id = Column(Integer, ForeignKey("fire_incidents.id"), nullable=True)
     # The IncidentEvent this activation announced on its matched incident's
     # timeline - kept so a later poll (more AOIs/products, closed) updates

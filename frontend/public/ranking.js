@@ -37,6 +37,7 @@ const ICONS = {
   camera: `<svg ${ICON_SVG_ATTRS} width="13" height="13"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.2"/></svg>`,
   clock: `<svg ${ICON_SVG_ATTRS} width="11" height="11"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
   flame: `<svg ${ICON_SVG_ATTRS} width="12" height="12"><path d="M12 2c1 3-3 4-3 8a3 3 0 0 0 6 0c0-1-.5-2-1-2.5.5 2 .5 4-1 5.5a4 4 0 0 1-4-4c0-3 2-4 2-7-2 1-4 4-4 7a5 5 0 0 0 10 0c0-5-3-6-5-7z"/></svg>`,
+  badge: `<svg ${ICON_SVG_ATTRS} width="12" height="12"><circle cx="12" cy="9" r="6"/><path d="M9 14l-2 7 5-3 5 3-2-7"/></svg>`,
 };
 
 const EVENT_TYPE_ICON = {
@@ -45,6 +46,7 @@ const EVENT_TYPE_ICON = {
   telegram_message: ICONS.send,
   satellite_imagery: ICONS.camera,
   regional_status: ICONS.shield,
+  ems_activation: ICONS.badge,
 };
 
 function riskBadgeHtml(riskLevel, status) {
@@ -117,6 +119,7 @@ function rankingRowHtml(incident, sort) {
     sourceChipHtml(incident.has_regional_status, ICONS.shield, "Estado oficial regional") +
     sourceChipHtml(incident.has_satellite_imagery, ICONS.satellite, "Imágenes de satélite") +
     sourceChipHtml(incident.has_telegram_mentions, ICONS.send, "Menciones en Telegram") +
+    sourceChipHtml(incident.has_ems_activation, ICONS.badge, "Activación de Copernicus EMS Rapid Mapping") +
     `</div>` +
     `</div>`
   );

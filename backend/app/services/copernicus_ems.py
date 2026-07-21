@@ -21,12 +21,17 @@ dashboard-backend API:
   - `countries` (plural, in the response body) is a list of full country
     names ("Spain"), not ISO codes.
 
-This only builds the timeline-surfacing MVP the app actually needs today:
-polling the list endpoint and announcing a match on the incident's timeline.
-It deliberately does NOT fetch/parse the per-activation detail endpoint's
-delineation-product ZIP (shapefile/geopackage of the actual burnt-area
-polygon) - that's a real follow-up (rendering an official extent polygon
-alongside the FIRMS/EFFIS-derived hull), but out of scope until asked for.
+Once an activation matches an incident, its detail endpoint
+(public-activations/?code=EMSRxxx) is also fetched for `reason` (the
+analyst's own incident description), `activator` (who requested it), the
+top-level `stats` object (population/roads/built-up area affected), and
+`reportLink` - a public ArcGIS StoryMap, which is the closest thing to an
+actual rendered, browser-viewable map this API offers. Deliberately does NOT
+fetch/render the per-product `layers[]`/`images[]` files: confirmed live
+(2026-07-21) those are raw full-resolution GeoTIFFs (COG, ~40MB), not
+browser-displayable thumbnails - dropping that URL into an <img> tag would
+just render blank. A real delineation-polygon overlay (parsing the
+downloadPath ZIP's shapefile) would be a follow-up, not this.
 """
 
 import json
@@ -84,6 +89,14 @@ def fetch_wildfire_activations(country: str = "Spain") -> list[dict]:
     return results
 
 
+def fetch_activation_detail(code: str) -> dict | None:
+    """Per-activation detail - reason/activator/reportLink/stats. See module docstring."""
+    response = httpx.get(settings.copernicus_ems_detail_url, params={"code": code}, timeout=30.0)
+    response.raise_for_status()
+    results = response.json().get("results") or []
+    return results[0] if results else None
+
+
 def _find_matching_incident(db: Session, lat: float, lon: float) -> FireIncident | None:
     """
     Nearest FireIncident within copernicus_ems_match_deg, searched across ALL
@@ -101,17 +114,44 @@ def _find_matching_incident(db: Session, lat: float, lon: float) -> FireIncident
     return min(in_range, key=lambda pair: pair[1])[0]
 
 
-def _event_title_and_description(activation: dict) -> tuple[str, str]:
+def _format_stats(stats_json: str | None) -> str:
+    """Top-level `stats` keys/units vary by disaster type (e.g. "Roads [km]",
+    "Population [No.]") - formatted generically rather than hardcoded, with
+    unset ("-") or not-applicable ("NA") values dropped."""
+    if not stats_json:
+        return ""
+    try:
+        stats = json.loads(stats_json)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(stats, dict):
+        return ""
+    return " · ".join(f"{key}: {value}" for key, value in stats.items() if value not in (None, "-", "NA"))
+
+
+def _event_title_and_description(activation: dict, record: CopernicusEmsActivation) -> tuple[str, str]:
     code = activation.get("code", "")
     title = f"Copernicus EMS activó cartografía de emergencia ({code})"
     n_products = activation.get("n_products") or 0
     n_aois = activation.get("n_aois") or 0
     status = "Activación cerrada" if activation.get("closed") else "Activación en curso"
-    description = (
-        f"{status} · {n_aois} zona(s) de interés, {n_products} producto(s) cartográfico(s) publicado(s). "
-        f"Detalle: https://rapidmapping.emergency.copernicus.eu/{code}"
+
+    lines = [f"{status} · {n_aois} zona(s) de interés, {n_products} producto(s) cartográfico(s) publicado(s)."]
+    if record.reason:
+        reason = record.reason.strip()
+        if len(reason) > 300:
+            reason = reason[:300].rsplit(" ", 1)[0] + "…"
+        lines.append(reason)
+    stats_line = _format_stats(record.stats_json)
+    if stats_line:
+        lines.append(stats_line)
+    if record.activator:
+        lines.append(f"Activado por: {record.activator}")
+    lines.append(
+        f"Mapa oficial: {record.report_link}" if record.report_link
+        else f"Detalle: https://rapidmapping.emergency.copernicus.eu/{code}"
     )
-    return title, description
+    return title, "\n".join(lines)
 
 
 def ingest_copernicus_ems(db: Session) -> int:
@@ -163,7 +203,30 @@ def _ingest_copernicus_ems(db: Session) -> int:
         if not record.matched_incident_id:
             continue
 
-        title, description = _event_title_and_description(activation)
+        # Skip re-fetching detail for an already-closed activation that
+        # already has one - reason/stats/reportLink are stable once closed.
+        # An open activation is refetched every poll to pick up newly
+        # published products or updated impact stats.
+        if not record.closed or not record.reason:
+            try:
+                detail = fetch_activation_detail(code)
+            except Exception:
+                logger.exception("Copernicus EMS detail fetch failed for %s", code)
+                detail = None
+            if detail:
+                record.reason = detail.get("reason")
+                # Raw activator is "Country|Full Agency Name" (confirmed
+                # live, e.g. "Spain|Ministry of Interior - Centro Nacional
+                # de Emergencias...") - the country is redundant with this
+                # activation's own countries field, so just the agency name
+                # reads better in a timeline description.
+                activator = detail.get("activator")
+                record.activator = activator.split("|", 1)[-1] if activator else None
+                record.report_link = detail.get("reportLink")
+                stats = detail.get("stats")
+                record.stats_json = json.dumps(stats) if stats else None
+
+        title, description = _event_title_and_description(activation, record)
         if record.incident_event_id:
             # Already announced - just refresh the existing event (more
             # AOIs/products since discovered, or the activation closed)

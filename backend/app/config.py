@@ -146,6 +146,15 @@ class Settings(BaseSettings):
     copernicus_ems_api_url: str = (
         "https://rapidmapping.emergency.copernicus.eu/backend/dashboard-api/public-activations-info/"
     )
+    # Per-activation detail endpoint (?code=EMSRxxx) - confirmed LIVE
+    # (2026-07-21): includes `reason` (analyst's own incident description),
+    # `activator`, `reportLink` (a public ArcGIS StoryMap - the closest thing
+    # to a rendered map this API offers), and a top-level `stats` object
+    # (population/roads/built-up area affected). Per-product `images`/
+    # `layers` files are raw full-resolution GeoTIFFs (confirmed via a real
+    # byte fetch - TIFF, ~40MB), NOT browser-displayable thumbnails, so
+    # those are deliberately not fetched/rendered here.
+    copernicus_ems_detail_url: str = "https://rapidmapping.emergency.copernicus.eu/backend/dashboard-api/public-activations/"
     # Activations are analyst-produced over hours-to-days, not minutes, and
     # Spain gets maybe 0-15 wildfire activations/year even in a severe season
     # - daily polling is plenty, no need for satellite-cadence checking.
