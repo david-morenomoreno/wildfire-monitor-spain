@@ -91,10 +91,15 @@ def _parse_fire_pixels(zip_bytes: bytes) -> list[dict]:
     return pixels
 
 
-def ingest_sentinel3(db: Session) -> int:
+def ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime | None = None) -> int:
+    """
+    start/end default to the last lookback window (normal scheduler polling)
+    when omitted - pass them explicitly for a historical backfill (see
+    scripts/backfill_history.py).
+    """
     state.mark_attempt("sentinel3")
     try:
-        count = _ingest_sentinel3(db)
+        count = _ingest_sentinel3(db, start=start, end=end)
     except Exception as exc:
         record_check(db, "sentinel3", "disrupted", str(exc))
         raise
@@ -102,14 +107,26 @@ def ingest_sentinel3(db: Session) -> int:
     return count
 
 
-def _ingest_sentinel3(db: Session) -> int:
+def _ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime | None = None) -> int:
     if not is_configured():
         record_check(db, "sentinel3", "skipped", "consumer_key/consumer_secret not configured")
         return 0
 
-    end = datetime.utcnow()
-    start = end - timedelta(minutes=settings.sentinel3_lookback_minutes)
+    if end is None:
+        end = datetime.utcnow()
+    if start is None:
+        start = end - timedelta(minutes=settings.sentinel3_lookback_minutes)
     features = search_products(settings.sentinel3_collection_id, start, end, bbox=settings.firms_bbox)
+    if len(features) >= 100:
+        # See the matching warning in eumetsat.py - search_products has no
+        # pagination past page_size (default 100).
+        logger.warning(
+            "Sentinel-3 search for [%s, %s] returned %d products (>= page size) - "
+            "results may be truncated; use a narrower window if backfilling",
+            start,
+            end,
+            len(features),
+        )
 
     count = 0
     skipped_low_confidence = 0

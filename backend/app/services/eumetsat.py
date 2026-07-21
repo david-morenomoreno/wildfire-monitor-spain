@@ -246,15 +246,17 @@ def _parse_fire_pixels(zip_bytes: bytes) -> list[dict]:
     return pixels
 
 
-def ingest_eumetsat(db: Session) -> int:
+def ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime | None = None) -> int:
     """
-    Searches for new MTG Active Fire Monitoring products since the last
-    lookback window, downloads+parses each, and upserts fire pixels over
-    Spain. Skipped (not an error) when credentials aren't configured yet.
+    Searches for new MTG Active Fire Monitoring products in [start, end],
+    downloads+parses each, and upserts fire pixels over Spain. Skipped (not
+    an error) when credentials aren't configured yet. start/end default to
+    the last lookback window (normal scheduler polling) when omitted - pass
+    them explicitly for a historical backfill (see scripts/backfill_history.py).
     """
     state.mark_attempt("eumetsat")
     try:
-        count = _ingest_eumetsat(db)
+        count = _ingest_eumetsat(db, start=start, end=end)
     except Exception as exc:
         record_check(db, "eumetsat", "disrupted", str(exc))
         raise
@@ -262,14 +264,30 @@ def ingest_eumetsat(db: Session) -> int:
     return count
 
 
-def _ingest_eumetsat(db: Session) -> int:
+def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime | None = None) -> int:
     if not is_configured():
         record_check(db, "eumetsat", "skipped", "consumer_key/consumer_secret not configured")
         return 0
 
-    end = datetime.utcnow()
-    start = end - timedelta(minutes=settings.eumetsat_lookback_minutes)
+    if end is None:
+        end = datetime.utcnow()
+    if start is None:
+        start = end - timedelta(minutes=settings.eumetsat_lookback_minutes)
     features = search_products(settings.eumetsat_collection_id, start, end)
+    if len(features) >= 100:
+        # search_products has no pagination past its own page_size (default
+        # 100, see eumetsat_client.py's module docstring) - a window this
+        # full may be silently missing older products in it. Not a problem
+        # for normal short-lookback polling; a historical backfill should
+        # use a narrower window (see EUMETSAT_WINDOW_HOURS in
+        # scripts/backfill_history.py) rather than trust this is complete.
+        logger.warning(
+            "EUMETSAT search for [%s, %s] returned %d products (>= page size) - "
+            "results may be truncated; use a narrower window if backfilling",
+            start,
+            end,
+            len(features),
+        )
 
     count = 0
     skipped_outside_spain = 0
