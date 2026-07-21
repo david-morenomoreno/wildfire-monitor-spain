@@ -56,6 +56,10 @@ def ingest_effis(db: Session) -> int:
     try:
         count = _ingest_effis(db)
     except Exception as exc:
+        # See the matching comment in eumetsat.py - roll back before
+        # record_check reuses this session so its own db.commit() doesn't
+        # raise a second, unrelated PendingRollbackError and mask the cause.
+        db.rollback()
         record_check(db, "effis", "disrupted", str(exc))
         raise
     record_check(db, "effis", "ok", f"{count} features processed")

@@ -58,6 +58,7 @@ may still not match FIRMS/EFFIS for a while. Treat EUMETSAT as a
 supplementary near-real-time layer, not a replacement for FIRMS/EFFIS.
 """
 
+import hashlib
 import io
 import logging
 import zipfile
@@ -258,6 +259,13 @@ def ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime | 
     try:
         count = _ingest_eumetsat(db, start=start, end=end)
     except Exception as exc:
+        # Roll back first - a DB-level failure (e.g. a constraint violation
+        # mid-insert) leaves the session's transaction aborted, and
+        # record_check's own db.add()/db.commit() would otherwise raise a
+        # second, unrelated PendingRollbackError that masks the real cause
+        # and leaves the session broken for whatever reuses it next (e.g. a
+        # long-lived script session across many backfill windows).
+        db.rollback()
         record_check(db, "eumetsat", "disrupted", str(exc))
         raise
     record_check(db, "eumetsat", "ok", f"{count} fire pixels processed")
@@ -294,6 +302,15 @@ def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime |
     skipped_over_water = 0
     for feature in features:
         product_id = feature.get("id") or feature.get("properties", {}).get("identifier") or "unknown"
+        # Short and collision-safe regardless of product_id length - same fix
+        # as sentinel3.py's product_hash. CONFIRMED live (2026-07-21): MTG
+        # product ids (e.g. "W_XX-EUMETSAT-Darmstadt,IMG+SAT,MTI1+FCI-2-FIR--
+        # FD--x-x---x_C_EUMT_..._N__C_0048_0000") already run >120 chars
+        # alone, so every real in-Spain detection's external_id below was
+        # silently failing FireDetection.external_id's VARCHAR(120) column
+        # with StringDataRightTruncation - meaning no real EUMETSAT fire
+        # pixel had ever actually been persisted, not a sensitivity issue.
+        product_hash = hashlib.md5(product_id.encode()).hexdigest()[:12]
         date_range = (feature.get("properties", {}).get("date") or "").split("/")
         try:
             captured_at = datetime.strptime(date_range[0], "%Y-%m-%dT%H:%M:%SZ")
@@ -322,7 +339,7 @@ def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime |
                 skipped_over_water += 1
                 continue
 
-            external_id = f"{product_id}-{latitude:.4f}-{longitude:.4f}"
+            external_id = f"{product_hash}-{latitude:.4f}-{longitude:.4f}"
             stmt = (
                 insert(FireDetection)
                 .values(

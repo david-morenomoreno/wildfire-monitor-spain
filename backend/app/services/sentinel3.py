@@ -101,6 +101,10 @@ def ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime |
     try:
         count = _ingest_sentinel3(db, start=start, end=end)
     except Exception as exc:
+        # See the matching comment in eumetsat.py - roll back before
+        # record_check reuses this session so its own db.commit() doesn't
+        # raise a second, unrelated PendingRollbackError and mask the cause.
+        db.rollback()
         record_check(db, "sentinel3", "disrupted", str(exc))
         raise
     record_check(db, "sentinel3", "ok", f"{count} fire pixels processed")

@@ -59,6 +59,10 @@ def ingest_firms(db: Session, day_range: int | None = None, end_date: str | None
     try:
         count = _ingest_firms(db, day_range, end_date)
     except Exception as exc:
+        # See the matching comment in eumetsat.py - roll back before
+        # record_check reuses this session so its own db.commit() doesn't
+        # raise a second, unrelated PendingRollbackError and mask the cause.
+        db.rollback()
         record_check(db, "firms", "disrupted", str(exc))
         raise
     record_check(db, "firms", "ok", f"{count} rows processed")
