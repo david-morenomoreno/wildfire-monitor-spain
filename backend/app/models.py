@@ -104,6 +104,13 @@ class FireIncident(Base):
     centroid_lon = Column(Float, nullable=False)
     province = Column(String(255), nullable=True)
     locality = Column(String(255), nullable=True)
+    # Manual override for display name (see PATCH /api/incidents/{id}) - takes
+    # priority over `locality` everywhere an incident's name is shown, for
+    # cases where Nominatim's reverse-geocoded municipality doesn't match the
+    # name Spanish authorities actually gave the fire (e.g. "IF Los
+    # Gallardos" reverse-geocoding to "Lubrín" or "Bédar" depending on which
+    # side of a municipal boundary the centroid landed on).
+    official_name = Column(String(255), nullable=True)
     country_code = Column(String(2), nullable=True)  # ISO 3166-1 alpha-2, e.g. "ES" - from Nominatim
     status = Column(String(20), nullable=False, default="active")  # active/cooling/archived
     severity_score = Column(Float, nullable=False, default=0.0)

@@ -5,6 +5,13 @@
 
 let apiBaseUrl = "http://localhost:8000";
 let lastRanked = [];
+// Populated only while merge mode is active - see loadMergeCandidates(). Uses
+// GET /api/incidents (undeduped) rather than /api/incidents/rankings,
+// because the rankings endpoint collapses probable-duplicate rows down to
+// one "richest" row per (locality, province, first-detection day) for
+// display (_dedupe_by_place in routers/incidents.py) - exactly the rows an
+// admin needs to SEE and select in order to merge them away for good.
+let mergeCandidates = [];
 
 async function loadConfig() {
   const res = await fetch("/config");
@@ -56,8 +63,18 @@ function formatDateTime(iso) {
   return new Date(iso).toLocaleString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
+// The "area" sort itself only ranks EFFIS-confirmed incidents today (the
+// backend filters to area_ha != null for that sort - see
+// get_incident_rankings), so this fallback is currently defensive/future-
+// proofing rather than reachable - but the report view (reportHtml below)
+// DOES hit it constantly, since most incidents opened from a non-area sort
+// have no official area_ha at all.
 function metricValueFor(sort, incident) {
-  if (sort === "area") return incident.area_ha != null ? Math.round(incident.area_ha).toLocaleString("es-ES") : "—";
+  if (sort === "area") {
+    if (incident.area_ha != null) return Math.round(incident.area_ha).toLocaleString("es-ES");
+    if (incident.area_ha_estimated != null) return `${Math.round(incident.area_ha_estimated).toLocaleString("es-ES")} (est.)`;
+    return "—";
+  }
   if (sort === "detections") return incident.detection_count.toLocaleString("es-ES");
   if (sort === "duration") return durationLabel(incident.duration_hours);
   return Math.round(incident.severity_score).toLocaleString("es-ES");
@@ -68,13 +85,27 @@ function sourceChipHtml(present, icon, title) {
   return `<span class="source-chip${present ? " present" : ""}" title="${title}">${icon}</span>`;
 }
 
+// Incident display name: a manually-set official_name always wins over the
+// reverse-geocoded locality (see backend PATCH /api/incidents/{id}).
+function displayName(incident) {
+  return incident.official_name || incident.locality || `Foco sin nombre #${incident.id}`;
+}
+
+let mergeModeActive = false;
+const selectedForMerge = new Set();
+
 function rankingRowHtml(incident, sort) {
   const place = [incident.locality, incident.province].filter(Boolean).join(", ") || "Ubicación sin resolver";
+  const checkbox = mergeModeActive
+    ? `<input type="checkbox" class="row-select-checkbox" data-select-id="${incident.id}" ${selectedForMerge.has(incident.id) ? "checked" : ""} />`
+    : "";
+  const selectedClass = mergeModeActive && selectedForMerge.has(incident.id) ? " selected" : "";
   return (
-    `<div class="ranking-row" data-id="${incident.id}">` +
+    `<div class="ranking-row${mergeModeActive ? " merge-mode" : ""}${selectedClass}" data-id="${incident.id}">` +
+    (mergeModeActive ? `<div>${checkbox}</div>` : "") +
     `<div class="ranking-rank">${incident.rank}</div>` +
     `<div class="ranking-name-block">` +
-    `<div class="ranking-name">${incident.locality || `Foco sin nombre #${incident.id}`}</div>` +
+    `<div class="ranking-name">${displayName(incident)}</div>` +
     `<div class="ranking-place">${place}</div>` +
     `</div>` +
     `<div>${riskBadgeHtml(incident.risk_level, incident.status)}</div>` +
@@ -91,6 +122,14 @@ function rankingRowHtml(incident, sort) {
   );
 }
 
+function updateMergeBar() {
+  const bar = document.getElementById("merge-bar");
+  const count = selectedForMerge.size;
+  bar.classList.toggle("visible", mergeModeActive && count > 0);
+  document.getElementById("merge-bar-count").innerHTML = `<b>${count}</b> incidente${count === 1 ? "" : "s"} seleccionado${count === 1 ? "" : "s"}`;
+  document.getElementById("merge-bar-btn").disabled = count < 2;
+}
+
 function renderRanking(incidents, sort) {
   const content = document.getElementById("ranking-content");
   if (incidents.length === 0) {
@@ -99,10 +138,46 @@ function renderRanking(incidents, sort) {
   }
   content.innerHTML = `<div class="ranking-table">${incidents.map((inc) => rankingRowHtml(inc, sort)).join("")}</div>`;
   content.querySelectorAll(".ranking-row").forEach((row) => {
-    row.addEventListener("click", () => {
-      window.location.hash = `#/incident/${row.dataset.id}`;
-    });
+    const id = Number(row.dataset.id);
+    if (mergeModeActive) {
+      row.addEventListener("click", (event) => {
+        if (event.target.matches(".row-select-checkbox")) return;
+        toggleSelection(id);
+      });
+      const checkboxEl = row.querySelector(".row-select-checkbox");
+      if (checkboxEl) checkboxEl.addEventListener("change", () => toggleSelection(id));
+    } else {
+      row.addEventListener("click", () => {
+        window.location.hash = `#/incident/${id}`;
+      });
+    }
   });
+  updateMergeBar();
+}
+
+function toggleSelection(id) {
+  if (selectedForMerge.has(id)) selectedForMerge.delete(id);
+  else selectedForMerge.add(id);
+  renderRanking(mergeCandidates, "detections");
+}
+
+// Fetches the full, undeduped incident list (see mergeCandidates comment
+// above) and adds the rank/duration_hours fields rankingRowHtml/metricValueFor
+// expect (rankings-only fields on RankedIncidentOut, absent from plain
+// FireIncidentOut), sorted by detection count so likely-duplicate rows
+// (identical/near-identical counts) sit next to each other.
+async function loadMergeCandidates() {
+  const content = document.getElementById("ranking-content");
+  content.innerHTML = `<div class="empty">Cargando incidentes (incluyendo posibles duplicados)…</div>`;
+  const res = await fetch(`${apiBaseUrl}/api/incidents?hours=${24 * 30}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const incidents = await res.json();
+  incidents.sort((a, b) => b.detection_count - a.detection_count);
+  mergeCandidates = incidents.map((inc, index) => ({
+    ...inc,
+    rank: index + 1,
+    duration_hours: (new Date(inc.last_detected_at) - new Date(inc.first_detected_at)) / 3600000,
+  }));
 }
 
 function updateScopeNote(days, count) {
@@ -280,14 +355,29 @@ function timelineSectionHtml(events) {
 
 function reportHtml(report) {
   const incident = report.incident;
-  const name = incident.locality || `Foco sin nombre #${incident.id}`;
+  const name = displayName(incident);
   const place = [incident.province, incident.country_code].filter(Boolean).join(" · ");
   const hasOfficialArea = incident.area_ha != null;
+  // area_ha is only ever populated from an EFFIS burnt-area detection
+  // (most incidents never get one) - area_ha_estimated is the backend's
+  // concave-hull estimate over this incident's own detections (see
+  // services/area_estimate.py), computed only when the official figure is
+  // missing. Same "oficial" vs "estimado" honesty convention the map's own
+  // sidebar uses (app.js) - never presented as if it were the EFFIS number.
+  const hasEstimatedArea = !hasOfficialArea && incident.area_ha_estimated != null;
 
   return (
     `<div class="report-header">` +
     `<div class="report-title">${name}</div>` +
     (place ? `<div class="report-subtitle">${place}</div>` : "") +
+    `<div class="rename-row">` +
+    `<button class="rename-btn" id="rename-toggle-btn">✎ Editar nombre</button>` +
+    `</div>` +
+    `<div class="rename-edit" id="rename-edit">` +
+    `<input type="text" id="rename-input" placeholder="Nombre oficial (p. ej. IF Los Gallardos)" value="${incident.official_name ? incident.official_name.replace(/"/g, "&quot;") : ""}" />` +
+    `<button class="rename-btn" id="rename-save-btn">Guardar</button>` +
+    `<button class="rename-btn" id="rename-cancel-btn">Cancelar</button>` +
+    `</div>` +
     `<div class="report-badges">` +
     `${riskBadgeHtml(incident.risk_level, incident.status)}` +
     `<span class="risk-badge" style="background:var(--bg-elevated-hover); color:var(--text-secondary);">${STATUS_LABELS[incident.status] || incident.status}</span>` +
@@ -297,7 +387,9 @@ function reportHtml(report) {
     `<div class="report-metric"><div class="report-metric-value">${durationLabel(report.duration_hours)}</div><div class="report-metric-label">Tiempo activo</div></div>` +
     (hasOfficialArea
       ? `<div class="report-metric"><div class="report-metric-value">${Math.round(incident.area_ha).toLocaleString("es-ES")}</div><div class="report-metric-label">Hectáreas (oficial)</div></div>`
-      : "") +
+      : hasEstimatedArea
+        ? `<div class="report-metric"><div class="report-metric-value">${Math.round(incident.area_ha_estimated).toLocaleString("es-ES")}</div><div class="report-metric-label">Hectáreas (estimado)</div></div>`
+        : "") +
     `<div class="report-metric"><div class="report-metric-value">${formatDateTime(incident.first_detected_at)}</div><div class="report-metric-label">Primera detección</div></div>` +
     `<div class="report-metric"><div class="report-metric-value">${formatDateTime(incident.last_detected_at)}</div><div class="report-metric-label">Última detección</div></div>` +
     `</div>` +
@@ -334,9 +426,42 @@ async function loadReport(incidentId) {
     const report = await res.json();
     content.innerHTML = reportHtml(report);
     attachLightboxHandlers();
+    attachRenameHandlers(incidentId);
   } catch (err) {
     content.innerHTML = `<div class="empty">No se pudo cargar el informe: ${err.message}</div>`;
   }
+}
+
+// ---------- Rename (manual name override) ----------
+function attachRenameHandlers(incidentId) {
+  const toggleBtn = document.getElementById("rename-toggle-btn");
+  const editRow = document.getElementById("rename-edit");
+  const input = document.getElementById("rename-input");
+  const saveBtn = document.getElementById("rename-save-btn");
+  const cancelBtn = document.getElementById("rename-cancel-btn");
+
+  toggleBtn.addEventListener("click", () => {
+    editRow.classList.add("active");
+    input.focus();
+  });
+  cancelBtn.addEventListener("click", () => editRow.classList.remove("active"));
+  saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Guardando…";
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/incidents/${incidentId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ official_name: input.value.trim() || null }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await loadReport(incidentId);
+    } catch (err) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Guardar";
+      alert(`No se pudo guardar el nombre: ${err.message}`);
+    }
+  });
 }
 
 function attachLightboxHandlers() {
@@ -377,6 +502,106 @@ document.getElementById("report-back").addEventListener("click", () => {
 window.addEventListener("hashchange", route);
 document.getElementById("sort-select").addEventListener("change", loadRanking);
 document.getElementById("days-select").addEventListener("change", loadRanking);
+
+// ---------- Merge mode ----------
+document.getElementById("merge-mode-toggle").addEventListener("click", async () => {
+  mergeModeActive = !mergeModeActive;
+  selectedForMerge.clear();
+  const toggleBtn = document.getElementById("merge-mode-toggle");
+  toggleBtn.classList.toggle("active", mergeModeActive);
+  toggleBtn.textContent = mergeModeActive ? "Cancelar selección" : "Fusionar incidentes";
+  if (mergeModeActive) {
+    try {
+      await loadMergeCandidates();
+      renderRanking(mergeCandidates, "detections");
+    } catch (err) {
+      document.getElementById("ranking-content").innerHTML = `<div class="empty">No se pudo cargar la lista para fusión: ${err.message}</div>`;
+    }
+  } else {
+    renderRanking(lastRanked, document.getElementById("sort-select").value);
+  }
+});
+
+document.getElementById("merge-bar-btn").addEventListener("click", () => openMergeModal());
+
+function selectedIncidents() {
+  const source = mergeModeActive ? mergeCandidates : lastRanked;
+  return source.filter((inc) => selectedForMerge.has(inc.id));
+}
+
+function openMergeModal() {
+  const incidents = selectedIncidents();
+  if (incidents.length < 2) return;
+  document.getElementById("merge-modal-count").textContent = incidents.length;
+  document.getElementById("merge-modal-error").textContent = "";
+  document.getElementById("merge-name-input").value = incidents.map((i) => i.official_name).find(Boolean) || "";
+
+  const defaultSurvivor = incidents.reduce((a, b) => (b.detection_count > a.detection_count ? b : a));
+  const list = document.getElementById("merge-survivor-list");
+  list.innerHTML = incidents
+    .map(
+      (inc) =>
+        `<label class="modal-survivor-option">` +
+        `<input type="radio" name="survivor" value="${inc.id}" ${inc.id === defaultSurvivor.id ? "checked" : ""} />` +
+        `#${inc.id} — ${displayName(inc)} (${inc.detection_count} detecciones, ${STATUS_LABELS[inc.status] || inc.status})` +
+        `</label>`
+    )
+    .join("");
+
+  document.getElementById("merge-modal").classList.add("active");
+}
+
+function closeMergeModal() {
+  document.getElementById("merge-modal").classList.remove("active");
+}
+
+document.getElementById("merge-modal-cancel").addEventListener("click", closeMergeModal);
+document.getElementById("merge-modal").addEventListener("click", (event) => {
+  if (event.target.id === "merge-modal") closeMergeModal();
+});
+
+document.getElementById("merge-modal-confirm").addEventListener("click", async () => {
+  const incidents = selectedIncidents();
+  const survivorInput = document.querySelector('input[name="survivor"]:checked');
+  const confirmBtn = document.getElementById("merge-modal-confirm");
+  const errorEl = document.getElementById("merge-modal-error");
+  if (!survivorInput) {
+    errorEl.textContent = "Selecciona un incidente superviviente.";
+    return;
+  }
+  const officialName = document.getElementById("merge-name-input").value.trim();
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = "Fusionando…";
+  errorEl.textContent = "";
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/incidents/merge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        incident_ids: incidents.map((i) => i.id),
+        survivor_id: Number(survivorInput.value),
+        official_name: officialName || null,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail ? JSON.stringify(body.detail) : `HTTP ${res.status}`);
+    }
+    const merged = await res.json();
+    closeMergeModal();
+    mergeModeActive = false;
+    selectedForMerge.clear();
+    document.getElementById("merge-mode-toggle").classList.remove("active");
+    document.getElementById("merge-mode-toggle").textContent = "Fusionar incidentes";
+    await loadRanking();
+    window.location.hash = `#/incident/${merged.id}`;
+  } catch (err) {
+    errorEl.textContent = `No se pudo fusionar: ${err.message}`;
+  } finally {
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = "Confirmar fusión";
+  }
+});
 
 (function initThemeToggle() {
   const btn = document.getElementById("theme-toggle");

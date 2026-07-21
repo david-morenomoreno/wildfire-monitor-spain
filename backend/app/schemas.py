@@ -27,12 +27,24 @@ class FireIncidentOut(BaseModel):
     centroid_lon: float
     province: Optional[str] = None
     locality: Optional[str] = None
+    # Manual override set via PATCH /api/incidents/{id} - see models.FireIncident.
+    # Takes priority over `locality` wherever this incident's name is displayed.
+    official_name: Optional[str] = None
     country_code: Optional[str] = None
     status: str
     severity_score: float
     risk_level: str
     detection_count: int
     area_ha: Optional[float] = None
+    # Best-effort concave-hull estimate over this incident's own detection
+    # points (see services/area_estimate.py), computed only when area_ha
+    # itself is null - i.e. no EFFIS burnt-area detection ever matched this
+    # incident, which is most of them. Always None when area_ha is set:
+    # EFFIS's own reported figure is authoritative and never gets an
+    # estimate layered alongside it. Populated by the rankings/report
+    # endpoints only (see routers/incidents.py); other endpoints leave it
+    # None rather than pay for the extra query on every list/detail call.
+    area_ha_estimated: Optional[float] = None
     first_detected_at: datetime
     last_detected_at: datetime
     updated_at: datetime
@@ -43,6 +55,22 @@ class FireIncidentOut(BaseModel):
     has_regional_status: bool = False
     has_telegram_mentions: bool = False
     has_satellite_imagery: bool = False
+
+
+class IncidentRenameRequest(BaseModel):
+    # Nullable so the same endpoint can also be used to CLEAR an override
+    # (fall back to the reverse-geocoded locality again) by passing null.
+    official_name: Optional[str] = None
+
+
+class IncidentMergeRequest(BaseModel):
+    incident_ids: list[int]
+    # Which of incident_ids survives and absorbs the others - defaults to
+    # the one with the most detections (see routers/incidents.py) when omitted.
+    survivor_id: Optional[int] = None
+    # Optional - set the survivor's official_name as part of the same request
+    # (e.g. merge the trio AND name the result "IF Los Gallardos" in one step).
+    official_name: Optional[str] = None
 
 
 class RankedIncidentOut(FireIncidentOut):

@@ -2,6 +2,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from app.models import FireDetection, FireIncident, IncidentEvent
@@ -32,6 +33,33 @@ INCIDENTS_WINDOW_HOURS = 24 * 30  # matches the UI's longest "date range" option
 
 ACTIVE_AFTER_HOURS = 24
 COOLING_AFTER_HOURS = 24 * 7
+
+# Archived incidents ARE eligible for reassociation (a real fire can flare up
+# again well after it's gone quiet and auto-archived - confirmed live: the
+# "IF Los Gallardos" fire near Lubrín/Bédar (Almería) went quiet for ~2 days,
+# auto-archived, then a genuine new detection cluster landed a few hundred
+# metres away days later and - because archived incidents were excluded from
+# matching entirely - created a brand-new incident row instead of
+# reactivating the archived one). But an incident archived a long time ago
+# (e.g. last season) shouldn't be reactivated just because a new, unrelated
+# fire starts nearby - so only incidents archived "recently" are considered.
+# 45 days comfortably covers a lull-then-reflare within the same fire season
+# without reaching back into an entirely separate season/ignition.
+ARCHIVED_REASSOCIATION_MAX_AGE_DAYS = 45
+
+# Serializes concurrent rebuild_incidents() calls across processes (e.g. the
+# scheduler's own interval job overlapping with the on-startup rebuild that
+# runs every time the backend container restarts/redeploys). Without this,
+# two concurrent runs can both SELECT the same "no existing incident matches
+# this cluster yet" result (neither has committed its INSERT yet) and both
+# create a FireIncident row for the same cluster - confirmed live: incidents
+# 99 and 7741 are byte-for-byte identical (same centroid, same
+# first/last_detected_at, same detection_count) but resolved to two
+# different localities (Lubrín vs Bédar), consistent with two independent,
+# concurrent reverse_geocode calls for the same near-boundary point rather
+# than a matching-logic bug. Any fixed constant works as the lock key; this
+# one has no other meaning.
+_REBUILD_LOCK_KEY = 918_273_645
 
 
 def group_by_proximity(points: list[tuple[float, float]], threshold_deg: float) -> list[list[int]]:
@@ -119,11 +147,19 @@ def _status(last_detected_at: datetime, now: datetime) -> str:
 def rebuild_incidents(db: Session) -> int:
     """
     Re-clusters recent FireDetection rows into FireIncident records, matching
-    each cluster to an existing (non-archived) incident by centroid proximity
-    so ids/slugs stay stable across runs, or creating a new one. Appends
-    IncidentEvent rows when an incident is created or grows. Returns the
-    number of incidents touched.
+    each cluster to an existing incident (active/cooling, or archived
+    recently enough - see ARCHIVED_REASSOCIATION_MAX_AGE_DAYS) by centroid
+    proximity so ids/slugs stay stable across runs, or creating a new one.
+    Appends IncidentEvent rows when an incident is created, grows, or is
+    reactivated from archived. Returns the number of incidents touched.
+
+    Takes a Postgres advisory lock for its entire duration so two overlapping
+    calls (e.g. scheduler tick vs. on-startup rebuild during a redeploy)
+    never run their match-then-insert logic concurrently - see
+    _REBUILD_LOCK_KEY above for why that matters.
     """
+    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _REBUILD_LOCK_KEY})
+
     now = datetime.utcnow()
     since = now - timedelta(hours=INCIDENTS_WINDOW_HOURS)
     detections = (
@@ -138,8 +174,16 @@ def rebuild_incidents(db: Session) -> int:
     points = [(d.latitude, d.longitude) for d in detections]
     groups = group_by_proximity(points, REGION_LINK_DEG)
 
+    archived_cutoff = now - timedelta(days=ARCHIVED_REASSOCIATION_MAX_AGE_DAYS)
     existing_incidents = (
-        db.query(FireIncident).filter(FireIncident.status != "archived").all()
+        db.query(FireIncident)
+        .filter(
+            or_(
+                FireIncident.status != "archived",
+                FireIncident.last_detected_at >= archived_cutoff,
+            )
+        )
+        .all()
     )
     existing_incidents_by_id = {inc.id: inc for inc in existing_incidents}
 
