@@ -9,6 +9,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import FireDetection
 from app.schemas import FireDetectionOut
+from app.services.copernicus_ems import ingest_copernicus_ems
 from app.services.effis import ingest_effis
 from app.services.eumetsat import ingest_eumetsat
 from app.services.firms import ingest_firms
@@ -120,3 +121,19 @@ def refresh_sentinel3(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Sentinel-3 fetch failed: {exc}") from exc
     return {"source": "SENTINEL3", "skipped": False, "ingested": count}
+
+
+@router.post("/refresh/copernicus-ems")
+def refresh_copernicus_ems(
+    force: bool = Query(False, description="Bypass the refresh cooldown and hit Copernicus EMS regardless"),
+    db: Session = Depends(get_db),
+):
+    if not force:
+        skipped = _cooldown_response("COPERNICUS_EMS", "copernicus_ems", settings.copernicus_ems_interval_minutes)
+        if skipped:
+            return skipped
+    try:
+        count = ingest_copernicus_ems(db)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Copernicus EMS fetch failed: {exc}") from exc
+    return {"source": "COPERNICUS_EMS", "skipped": False, "ingested": count}

@@ -55,6 +55,7 @@ class FireIncidentOut(BaseModel):
     has_regional_status: bool = False
     has_telegram_mentions: bool = False
     has_satellite_imagery: bool = False
+    has_ems_activation: bool = False
 
 
 class IncidentRenameRequest(BaseModel):

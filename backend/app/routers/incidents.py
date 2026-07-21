@@ -50,6 +50,7 @@ _SOURCE_FLAG_EVENT_TYPES = {
     "regional_status": "has_regional_status",
     "telegram_message": "has_telegram_mentions",
     "satellite_imagery": "has_satellite_imagery",
+    "ems_activation": "has_ems_activation",
 }
 
 

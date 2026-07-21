@@ -8,6 +8,7 @@ from app.config import settings
 from app.models import (
     AdminBulletin,
     AdminSource,
+    CopernicusEmsActivation,
     FireDetection,
     RegionalIncident,
     RegionalIncidentSource,
@@ -143,6 +144,24 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": f"{sentinel3_count} detections stored",
             "refresh_url": "/api/fires/refresh/sentinel3?force=true",
             "last_success_at": last_success.get("sentinel3"),
+        }
+    )
+
+    ems_count = db.query(CopernicusEmsActivation).count()
+    ems_matched_count = (
+        db.query(CopernicusEmsActivation).filter(CopernicusEmsActivation.matched_incident_id.isnot(None)).count()
+    )
+    ems_seconds = state.seconds_since_last_attempt("copernicus_ems")
+    sources.append(
+        {
+            "key": "copernicus_ems",
+            "category": "satellite",
+            "name": "Copernicus EMS Rapid Mapping",
+            "url": "https://rapidmapping.emergency.copernicus.eu/",
+            "status": "active" if (ems_seconds is not None or ems_count > 0) else "not yet polled",
+            "detail": f"{ems_count} Spain wildfire activations tracked, {ems_matched_count} matched to an incident",
+            "refresh_url": "/api/fires/refresh/copernicus-ems?force=true",
+            "last_success_at": last_success.get("copernicus_ems"),
         }
     )
 

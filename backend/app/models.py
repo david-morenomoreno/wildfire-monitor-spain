@@ -270,6 +270,43 @@ class SatelliteScene(Base):
     discovered_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class CopernicusEmsActivation(Base):
+    """
+    A Copernicus EMS Rapid Mapping "activation" - an analyst-produced,
+    officially delineated disaster-extent map. Unlike EFFIS's automated
+    burnt-area detection, an activation can only be triggered by an
+    authorized body (Spain's Protección Civil, or EU-level monitoring via
+    EFFIS/GDACS alerts) for events serious enough to warrant national
+    civil-protection escalation - so this is a rare "officially confirmed by
+    the EU" marker on major incidents, not a routine feed (confirmed live
+    2026-07-21: Spain gets roughly 0-15 wildfire activations/year). See
+    services/copernicus_ems.py.
+    """
+
+    __tablename__ = "copernicus_ems_activations"
+    __table_args__ = (UniqueConstraint("code", name="uq_ems_activation_code"),)
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(20), nullable=False)  # e.g. "EMSR898"
+    name = Column(String(500), nullable=True)
+    centroid_lat = Column(Float, nullable=True)
+    centroid_lon = Column(Float, nullable=True)
+    event_time = Column(DateTime, nullable=True)
+    activation_time = Column(DateTime, nullable=True)
+    closed = Column(Boolean, nullable=False, default=False)
+    n_aois = Column(Integer, nullable=True)
+    n_products = Column(Integer, nullable=True)
+    matched_incident_id = Column(Integer, ForeignKey("fire_incidents.id"), nullable=True)
+    # The IncidentEvent this activation announced on its matched incident's
+    # timeline - kept so a later poll (more AOIs/products, closed) updates
+    # that same row instead of appending a duplicate "new activation" event
+    # every time the scheduler re-fetches this still-open activation.
+    incident_event_id = Column(Integer, ForeignKey("incident_events.id"), nullable=True)
+    raw_json = Column(Text, nullable=True)
+    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class RegionalIncidentSource(Base):
     """
     A regional government's live per-fire operational status feed (as opposed

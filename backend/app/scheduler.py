@@ -6,6 +6,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.services.admin_bulletins.sync import sync_all_regions
 from app.services.copernicus import discover_for_active_incidents
+from app.services.copernicus_ems import ingest_copernicus_ems
 from app.services.effis import ingest_effis
 from app.services.eumetsat import ingest_eumetsat
 from app.services.firms import ingest_firms
@@ -106,6 +107,17 @@ def _run_copernicus_discovery_job():
         db.close()
 
 
+def _run_copernicus_ems_job():
+    db = SessionLocal()
+    try:
+        count = ingest_copernicus_ems(db)
+        logger.info("Copernicus EMS: %d activations newly matched", count)
+    except Exception:
+        logger.exception("Copernicus EMS ingest failed")
+    finally:
+        db.close()
+
+
 def _run_regional_incidents_job():
     db = SessionLocal()
     try:
@@ -177,6 +189,12 @@ def start_scheduler() -> BackgroundScheduler:
         "interval",
         minutes=settings.copernicus_discovery_interval_minutes,
         id="copernicus_discovery",
+    )
+    scheduler.add_job(
+        _run_copernicus_ems_job,
+        "interval",
+        minutes=settings.copernicus_ems_interval_minutes,
+        id="copernicus_ems_ingest",
     )
     scheduler.add_job(
         _run_regional_incidents_job,

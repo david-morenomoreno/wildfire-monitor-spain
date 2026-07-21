@@ -744,6 +744,8 @@ const ICONS = {
     `<svg ${ICON_SVG_ATTRS} width="13" height="13" class="icon"><path d="M12 3s6 6.5 6 11a6 6 0 1 1-12 0c0-4.5 6-11 6-11z"/></svg>`,
   camera:
     `<svg ${ICON_SVG_ATTRS} width="14" height="14" class="icon"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.2"/></svg>`,
+  badge:
+    `<svg ${ICON_SVG_ATTRS} width="13" height="13" class="icon"><circle cx="12" cy="9" r="6"/><path d="M9 14l-2 7 5-3 5 3-2-7"/></svg>`,
 };
 
 // Cache of Telegram messages matched to an incident (parallel to
@@ -1607,6 +1609,7 @@ const EVENT_TYPE_ICON = {
   telegram_message: ICONS.send,
   satellite_imagery: ICONS.camera,
   regional_status: ICONS.shield,
+  ems_activation: ICONS.badge,
 };
 
 // Consecutive same-day "detection" events (see dailyDetectionCounts' regex

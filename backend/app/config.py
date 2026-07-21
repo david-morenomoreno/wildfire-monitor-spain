@@ -136,6 +136,26 @@ class Settings(BaseSettings):
     # rate study, adjust if Sentinel-3 detections look noisier than FIRMS'.
     sentinel3_min_confidence_pct: float = 70.0
 
+    # Copernicus EMS Rapid Mapping - official, analyst-produced fire-extent
+    # delineation maps. No auth needed - confirmed LIVE (2026-07-21): plain
+    # unauthenticated JSON, standard DRF pagination (count/next/previous/
+    # results), and `category`/`country` (singular) query params both work
+    # and AND together server-side (e.g. ?category=Wildfire&country=Spain
+    # narrowed 233 total activations to 19). `centroid` is returned as a WKT
+    # string "POINT (lon lat)", not a coordinate array or GeoJSON.
+    copernicus_ems_api_url: str = (
+        "https://rapidmapping.emergency.copernicus.eu/backend/dashboard-api/public-activations-info/"
+    )
+    # Activations are analyst-produced over hours-to-days, not minutes, and
+    # Spain gets maybe 0-15 wildfire activations/year even in a severe season
+    # - daily polling is plenty, no need for satellite-cadence checking.
+    copernicus_ems_interval_minutes: int = 1440
+    # Degrees around an activation's centroid to match against an existing
+    # FireIncident - matches INCIDENT_REASSOCIATION_DEG's ballpark (~16.7km)
+    # since an EMS analyst's centroid and this app's own FIRMS-derived
+    # centroid for the same real fire won't be pixel-identical.
+    copernicus_ems_match_deg: float = 0.2
+
     # Regional live-incident feeds (e.g. Castilla y León's INCYL) - unlike
     # admin_bulletins (periodic PDF/CSV documents), these are near-real-time
     # per-fire operational status, so poll closer to the satellite cadence.
