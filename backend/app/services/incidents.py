@@ -234,20 +234,35 @@ def rebuild_incidents(db: Session) -> int:
 
     touched = 0
     for key, group in merged_populations.items():
+        match = existing_incidents_by_id[int(key.split("-", 1)[1])] if key.startswith("existing-") else None
+
         lat_sum = sum(d.latitude for d in group)
         lon_sum = sum(d.longitude for d in group)
         centroid_lat = lat_sum / len(group)
         centroid_lon = lon_sum / len(group)
+        # This pass's `group` only ever contains detections within the last
+        # INCIDENTS_WINDOW_HOURS (30 days) - see the `detections` query at the
+        # top of this function. Without anchoring to the existing incident's
+        # own first_detected_at, a fire whose earliest detections eventually
+        # age out of that window would have its true ignition date silently
+        # overwritten FORWARD in time on the next rebuild pass (confirmed
+        # live: an incident's own "Primera detección" timeline event stayed
+        # at its real July 4 origin while first_detected_at itself drifted to
+        # July 22 once the window moved past the 4th - same root cause behind
+        # a fire's displayed name/origin town appearing to silently change).
+        # last_detected_at is taken the same way for symmetry/safety, though
+        # in practice the group's own max should already be >= it.
         first_detected_at = min(d.acquired_at for d in group)
         last_detected_at = max(d.acquired_at for d in group)
+        if match is not None:
+            first_detected_at = min(first_detected_at, match.first_detected_at)
+            last_detected_at = max(last_detected_at, match.last_detected_at)
         area_ha = max((d.area_ha for d in group if d.area_ha is not None), default=None)
         detection_count = len(group)
         duration_hours = (last_detected_at - first_detected_at).total_seconds() / 3600
         severity_score = _severity(detection_count, area_ha, duration_hours)
         risk_level = _risk_level(severity_score)
         status = _status(last_detected_at, now)
-
-        match = existing_incidents_by_id[int(key.split("-", 1)[1])] if key.startswith("existing-") else None
 
         # Only hit Nominatim when this incident doesn't already have a name -
         # matched incidents keep their previously-resolved locality/province
