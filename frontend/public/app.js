@@ -907,7 +907,7 @@ function regionPopupHtml(
   // own nearest-town name instead of the incident's name is exactly the
   // confusing "La Mierla" vs "Arbancón" split confirmed live this session -
   // same fire, two different popup titles depending which part you clicked.
-  const title = matchedIncident && matchedIncident.locality ? matchedIncident.locality : geo ? geo.locality : "Área de incendio estimada";
+  const title = matchedIncident ? displayName(matchedIncident) : geo ? geo.locality : "Área de incendio estimada";
   const subtitle =
     matchedIncident && matchedIncident.province
       ? `<span class="card-subtitle"> · ${matchedIncident.province}</span>`
@@ -1003,7 +1003,7 @@ function attachGeocode(polygon, group, earliest, mostRecent, matchedIncident, gr
   // title - keeps the hover tooltip consistent with the popup instead of
   // showing a different per-point nearest-town name for a fire that spans
   // more than one.
-  const displayLocality = () => (matchedIncident && matchedIncident.locality ? matchedIncident.locality : geo && geo.locality);
+  const displayLocality = () => (matchedIncident ? displayName(matchedIncident) : geo && geo.locality);
 
   polygon.bindPopup(render());
   if (displayLocality()) polygon.bindTooltip(displayLocality(), { sticky: true });
@@ -1442,6 +1442,14 @@ function relativeTime(iso) {
 // most recent renderMap() pass, so a brand-new incident (or one outside the
 // current map viewport/zoom) simply won't have a hectares figure yet here -
 // that's a one-refresh lag, not a bug, and it self-corrects on the next pass.
+// A manually-set official_name (see PATCH /api/incidents/{id}, set from the
+// ranking page's rename control) always wins over the reverse-geocoded
+// locality wherever an incident's name is displayed - same rule ranking.js's
+// own displayName() already applies to the ranking table/report tab.
+function displayName(incident) {
+  return (incident && (incident.official_name || incident.locality)) || `Foco sin nombre #${incident.id}`;
+}
+
 function incidentAreaHa(incident) {
   const growth = incidentEstimatesById.get(incident.id) || null;
   if (incident.area_ha != null) return { areaHa: incident.area_ha, isOfficial: true };
@@ -1450,7 +1458,7 @@ function incidentAreaHa(incident) {
 }
 
 function incidentCardHtml(incident) {
-  const name = incident.locality || `Foco sin nombre #${incident.id}`;
+  const name = displayName(incident);
   const place = incident.province ? `${name} · ${incident.province}` : name;
   const area = incidentAreaHa(incident);
   const areaLine = area
@@ -1503,7 +1511,7 @@ function incidentPassesFilters(incident, filters) {
   if (filters.statuses.length && !filters.statuses.includes(incident.status)) return false;
   if (filters.sourceKeys.length && !filters.sourceKeys.some((key) => incident[key])) return false;
   if (filters.searchText) {
-    const haystack = normalizeSearchText(`${incident.locality || ""} ${incident.province || ""}`);
+    const haystack = normalizeSearchText(`${incident.official_name || ""} ${incident.locality || ""} ${incident.province || ""}`);
     if (!haystack.includes(filters.searchText)) return false;
   }
   return true;
@@ -1711,7 +1719,7 @@ async function showIncidentDetail(incident) {
     refreshIncidentList();
   });
 
-  const name = incident.locality || `Foco sin nombre #${incident.id}`;
+  const name = displayName(incident);
   const body = document.getElementById("sidebar-body");
 
   // Prefer the official EFFIS area (more accurate) over our own hull-based
@@ -2452,7 +2460,7 @@ function notifyNewCriticalIncidents(incidents) {
   criticalActive.forEach((incident) => {
     if (notifiedCriticalIncidentIds.has(incident.id)) return;
     notifiedCriticalIncidentIds.add(incident.id);
-    const name = incident.locality || `Foco sin nombre #${incident.id}`;
+    const name = displayName(incident);
     showBrowserNotification(
       "🔥 Nuevo incendio crítico",
       `${name}${incident.province ? " · " + incident.province : ""}`
