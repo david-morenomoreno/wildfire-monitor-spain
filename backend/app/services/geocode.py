@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 import unicodedata
 
 import httpx
@@ -19,6 +20,51 @@ USER_AGENT = "WildfireMonitorSpain/1.0 (dev/test - contact via repo)"
 # hotspots in the same cluster mostly share one cached lookup instead of each
 # triggering a fresh Nominatim call.
 CACHE_PRECISION = 2
+
+# Nominatim's usage policy permits them to 429 even a compliant ~1 req/sec
+# client during load spikes (confirmed live: a heavy historical backfill
+# created hundreds of fresh incidents needing lookups in a short window and
+# triggered 429s despite wait_for_nominatim_slot throttling every request).
+# Retry a handful of times with growing backoff before giving up - this is
+# deliberately scoped to 429 only, not a blanket retry-on-any-error.
+NOMINATIM_429_MAX_RETRIES = 3
+NOMINATIM_429_BASE_DELAY_SECONDS = 2.0
+
+
+def _retry_after_seconds(response: httpx.Response, fallback: float) -> float:
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return fallback
+    try:
+        return max(float(header), 0.0)
+    except ValueError:
+        # Retry-After may also be an HTTP-date; Nominatim doesn't document
+        # sending that form, so fall back to our own backoff rather than
+        # parsing dates for a case we've never actually observed.
+        return fallback
+
+
+def _get_with_429_retry(url: str, params: dict) -> httpx.Response:
+    delay = NOMINATIM_429_BASE_DELAY_SECONDS
+    response: httpx.Response | None = None
+    for attempt in range(NOMINATIM_429_MAX_RETRIES + 1):
+        state.wait_for_nominatim_slot()
+        response = httpx.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15.0)
+        if response.status_code != 429:
+            return response
+        if attempt == NOMINATIM_429_MAX_RETRIES:
+            break
+        wait_seconds = _retry_after_seconds(response, delay)
+        logger.warning(
+            "Nominatim 429 (attempt %d/%d), retrying in %.1fs: %s",
+            attempt + 1,
+            NOMINATIM_429_MAX_RETRIES,
+            wait_seconds,
+            url,
+        )
+        time.sleep(wait_seconds)
+        delay *= 2
+    return response
 
 
 def _hashtag_from_locality(name: str) -> str:
@@ -48,8 +94,7 @@ def reverse_geocode(db: Session, latitude: float, longitude: float) -> dict:
             "cached": True,
         }
 
-    state.wait_for_nominatim_slot()
-    response = httpx.get(
+    response = _get_with_429_retry(
         NOMINATIM_URL,
         params={
             "format": "jsonv2",
@@ -58,8 +103,6 @@ def reverse_geocode(db: Session, latitude: float, longitude: float) -> dict:
             "zoom": 12,
             "addressdetails": 1,
         },
-        headers={"User-Agent": USER_AGENT},
-        timeout=15.0,
     )
     response.raise_for_status()
     payload = response.json()
@@ -119,13 +162,10 @@ def forward_geocode(db: Session, query: str) -> tuple[float, float] | None:
             return None
         return cached.latitude, cached.longitude
 
-    state.wait_for_nominatim_slot()
     try:
-        response = httpx.get(
+        response = _get_with_429_retry(
             NOMINATIM_SEARCH_URL,
             params={"format": "jsonv2", "q": query, "limit": 1, "countrycodes": "es"},
-            headers={"User-Agent": USER_AGENT},
-            timeout=15.0,
         )
         response.raise_for_status()
         results = response.json()
