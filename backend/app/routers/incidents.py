@@ -24,12 +24,9 @@ from app.schemas import (
     RankedIncidentOut,
 )
 from app.services.area_estimate import estimate_area_ha
-from app.services.incidents import (
-    INCIDENT_REASSOCIATION_DEG,
-    _risk_level,
-    _severity,
-    _status,
-)
+from app.services.incidents import INCIDENT_REASSOCIATION_DEG
+from app.services.incidents import merge_incidents as _merge_incidents_core
+from app.services.incidents import merge_reassociable_incidents as _merge_reassociable_incidents
 
 router = APIRouter(prefix="/api/incidents", tags=["incidents"])
 
@@ -329,23 +326,9 @@ def merge_incidents(body: IncidentMergeRequest, db: Session = Depends(get_db)):
     proximity matching either created duplicate rows or (before its
     archived-reassociation fix) split one real fire into several rows -
     e.g. the "IF Los Gallardos" fire that landed across 3 FireIncident rows.
-    Reassigns every child row (IncidentEvent timeline, RegionalIncident,
-    SatelliteScene, TelegramMessage) to a single surviving incident, combines
-    the merged incidents' stats, then deletes the absorbed rows so they stop
-    showing up as separate entries in the rankings.
-
-    Stat-combination judgment calls (see inline comments below):
-    - first/last_detected_at: min/max across all merged incidents.
-    - detection_count: incidents whose [first, last] windows overlap are
-      treated as likely re-detections of the same underlying cluster (take
-      the max, don't double count - this is exactly what happened with the
-      byte-for-byte-identical id=99/7741 pair); incidents whose windows
-      don't overlap are treated as genuinely separate detection batches of
-      the same physical fire (sum them - this is what should happen for a
-      later, real re-flareup like id=47).
-    - area_ha: max of whatever official (EFFIS) figures are present.
-    - centroid: detection-count-weighted average, so the combined incident's
-      polygon/marker sits closer to whichever sub-cluster had more detections.
+    Validates the request, then delegates the actual reassignment/stat
+    combination/deletion to services.incidents.merge_incidents - see that
+    function's docstring for the stat-combination judgment calls.
     """
     unique_ids = list(dict.fromkeys(body.incident_ids))
     if len(unique_ids) < 2:
@@ -361,104 +344,19 @@ def merge_incidents(body: IncidentMergeRequest, db: Session = Depends(get_db)):
     if survivor_id not in unique_ids:
         raise HTTPException(status_code=400, detail="survivor_id must be one of incident_ids")
 
-    survivor = next(inc for inc in incidents if inc.id == survivor_id)
-    absorbed = [inc for inc in incidents if inc.id != survivor_id]
-    absorbed_ids = [inc.id for inc in absorbed]
-
-    ordered = sorted(incidents, key=lambda inc: inc.first_detected_at)
-    combined_detection_count = ordered[0].detection_count
-    running_window_end = ordered[0].last_detected_at
-    for inc in ordered[1:]:
-        if inc.first_detected_at <= running_window_end:
-            combined_detection_count = max(combined_detection_count, inc.detection_count)
-        else:
-            combined_detection_count += inc.detection_count
-        running_window_end = max(running_window_end, inc.last_detected_at)
-
-    first_detected_at = min(inc.first_detected_at for inc in incidents)
-    last_detected_at = max(inc.last_detected_at for inc in incidents)
-    area_ha_values = [inc.area_ha for inc in incidents if inc.area_ha is not None]
-    area_ha = max(area_ha_values) if area_ha_values else None
-
-    total_weight = sum(inc.detection_count for inc in incidents) or len(incidents)
-    centroid_lat = sum(inc.centroid_lat * (inc.detection_count or 1) for inc in incidents) / total_weight
-    centroid_lon = sum(inc.centroid_lon * (inc.detection_count or 1) for inc in incidents) / total_weight
-
-    duration_hours = (last_detected_at - first_detected_at).total_seconds() / 3600
-    severity_score = _severity(combined_detection_count, area_ha, duration_hours)
-    risk_level = _risk_level(severity_score)
-    status = _status(last_detected_at, datetime.utcnow())
-
-    db.query(IncidentEvent).filter(IncidentEvent.incident_id.in_(absorbed_ids)).update(
-        {IncidentEvent.incident_id: survivor_id}, synchronize_session=False
-    )
-    db.query(RegionalIncident).filter(RegionalIncident.matched_incident_id.in_(absorbed_ids)).update(
-        {RegionalIncident.matched_incident_id: survivor_id}, synchronize_session=False
-    )
-    db.query(TelegramMessage).filter(TelegramMessage.matched_incident_id.in_(absorbed_ids)).update(
-        {TelegramMessage.matched_incident_id: survivor_id}, synchronize_session=False
-    )
-
-    # SatelliteScene has a UNIQUE(incident_id, collection, scene_id)
-    # constraint - a plain bulk reassign could violate it if the survivor and
-    # an absorbed row both discovered the exact same scene (plausible for
-    # exact-duplicate incidents). Drop those collisions rather than fail the
-    # whole merge - the survivor already has an equivalent row.
-    survivor_scene_keys = {
-        (s.collection, s.scene_id)
-        for s in db.query(SatelliteScene).filter(SatelliteScene.incident_id == survivor_id).all()
-    }
-    for scene in db.query(SatelliteScene).filter(SatelliteScene.incident_id.in_(absorbed_ids)).all():
-        key = (scene.collection, scene.scene_id)
-        if key in survivor_scene_keys:
-            db.delete(scene)
-        else:
-            scene.incident_id = survivor_id
-            survivor_scene_keys.add(key)
-
-    db.add(
-        IncidentEvent(
-            incident_id=survivor_id,
-            occurred_at=datetime.utcnow(),
-            event_type="merge",
-            source="admin",
-            title="Incidentes fusionados manualmente",
-            description=f"Fusionado con incidente(s) #{', #'.join(str(i) for i in absorbed_ids)}.",
-        )
-    )
-
-    survivor.centroid_lat = centroid_lat
-    survivor.centroid_lon = centroid_lon
-    survivor.detection_count = combined_detection_count
-    survivor.first_detected_at = first_detected_at
-    survivor.last_detected_at = last_detected_at
-    survivor.area_ha = area_ha
-    survivor.severity_score = severity_score
-    survivor.risk_level = risk_level
-    survivor.status = status
-    survivor.updated_at = datetime.utcnow()
-    if body.official_name is not None:
-        survivor.official_name = body.official_name.strip() or None
-    if not survivor.locality:
-        for inc in absorbed:
-            if inc.locality:
-                survivor.locality = inc.locality
-                survivor.province = survivor.province or inc.province
-                survivor.country_code = survivor.country_code or inc.country_code
-                break
-
-    # Force the SatelliteScene/RegionalIncident/TelegramMessage/IncidentEvent
-    # reassignments above to hit the database before deleting the absorbed
-    # FireIncident rows - without this, SQLAlchemy's unit-of-work can order
-    # the DELETE FROM fire_incidents before the dependent-row updates it
-    # can't see a plain ForeignKey (no ORM relationship() is declared on
-    # these models) as an ordering dependency, which fails with a
-    # ForeignKeyViolation instead of quietly reassigning first.
-    db.flush()
-
-    for inc in absorbed:
-        db.delete(inc)
-
-    db.commit()
-    db.refresh(survivor)
+    absorbed_ids = [i for i in unique_ids if i != survivor_id]
+    survivor = _merge_incidents_core(db, survivor_id, absorbed_ids, official_name=body.official_name)
     return _with_source_flags(db, [survivor])[0]
+
+
+@router.post("/reassociate")
+def reassociate_incidents(db: Session = Depends(get_db)):
+    """
+    Manual trigger for the retroactive auto-merge pass (see
+    services.incidents.merge_reassociable_incidents) - lets an admin run it
+    on demand instead of waiting for the next incident_rebuild scheduler
+    tick, e.g. right after confirming a specific pair (like #53/#1439)
+    should already qualify.
+    """
+    absorbed = _merge_reassociable_incidents(db)
+    return {"incidents_absorbed": absorbed}

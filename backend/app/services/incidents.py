@@ -5,7 +5,15 @@ from datetime import datetime, timedelta
 from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
-from app.models import FireDetection, FireIncident, IncidentEvent
+from app.models import (
+    CopernicusEmsActivation,
+    FireDetection,
+    FireIncident,
+    IncidentEvent,
+    RegionalIncident,
+    SatelliteScene,
+    TelegramMessage,
+)
 from app.services.geocode import reverse_geocode
 
 logger = logging.getLogger(__name__)
@@ -60,6 +68,20 @@ ARCHIVED_REASSOCIATION_MAX_AGE_DAYS = 45
 # than a matching-logic bug. Any fixed constant works as the lock key; this
 # one has no other meaning.
 _REBUILD_LOCK_KEY = 918_273_645
+
+# Guard for merge_reassociable_incidents (see below): auto-merging is
+# destructive (deletes a FireIncident row, unlike a bad automatic
+# *association* of new detections onto the wrong incident, which the next
+# rebuild_incidents pass can't itself undo but at least doesn't destroy
+# history for). Two candidate incidents both at/above this many detections
+# AND both currently active/cooling (i.e. neither has gone quiet and
+# archived) are plausibly two genuinely distinct, simultaneous fires - e.g.
+# two separate ignitions in the same mountain range on the same dry, windy
+# day - rather than one fire's quiet-then-reflare pattern this pass exists
+# to catch. Require at least one side to be small or archived before
+# auto-merging; anything else is left for a human to merge manually via
+# POST /api/incidents/merge.
+AUTO_MERGE_SMALL_DETECTION_COUNT = 15
 
 
 def group_by_proximity(points: list[tuple[float, float]], threshold_deg: float) -> list[list[int]]:
@@ -151,12 +173,22 @@ def rebuild_incidents(db: Session) -> int:
     recently enough - see ARCHIVED_REASSOCIATION_MAX_AGE_DAYS) by centroid
     proximity so ids/slugs stay stable across runs, or creating a new one.
     Appends IncidentEvent rows when an incident is created, grows, or is
-    reactivated from archived. Returns the number of incidents touched.
+    reactivated from archived. Returns the number of incidents touched (NOT
+    counting any auto-merges performed afterwards - see below).
 
     Takes a Postgres advisory lock for its entire duration so two overlapping
     calls (e.g. scheduler tick vs. on-startup rebuild during a redeploy)
     never run their match-then-insert logic concurrently - see
     _REBUILD_LOCK_KEY above for why that matters.
+
+    After the main clustering pass commits, also runs
+    merge_reassociable_incidents - the retroactive counterpart to the
+    matching above, catching cases where TWO ALREADY-EXISTING incidents
+    (not a new cluster vs. an existing one) turn out to be the same real
+    fire. Run here, at the tail of the same job that already fires on every
+    fetch_interval_minutes tick, rather than as its own scheduler job -
+    there's no reason for retroactive reassociation to run on a different
+    cadence than the clustering pass whose gap it's covering for.
     """
     db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _REBUILD_LOCK_KEY})
 
@@ -343,4 +375,311 @@ def rebuild_incidents(db: Session) -> int:
         touched += 1
 
     db.commit()
+
+    absorbed = merge_reassociable_incidents(db)
+    if absorbed:
+        logger.info("Incident rebuild: %d incident(s) auto-merged via retroactive reassociation", absorbed)
+
     return touched
+
+
+def merge_incidents(
+    db: Session,
+    survivor_id: int,
+    absorbed_ids: list[int],
+    official_name: str | None = None,
+    event_source: str = "admin",
+    event_title: str = "Incidentes fusionados manualmente",
+    event_description: str | None = None,
+) -> FireIncident:
+    """
+    Core merge logic shared by the manual POST /api/incidents/merge endpoint
+    (routers/incidents.py) and the automatic merge_reassociable_incidents
+    pass below. Reassigns every child row (IncidentEvent timeline,
+    RegionalIncident, SatelliteScene, TelegramMessage) from absorbed_ids onto
+    survivor_id, combines the merged incidents' stats, deletes the absorbed
+    rows, and commits.
+
+    Callers are responsible for validating survivor_id/absorbed_ids
+    (existence, distinctness, survivor not itself in absorbed_ids) before
+    calling this - see routers/incidents.py's merge_incidents handler for
+    that validation.
+
+    Stat-combination judgment calls:
+    - first/last_detected_at: min/max across all merged incidents.
+    - detection_count: incidents whose [first, last] windows overlap are
+      treated as likely re-detections of the same underlying cluster (take
+      the max, don't double count - this is exactly what happened with the
+      byte-for-byte-identical id=99/7741 pair); incidents whose windows
+      don't overlap are treated as genuinely separate detection batches of
+      the same physical fire (sum them - this is what should happen for a
+      later, real re-flareup like id=47).
+    - area_ha: max of whatever official (EFFIS) figures are present.
+    - centroid: detection-count-weighted average, so the combined incident's
+      polygon/marker sits closer to whichever sub-cluster had more detections.
+    """
+    all_ids = [survivor_id, *absorbed_ids]
+    incidents = db.query(FireIncident).filter(FireIncident.id.in_(all_ids)).all()
+    survivor = next(inc for inc in incidents if inc.id == survivor_id)
+    absorbed = [inc for inc in incidents if inc.id != survivor_id]
+
+    ordered = sorted(incidents, key=lambda inc: inc.first_detected_at)
+    combined_detection_count = ordered[0].detection_count
+    running_window_end = ordered[0].last_detected_at
+    for inc in ordered[1:]:
+        if inc.first_detected_at <= running_window_end:
+            combined_detection_count = max(combined_detection_count, inc.detection_count)
+        else:
+            combined_detection_count += inc.detection_count
+        running_window_end = max(running_window_end, inc.last_detected_at)
+
+    first_detected_at = min(inc.first_detected_at for inc in incidents)
+    last_detected_at = max(inc.last_detected_at for inc in incidents)
+    area_ha_values = [inc.area_ha for inc in incidents if inc.area_ha is not None]
+    area_ha = max(area_ha_values) if area_ha_values else None
+
+    total_weight = sum(inc.detection_count for inc in incidents) or len(incidents)
+    centroid_lat = sum(inc.centroid_lat * (inc.detection_count or 1) for inc in incidents) / total_weight
+    centroid_lon = sum(inc.centroid_lon * (inc.detection_count or 1) for inc in incidents) / total_weight
+
+    duration_hours = (last_detected_at - first_detected_at).total_seconds() / 3600
+    severity_score = _severity(combined_detection_count, area_ha, duration_hours)
+    risk_level = _risk_level(severity_score)
+    status = _status(last_detected_at, datetime.utcnow())
+
+    db.query(IncidentEvent).filter(IncidentEvent.incident_id.in_(absorbed_ids)).update(
+        {IncidentEvent.incident_id: survivor_id}, synchronize_session=False
+    )
+    db.query(RegionalIncident).filter(RegionalIncident.matched_incident_id.in_(absorbed_ids)).update(
+        {RegionalIncident.matched_incident_id: survivor_id}, synchronize_session=False
+    )
+    db.query(TelegramMessage).filter(TelegramMessage.matched_incident_id.in_(absorbed_ids)).update(
+        {TelegramMessage.matched_incident_id: survivor_id}, synchronize_session=False
+    )
+    # CopernicusEmsActivation.matched_incident_id is a real FK to
+    # fire_incidents - missing this reassignment made ANY merge (manual or
+    # automatic) of an incident with a matched EMS activation fail with a
+    # ForeignKeyViolation on delete (confirmed live: incident 53's own
+    # "El Barraco" EMS activation blocked its merge into 1439).
+    db.query(CopernicusEmsActivation).filter(CopernicusEmsActivation.matched_incident_id.in_(absorbed_ids)).update(
+        {CopernicusEmsActivation.matched_incident_id: survivor_id}, synchronize_session=False
+    )
+
+    # SatelliteScene has a UNIQUE(incident_id, collection, scene_id)
+    # constraint - a plain bulk reassign could violate it if the survivor and
+    # an absorbed row both discovered the exact same scene (plausible for
+    # exact-duplicate incidents). Drop those collisions rather than fail the
+    # whole merge - the survivor already has an equivalent row.
+    survivor_scene_keys = {
+        (s.collection, s.scene_id)
+        for s in db.query(SatelliteScene).filter(SatelliteScene.incident_id == survivor_id).all()
+    }
+    for scene in db.query(SatelliteScene).filter(SatelliteScene.incident_id.in_(absorbed_ids)).all():
+        key = (scene.collection, scene.scene_id)
+        if key in survivor_scene_keys:
+            db.delete(scene)
+        else:
+            scene.incident_id = survivor_id
+            survivor_scene_keys.add(key)
+
+    db.add(
+        IncidentEvent(
+            incident_id=survivor_id,
+            occurred_at=datetime.utcnow(),
+            event_type="merge",
+            source=event_source,
+            title=event_title,
+            description=event_description
+            or f"Fusionado con incidente(s) #{', #'.join(str(i) for i in absorbed_ids)}.",
+        )
+    )
+
+    survivor.centroid_lat = centroid_lat
+    survivor.centroid_lon = centroid_lon
+    survivor.detection_count = combined_detection_count
+    survivor.first_detected_at = first_detected_at
+    survivor.last_detected_at = last_detected_at
+    survivor.area_ha = area_ha
+    survivor.severity_score = severity_score
+    survivor.risk_level = risk_level
+    survivor.status = status
+    survivor.updated_at = datetime.utcnow()
+    if official_name is not None:
+        survivor.official_name = official_name.strip() or None
+    if not survivor.locality:
+        for inc in absorbed:
+            if inc.locality:
+                survivor.locality = inc.locality
+                survivor.province = survivor.province or inc.province
+                survivor.country_code = survivor.country_code or inc.country_code
+                break
+
+    # Force the SatelliteScene/RegionalIncident/TelegramMessage/IncidentEvent
+    # reassignments above to hit the database before deleting the absorbed
+    # FireIncident rows - without this, SQLAlchemy's unit-of-work can order
+    # the DELETE FROM fire_incidents before the dependent-row updates it
+    # can't see a plain ForeignKey (no ORM relationship() is declared on
+    # these models) as an ordering dependency, which fails with a
+    # ForeignKeyViolation instead of quietly reassigning first.
+    db.flush()
+
+    for inc in absorbed:
+        db.delete(inc)
+
+    db.commit()
+    db.refresh(survivor)
+    return survivor
+
+
+def _auto_merge_candidate(a: FireIncident, b: FireIncident) -> bool:
+    """
+    Whether two EXISTING incidents are plausible auto-merge candidates for
+    merge_reassociable_incidents - same spatial/temporal reasoning
+    rebuild_incidents already applies to a NEW cluster vs. an existing
+    incident (INCIDENT_REASSOCIATION_DEG proximity,
+    ARCHIVED_REASSOCIATION_MAX_AGE_DAYS gap), plus the extra
+    both-still-large guard documented above AUTO_MERGE_SMALL_DETECTION_COUNT.
+    """
+    dist_deg = ((a.centroid_lat - b.centroid_lat) ** 2 + (a.centroid_lon - b.centroid_lon) ** 2) ** 0.5
+    if dist_deg > INCIDENT_REASSOCIATION_DEG:
+        return False
+
+    earlier, later = (a, b) if a.first_detected_at <= b.first_detected_at else (b, a)
+    gap_hours = (later.first_detected_at - earlier.last_detected_at).total_seconds() / 3600
+    if gap_hours > ARCHIVED_REASSOCIATION_MAX_AGE_DAYS * 24:
+        return False
+
+    def is_small_or_archived(inc: FireIncident) -> bool:
+        return inc.status == "archived" or inc.detection_count < AUTO_MERGE_SMALL_DETECTION_COUNT
+
+    return is_small_or_archived(a) or is_small_or_archived(b)
+
+
+def _merge_one_reassociable_pair(db: Session) -> bool:
+    """
+    Finds and merges (at most) one auto-mergeable pair of existing incidents.
+    Re-queries incidents fresh rather than trying to reuse an in-memory list
+    across multiple merges in the same pass - merge_incidents commits (and
+    SQLAlchemy's default expire-on-commit then invalidates deleted rows'
+    attributes), so scanning further pairs from a stale pre-merge list risks
+    touching an already-deleted incident. Simpler and safer to do one merge
+    per query given the expected incident count is small (tens, not
+    thousands - see _resolve_locality above).
+    """
+    now = datetime.utcnow()
+    archived_cutoff = now - timedelta(days=ARCHIVED_REASSOCIATION_MAX_AGE_DAYS)
+    candidates = (
+        db.query(FireIncident)
+        .filter(
+            or_(
+                FireIncident.status != "archived",
+                FireIncident.last_detected_at >= archived_cutoff,
+            )
+        )
+        .order_by(FireIncident.id.asc())
+        .all()
+    )
+
+    for i in range(len(candidates)):
+        a = candidates[i]
+        for j in range(i + 1, len(candidates)):
+            b = candidates[j]
+            if not _auto_merge_candidate(a, b):
+                continue
+
+            # Merge the smaller (fewer-detections) incident into the larger
+            # one - the larger one is more likely to already carry the
+            # richer name/timeline/child-record history worth keeping as the
+            # surviving identity. Ties (e.g. both freshly created) fall back
+            # to keeping the OLDER row (lower id) as survivor, since it's
+            # more likely to be the originally-named incident and the newer
+            # row the just-created duplicate.
+            if a.detection_count != b.detection_count:
+                survivor, absorbed = (a, b) if a.detection_count > b.detection_count else (b, a)
+            else:
+                survivor, absorbed = (a, b) if a.id < b.id else (b, a)
+
+            dist_deg = ((a.centroid_lat - b.centroid_lat) ** 2 + (a.centroid_lon - b.centroid_lon) ** 2) ** 0.5
+            logger.info(
+                "Auto-merging incident #%d (%s, %d detections) into #%d (%s, %d detections) - "
+                "retroactive reassociation, centroids %.4f deg apart",
+                absorbed.id,
+                absorbed.locality or "?",
+                absorbed.detection_count,
+                survivor.id,
+                survivor.locality or "?",
+                survivor.detection_count,
+                dist_deg,
+            )
+            try:
+                merge_incidents(
+                    db,
+                    survivor.id,
+                    [absorbed.id],
+                    event_source="system",
+                    event_title="Fusión automática (reasociación retroactiva)",
+                    event_description=(
+                        f"Incidente #{absorbed.id} fusionado automáticamente: centroides a "
+                        f"{dist_deg:.4f} grados, dentro de la ventana de reasociación de "
+                        f"{ARCHIVED_REASSOCIATION_MAX_AGE_DAYS} días."
+                    ),
+                )
+            except Exception:
+                # Roll back so the session is usable again (an uncaught DB
+                # error here otherwise leaves it in "pending rollback" state
+                # for whatever runs next - same class of bug fixed in the
+                # ingest_*() functions). Log and keep scanning rather than
+                # aborting the whole pass - one bad pair (e.g. an FK this
+                # function doesn't yet know how to reassign) shouldn't block
+                # every other legitimate merge in the same pass.
+                db.rollback()
+                logger.exception(
+                    "Auto-merge of incident #%d into #%d failed - skipping this pair", absorbed.id, survivor.id
+                )
+                continue
+            return True
+
+    return False
+
+
+def merge_reassociable_incidents(db: Session) -> int:
+    """
+    Retroactively catches what rebuild_incidents' own reassociation never
+    can: two ALREADY-EXISTING FireIncident rows that are actually the same
+    real fire. rebuild_incidents only ever tests a NEW detection cluster
+    against existing incidents at the moment that cluster is processed - once
+    an incident exists, it just keeps matching new detections to ITSELF going
+    forward, and is never re-examined against other existing incidents.
+    Confirmed live: incident 53 ("El Barraco", archived, last_detected_at
+    2026-07-16) and incident 1439 ("Casavieja", active, first_detected_at
+    2026-07-22) sit ~13-14km apart in the same Ávila province stretch - well
+    under INCIDENT_REASSOCIATION_DEG (~16.7km) and well within
+    ARCHIVED_REASSOCIATION_MAX_AGE_DAYS (45 days) - consistent with the same
+    fire going quiet, auto-archiving, then reflaring under what looked like a
+    brand-new detection cluster days later, but 1439 was created without ever
+    being checked against 53.
+
+    Deliberately pairwise, not N-way: each call to _merge_one_reassociable_pair
+    finds and performs AT MOST ONE merge from a fresh query, so this loops
+    until a pass finds nothing left to merge. Slower than solving transitive
+    N-way clustering (e.g. A-B-C all the same fire) in one shot, but far
+    simpler to reason about, and self-correcting since this runs on every
+    rebuild_incidents pass (see call site) - a 3-way chain just takes two
+    scheduler ticks to fully collapse instead of one.
+
+    Reuses rebuild_incidents' own _REBUILD_LOCK_KEY advisory lock (rather
+    than inventing a second lock) so a concurrent rebuild_incidents call
+    never interleaves with this pass. The lock is re-acquired once per
+    iteration (not held once for the whole function) because merge_incidents
+    itself commits - which ends the current Postgres transaction and, with
+    it, releases any pg_advisory_xact_lock taken inside it.
+
+    Returns the number of incidents absorbed (deleted) across all passes.
+    """
+    total_absorbed = 0
+    while True:
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _REBUILD_LOCK_KEY})
+        if not _merge_one_reassociable_pair(db):
+            break
+        total_absorbed += 1
+    return total_absorbed
