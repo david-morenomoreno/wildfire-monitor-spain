@@ -10,6 +10,7 @@ from app.database import Base, SessionLocal, engine
 from app.routers import (
     admin_bulletins,
     copernicus,
+    copernicus_ems,
     fire_spread,
     fires,
     geo,
@@ -48,6 +49,7 @@ app.include_router(telegram.router)
 app.include_router(sources.router)
 app.include_router(health.router)
 app.include_router(copernicus.router)
+app.include_router(copernicus_ems.router)
 app.include_router(regional_incidents.router)
 app.include_router(webcams.router)
 app.include_router(fire_spread.router)

@@ -335,16 +335,62 @@ function timelineEventImageUrl(event) {
   return null;
 }
 
+// A Copernicus EMS activation can span several AOIs, each with its own
+// lazily-rendered satellite preview (GET
+// /api/copernicus-ems/products/{id}/thumbnail - see
+// services/copernicus_ems_imagery.py) - so unlike the single-image sources
+// above, this returns a list rather than one URL. Kept in sync with the
+// same helper in app.js (this page is deliberately self-contained - see
+// the file header comment).
+function emsProductImageUrls(event) {
+  if (!event.raw_data) return [];
+  try {
+    const data = JSON.parse(event.raw_data);
+    if (Array.isArray(data.ems_product_ids)) {
+      return data.ems_product_ids.map((id) => `${apiBaseUrl}/api/copernicus-ems/products/${id}/thumbnail`);
+    }
+  } catch {
+    return [];
+  }
+  return [];
+}
+
+// event.description is server-generated free text (analyst summaries,
+// impact stats, a report URL) - escaped first so it's never interpreted as
+// HTML, then any bare http(s) URL (e.g. the EMS "Mapa oficial: ..."
+// StoryMap link) is turned into a real clickable link.
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function linkifyDescription(text) {
+  if (!text) return "";
+  return escapeHtml(text).replace(
+    /(https?:\/\/[^\s]+)/g,
+    (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
+  );
+}
+
 function timelineItemHtml(event) {
   const imageUrl = event.event_type === "satellite_imagery" ? null : timelineEventImageUrl(event);
+  const emsImages = event.event_type === "ems_activation" ? emsProductImageUrls(event) : [];
   const icon = EVENT_TYPE_ICON[event.event_type] || "";
   return (
     `<div class="timeline-item">` +
     `<span class="timeline-dot timeline-dot-${event.event_type || "default"}">${icon}</span>` +
     `<div class="timeline-time">${formatDateTime(event.occurred_at)}</div>` +
     `<div class="timeline-title">${event.title}</div>` +
-    (event.description ? `<div class="timeline-desc">${event.description}</div>` : "") +
+    (event.description ? `<div class="timeline-desc">${linkifyDescription(event.description)}</div>` : "") +
     (imageUrl ? `<img src="${imageUrl}" class="timeline-thumb" data-lightbox="${imageUrl}" />` : "") +
+    (emsImages.length
+      ? `<div class="ems-aoi-thumbs">` +
+        emsImages
+          .map((url) => `<img src="${url}" class="timeline-thumb ems-aoi-thumb" loading="lazy" data-lightbox="${url}" />`)
+          .join("") +
+        `</div>`
+      : "") +
     `</div>`
   );
 }

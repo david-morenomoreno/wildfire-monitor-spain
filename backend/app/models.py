@@ -321,6 +321,52 @@ class CopernicusEmsActivation(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class CopernicusEmsProduct(Base):
+    """
+    The single BEST delineation ("DEL") product per AOI within a
+    CopernicusEmsActivation - see services/copernicus_ems.py's
+    `_select_best_products`. An activation's detail endpoint nests
+    `aois[].products[]`, and each AOI is typically re-monitored several times
+    (monitoringNumber 0, 1, 2, ...) as the fire evolves; only the latest
+    DELIVERED pass (highest monitoringNumber with `version.statusCode == "F"`
+    and a non-null `stats` block - "W" means still awaiting analyst delivery)
+    is kept per AOI. Stored one row per AOI (not flattened/summed into the
+    activation) because each AOI's `stats` (land-use/burnt-area/population
+    breakdown) and satellite preview cover a distinct, independently-sized
+    geographic footprint - summing hectares across AOIs is still done at
+    display time (services/copernicus_ems.py), but the per-AOI stats/imagery
+    themselves stay separately queryable/renderable here.
+    """
+
+    __tablename__ = "copernicus_ems_products"
+    __table_args__ = (
+        UniqueConstraint("activation_id", "aoi_number", name="uq_ems_activation_aoi"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    activation_id = Column(Integer, ForeignKey("copernicus_ems_activations.id"), nullable=False)
+    aoi_number = Column(Integer, nullable=False)
+    aoi_name = Column(String(255), nullable=True)
+    monitoring_number = Column(Integer, nullable=True)
+    # Raw per-product `stats` object as-is (land-use/burnt-area/transport/
+    # population categories vary by disaster type) - see
+    # services/copernicus_ems.py's `_aggregate_stats` for the readable
+    # summary derived from this.
+    stats_json = Column(Text, nullable=True)
+    # Direct HTTPS URL to this product's Cloud-Optimized GeoTIFF (aws_bucket
+    # + the `layers[]` entry with format=="cog") - confirmed live
+    # (2026-07-23) to be a real COG with internal overviews, so a low-res
+    # preview can be read via HTTP range requests (GDAL /vsicurl/) without
+    # downloading the full ~40MB file. Null if no "cog" layer was published
+    # for this product.
+    cog_url = Column(String(1000), nullable=True)
+    # Filename under settings.upload_dir once rendered - same lazy
+    # render-on-first-request + disk-cache pattern as
+    # SatelliteScene.thumbnail_path / services/copernicus.py.
+    thumbnail_path = Column(String(500), nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class RegionalIncidentSource(Base):
     """
     A regional government's live per-fire operational status feed (as opposed

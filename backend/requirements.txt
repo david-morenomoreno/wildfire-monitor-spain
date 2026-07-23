@@ -14,3 +14,11 @@ telethon==1.36.0
 pyproj==3.6.1
 shapely==2.0.4
 netCDF4==1.7.1
+# Reads low-res previews of Copernicus EMS's per-product Cloud-Optimized
+# GeoTIFFs via HTTP range requests (GDAL /vsicurl/ + internal COG overviews)
+# without downloading the full ~40MB file - see
+# services/copernicus_ems_imagery.py. Ships its own bundled GDAL in the
+# manylinux wheel, no system GDAL install needed.
+rasterio==1.4.4
+numpy==1.26.4
+Pillow==10.4.0

@@ -164,6 +164,12 @@ class Settings(BaseSettings):
     # since an EMS analyst's centroid and this app's own FIRMS-derived
     # centroid for the same real fire won't be pixel-identical.
     copernicus_ems_match_deg: float = 0.2
+    # Pixel size (width == height) for the lazily-rendered, disk-cached
+    # low-res preview read from a product's Cloud-Optimized GeoTIFF via GDAL
+    # /vsicurl/ - see services/copernicus_ems_imagery.py. Matches
+    # copernicus_thumbnail_size's ballpark; no need for anything larger for a
+    # timeline/report card image.
+    copernicus_ems_thumbnail_size: int = 512
 
     # Regional live-incident feeds (e.g. Castilla y León's INCYL) - unlike
     # admin_bulletins (periodic PDF/CSV documents), these are near-real-time

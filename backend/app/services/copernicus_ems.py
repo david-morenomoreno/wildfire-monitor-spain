@@ -26,12 +26,25 @@ Once an activation matches an incident, its detail endpoint
 analyst's own incident description), `activator` (who requested it), the
 top-level `stats` object (population/roads/built-up area affected), and
 `reportLink` - a public ArcGIS StoryMap, which is the closest thing to an
-actual rendered, browser-viewable map this API offers. Deliberately does NOT
-fetch/render the per-product `layers[]`/`images[]` files: confirmed live
-(2026-07-21) those are raw full-resolution GeoTIFFs (COG, ~40MB), not
-browser-displayable thumbnails - dropping that URL into an <img> tag would
-just render blank. A real delineation-polygon overlay (parsing the
-downloadPath ZIP's shapefile) would be a follow-up, not this.
+actual rendered, browser-viewable map this API offers.
+
+Additionally, per-AOI PRODUCT-level detail is now also parsed: the detail
+response's `aois[].products[]` array carries a much richer per-product
+`stats` object (land-use/vegetation categories affected in hectares, burnt
+area, active-flame count, population/infrastructure impact) than the
+activation's own top-level `stats`. Confirmed live (2026-07-23) that an AOI
+is often re-monitored multiple times (`monitoringNumber` 0, 1, 2, ...) as a
+fire evolves, and a still-in-progress pass has `version.statusCode == "W"`
+(awaiting delivery) with `stats: null` - only the latest DELIVERED
+(`statusCode == "F"`) pass per AOI is kept, see `_select_best_products`.
+
+Per-product `layers[]` includes a "cog" entry - confirmed live to be a real
+Cloud-Optimized GeoTIFF (not just a plain full-res TIFF given a COG-shaped
+name): GDAL's /vsicurl/ virtual filesystem can read a small preview off its
+internal overviews via HTTP range requests, so a low-res JPEG IS rendered
+server-side and cached, same lazy pattern as services/copernicus.py's
+Sentinel Hub thumbnails - see services/copernicus_ems_imagery.py. The raw
+full-resolution file itself (~40MB) is never downloaded.
 """
 
 import json
@@ -44,7 +57,7 @@ from sqlalchemy.orm import Session
 
 from app import state
 from app.config import settings
-from app.models import CopernicusEmsActivation, FireIncident, IncidentEvent
+from app.models import CopernicusEmsActivation, CopernicusEmsProduct, FireIncident, IncidentEvent
 from app.services.health import record_check
 
 logger = logging.getLogger(__name__)
@@ -114,6 +127,142 @@ def _find_matching_incident(db: Session, lat: float, lon: float) -> FireIncident
     return min(in_range, key=lambda pair: pair[1])[0]
 
 
+# Common CORINE-style land-use category names seen in the "Land use" stats
+# block (confirmed live against EMSR898/EMSR896's real product stats,
+# 2026-07-23) - translated for a readable Spanish timeline summary. Keys are
+# matched after stripping whitespace (the raw API returns some with a
+# trailing space, e.g. "Forests ", "Pastures "). Anything not in this map
+# falls back to the raw category name as-is, since the full CORINE
+# nomenclature has dozens of categories not worth hardcoding every one.
+_LAND_USE_LABELS_ES = {
+    "Forests": "bosque",
+    "Shrub and/or herbaceous vegetation association": "matorral y vegetación herbácea",
+    "Arable land": "cultivos de secano/regadío",
+    "Heterogeneous agricultural areas": "mosaico agrícola",
+    "Pastures": "pastos",
+    "Open spaces with little or no vegetation": "espacios con poca vegetación",
+    "Permanent crops": "cultivos permanentes",
+    "Other": "otros usos",
+}
+
+
+def _select_best_products(detail: dict) -> list[dict]:
+    """
+    Picks the single latest DELIVERED "DEL" (delineation) product per AOI
+    from a detail response's `aois[].products[]` - an AOI can carry several
+    monitoring passes (monitoringNumber 0, 1, 2, ...), and a pass still
+    awaiting analyst delivery has `version.statusCode == "W"` and
+    `stats: null` rather than being simply absent, so both conditions are
+    checked rather than just picking the highest monitoringNumber outright.
+    Returns one dict per AOI: {aoi_number, aoi_name, monitoring_number,
+    stats, cog_url}.
+    """
+    aws_bucket = detail.get("aws_bucket") or ""
+    selected: list[dict] = []
+    for aoi in detail.get("aois") or []:
+        delivered = [
+            product
+            for product in (aoi.get("products") or [])
+            if product.get("type") == "DEL"
+            and product.get("stats") is not None
+            and (product.get("version") or {}).get("statusCode") == "F"
+        ]
+        if not delivered:
+            continue
+        best = max(delivered, key=lambda p: p.get("monitoringNumber") or 0)
+        cog_layer = next(
+            (layer for layer in best.get("layers") or [] if layer.get("format") == "cog"),
+            None,
+        )
+        cog_url = f"{aws_bucket}/{cog_layer['name']}" if aws_bucket and cog_layer else None
+        selected.append(
+            {
+                "aoi_number": aoi.get("number"),
+                "aoi_name": aoi.get("name"),
+                "monitoring_number": best.get("monitoringNumber"),
+                "stats": best.get("stats"),
+                "cog_url": cog_url,
+            }
+        )
+    return selected
+
+
+def _numeric(value) -> float | None:
+    """Product stats mix real numbers with sentinel strings ("NA", "-") for
+    not-applicable/unset fields - this is the shared guard for pulling a
+    usable number out of one `{"unit":..., "total":..., "affected":...}` leaf."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _aggregate_product_stats(products: list[dict]) -> dict:
+    """
+    Sums the per-AOI `stats` blocks selected by `_select_best_products`
+    across every AOI in the activation - summing hectares/counts across AOIs
+    has real precedent in this codebase (services/area_estimate.py, and the
+    incident-merge endpoint summing detection_count/area_ha), and each AOI
+    here is a genuinely distinct chunk of the same fire's footprint rather
+    than an overlapping remeasurement of it.
+    """
+    land_use_ha: dict[str, float] = {}
+    burnt_area_ha = 0.0
+    active_flames = 0.0
+    population_affected = 0.0
+    has_burnt_area = has_active_flames = has_population = False
+
+    for product in products:
+        stats = product.get("stats") or {}
+
+        for category, leaf in (stats.get("Land use") or {}).items():
+            affected = _numeric(leaf.get("affected")) if isinstance(leaf, dict) else None
+            if affected:
+                label = _LAND_USE_LABELS_ES.get(category.strip(), category.strip().lower())
+                land_use_ha[label] = land_use_ha.get(label, 0.0) + affected
+
+        burnt = _numeric(((stats.get("Burnt area") or {}).get("None") or {}).get("affected"))
+        if burnt is not None:
+            burnt_area_ha += burnt
+            has_burnt_area = True
+
+        flames = _numeric(((stats.get("Active Flames") or {}).get("None") or {}).get("affected"))
+        if flames is not None:
+            active_flames += flames
+            has_active_flames = True
+
+        population = _numeric(((stats.get("Estimated population") or {}).get("None") or {}).get("affected"))
+        if population is not None:
+            population_affected += population
+            has_population = True
+
+    top_land_use = sorted(land_use_ha.items(), key=lambda pair: -pair[1])[:3]
+    return {
+        "top_land_use": top_land_use,
+        "burnt_area_ha": burnt_area_ha if has_burnt_area else None,
+        "active_flames": int(active_flames) if has_active_flames else None,
+        "population_affected": int(population_affected) if has_population else None,
+    }
+
+
+def _format_product_stats_summary(products: list[dict]) -> str:
+    """Readable Spanish one-liner from `_aggregate_product_stats` - dropped
+    entirely (returns "") when an activation has no delivered products yet."""
+    if not products:
+        return ""
+    aggregate = _aggregate_product_stats(products)
+    parts = []
+    if aggregate["top_land_use"]:
+        breakdown = ", ".join(f"{label} ({ha:,.0f} ha)".replace(",", ".") for label, ha in aggregate["top_land_use"])
+        parts.append(f"Vegetación/terreno más afectado: {breakdown}")
+    if aggregate["burnt_area_ha"] is not None:
+        parts.append(f"área quemada: {aggregate['burnt_area_ha']:,.0f} ha".replace(",", "."))
+    if aggregate["active_flames"]:
+        parts.append(f"{aggregate['active_flames']} foco(s) activo(s) detectado(s) en la pasada")
+    if aggregate["population_affected"]:
+        parts.append(f"~{aggregate['population_affected']:,} persona(s) en el área afectada".replace(",", "."))
+    return " · ".join(parts)
+
+
 def _format_stats(stats_json: str | None) -> str:
     """Top-level `stats` keys/units vary by disaster type (e.g. "Roads [km]",
     "Population [No.]") - formatted generically rather than hardcoded, with
@@ -129,7 +278,9 @@ def _format_stats(stats_json: str | None) -> str:
     return " · ".join(f"{key}: {value}" for key, value in stats.items() if value not in (None, "-", "NA"))
 
 
-def _event_title_and_description(activation: dict, record: CopernicusEmsActivation) -> tuple[str, str]:
+def _event_title_and_description(
+    activation: dict, record: CopernicusEmsActivation, products: list[dict]
+) -> tuple[str, str]:
     code = activation.get("code", "")
     title = f"Copernicus EMS activó cartografía de emergencia ({code})"
     n_products = activation.get("n_products") or 0
@@ -142,6 +293,12 @@ def _event_title_and_description(activation: dict, record: CopernicusEmsActivati
         if len(reason) > 300:
             reason = reason[:300].rsplit(" ", 1)[0] + "…"
         lines.append(reason)
+    # Per-AOI product stats (land-use/burnt-area/active-flames/population) -
+    # much richer than the activation-level `stats` below, so this is listed
+    # first when available.
+    product_stats_line = _format_product_stats_summary(products)
+    if product_stats_line:
+        lines.append(product_stats_line)
     stats_line = _format_stats(record.stats_json)
     if stats_line:
         lines.append(stats_line)
@@ -152,6 +309,29 @@ def _event_title_and_description(activation: dict, record: CopernicusEmsActivati
         else f"Detalle: https://rapidmapping.emergency.copernicus.eu/{code}"
     )
     return title, "\n".join(lines)
+
+
+def _store_products(db: Session, activation_id: int, selected: list[dict]) -> None:
+    """Upserts one CopernicusEmsProduct row per AOI (unique on
+    activation_id+aoi_number) from `_select_best_products`' output."""
+    for item in selected:
+        aoi_number = item.get("aoi_number")
+        if aoi_number is None:
+            continue
+        product = (
+            db.query(CopernicusEmsProduct)
+            .filter_by(activation_id=activation_id, aoi_number=aoi_number)
+            .first()
+        )
+        if product is None:
+            product = CopernicusEmsProduct(activation_id=activation_id, aoi_number=aoi_number)
+            db.add(product)
+        product.aoi_name = item.get("aoi_name")
+        product.monitoring_number = item.get("monitoring_number")
+        stats = item.get("stats")
+        product.stats_json = json.dumps(stats) if stats else None
+        product.cog_url = item.get("cog_url")
+        product.updated_at = datetime.utcnow()
 
 
 def ingest_copernicus_ems(db: Session) -> int:
@@ -203,6 +383,8 @@ def _ingest_copernicus_ems(db: Session) -> int:
         if not record.matched_incident_id:
             continue
 
+        db.flush()  # need record.id below (for a brand-new record) before touching its products
+
         # Skip re-fetching detail for an already-closed activation that
         # already has one - reason/stats/reportLink are stable once closed.
         # An open activation is refetched every poll to pick up newly
@@ -225,8 +407,30 @@ def _ingest_copernicus_ems(db: Session) -> int:
                 record.report_link = detail.get("reportLink")
                 stats = detail.get("stats")
                 record.stats_json = json.dumps(stats) if stats else None
+                _store_products(db, record.id, _select_best_products(detail))
+                db.flush()
 
-        title, description = _event_title_and_description(activation, record)
+        # Reloaded regardless of whether detail was refetched this poll, so
+        # an already-closed activation's description still reflects
+        # whatever products were captured on a previous (pre-closed) poll.
+        product_rows = (
+            db.query(CopernicusEmsProduct)
+            .filter_by(activation_id=record.id)
+            .order_by(CopernicusEmsProduct.aoi_number)
+            .all()
+        )
+        products_for_stats = [
+            {"stats": json.loads(row.stats_json)} for row in product_rows if row.stats_json
+        ]
+        product_ids_with_imagery = [row.id for row in product_rows if row.cog_url]
+
+        title, description = _event_title_and_description(activation, record, products_for_stats)
+        # ems_product_ids lets the frontend request a lazily-rendered
+        # satellite preview per AOI at
+        # GET /api/copernicus-ems/products/{id}/thumbnail - see
+        # services/copernicus_ems_imagery.py. Only products with a "cog"
+        # layer are included; others render nothing.
+        raw_data = json.dumps({"code": code, "ems_product_ids": product_ids_with_imagery})
         if record.incident_event_id:
             # Already announced - just refresh the existing event (more
             # AOIs/products since discovered, or the activation closed)
@@ -235,6 +439,7 @@ def _ingest_copernicus_ems(db: Session) -> int:
             if event:
                 event.title = title
                 event.description = description
+                event.raw_data = raw_data
         else:
             event = IncidentEvent(
                 incident_id=record.matched_incident_id,
@@ -243,7 +448,7 @@ def _ingest_copernicus_ems(db: Session) -> int:
                 source="copernicus_ems",
                 title=title,
                 description=description,
-                raw_data=json.dumps({"code": code}),
+                raw_data=raw_data,
             )
             db.add(event)
             db.flush()  # need event.id to store on record below
