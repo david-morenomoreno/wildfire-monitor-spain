@@ -61,6 +61,14 @@ app.mount("/media", StaticFiles(directory=settings.upload_dir), name="media")
 
 @app.on_event("startup")
 def on_startup():
+    # Legacy safety net, kept for now: this only ever CREATES missing tables,
+    # it never adds a missing column to a table that already exists (bitten
+    # by this twice - see git history for `official_name` and
+    # CopernicusEmsActivation). Alembic (backend/alembic/) is now the source
+    # of truth for schema changes going forward - see README.md's "Database
+    # migrations" section. This call should be removed once every
+    # environment, including prod, has been `alembic stamp head`-ed so
+    # Alembic's own version table reflects reality everywhere.
     Base.metadata.create_all(bind=engine)
     # Populate incidents from whatever detections already exist immediately,
     # rather than waiting up to fetch_interval_minutes for the first scheduled run.

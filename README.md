@@ -176,7 +176,57 @@ Used by `/sources.html` as a source directory + status timeline.
 - Manual refreshes use the same server-side cooldown as scheduled polling.
 - Cooldown state is in-memory and resets on backend restart.
 - Media is served under `/media/...` from backend upload storage.
-- There is no migration engine yet (Alembic): existing-schema alterations require manual SQL or local DB reset.
+- Schema changes are managed by Alembic - see "Database migrations" below.
+  `Base.metadata.create_all()` still runs on startup as a legacy safety net
+  for brand-new tables, but it never adds columns to an existing table, so
+  Alembic is the actual source of truth going forward.
+
+## Database migrations
+
+Schema changes are managed with [Alembic](https://alembic.sqlalchemy.org/),
+configured under `backend/alembic/`. `backend/alembic/env.py` imports the
+app's own `app.config.settings.database_url` and `app.database.Base` directly
+- there's no separate DB URL to keep in sync in `alembic.ini`, and
+`--autogenerate` compares directly against the live model definitions in
+`app/models.py`.
+
+**After changing a model** (adding a column, table, index, etc.) in
+`app/models.py`, generate a migration from `backend/`:
+
+```bash
+cd backend
+alembic revision --autogenerate -m "add official_name to fire_incidents"
+```
+
+Always read the generated file under `backend/alembic/versions/` before
+applying it - autogenerate is a good first draft, not a guarantee (it can
+miss things like renames, and needs manual review for e.g. `NOT NULL` columns
+added to a table that already has rows).
+
+**To apply migrations** (creates any tables/columns that don't exist yet):
+
+```bash
+cd backend
+alembic upgrade head
+```
+
+This runs automatically only where you invoke it - it is deliberately *not*
+wired into the app's own startup, so a bad migration doesn't take the app
+down on deploy. Run it as an explicit deploy step.
+
+**One-time production adoption:** prod's schema already matches the current
+models (including `official_name` and `copernicus_ems_activations`, added
+manually before Alembic existed), so do **not** run the baseline migration
+there - it would try to `CREATE TABLE` things that already exist. Instead,
+tell Alembic prod is already at that revision:
+
+```bash
+cd backend
+alembic stamp head
+```
+
+Run that once against prod. From then on, `alembic upgrade head` there
+behaves normally for every migration generated after this one.
 
 ## Disclaimer
 
