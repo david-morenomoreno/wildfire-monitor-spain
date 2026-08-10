@@ -244,6 +244,37 @@ def _aggregate_product_stats(products: list[dict]) -> dict:
     }
 
 
+def get_incident_vegetation_stats(db: Session, incident_id: int) -> dict | None:
+    """
+    Public entry point for the vegetation/burnt-area breakdown behind an
+    incident's "ems_activation" timeline entries - same
+    _aggregate_product_stats math _event_title_and_description already uses
+    to build that entry's free-text description, but returned as structured
+    data (label/hectares pairs, not prose) for the map sidebar's "Vegetación
+    quemada" section and the ranking report to render as an actual chart
+    instead of re-parsing a sentence. Aggregates across every
+    CopernicusEmsActivation matched to this incident (rare, but a single
+    long-running fire can have more than one) and every AOI within each.
+    Returns None - not an empty aggregate - when this incident has no EMS
+    activation at all, so callers can tell "no data" apart from "activation
+    exists but delivered nothing yet".
+    """
+    activation_ids = [
+        row.id
+        for row in db.query(CopernicusEmsActivation.id)
+        .filter(CopernicusEmsActivation.matched_incident_id == incident_id)
+        .all()
+    ]
+    if not activation_ids:
+        return None
+
+    product_rows = (
+        db.query(CopernicusEmsProduct).filter(CopernicusEmsProduct.activation_id.in_(activation_ids)).all()
+    )
+    products_for_stats = [{"stats": json.loads(row.stats_json)} for row in product_rows if row.stats_json]
+    return _aggregate_product_stats(products_for_stats)
+
+
 def _format_product_stats_summary(products: list[dict]) -> str:
     """Readable Spanish one-liner from `_aggregate_product_stats` - dropped
     entirely (returns "") when an activation has no delivered products yet."""

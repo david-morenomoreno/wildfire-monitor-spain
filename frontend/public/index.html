@@ -2,17 +2,19 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8" />
-  <title>Wildfire Monitor Spain</title>
+  <title>Vigía</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- Set the theme before first paint - avoids a flash of the wrong theme
-       when a returning user's preference is "light". -->
-  <script>
-    document.documentElement.dataset.theme = localStorage.getItem("wm-theme") || "dark";
-  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@700;800&display=swap"
+    rel="stylesheet"
+  />
   <link
     rel="stylesheet"
     href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
   />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="stylesheet" href="/shared.css" />
   <style>
     * { box-sizing: border-box; }
@@ -21,15 +23,13 @@
 
     /* ---------- Leaflet zoom control ----------
        #incident-sidebar is full-height on the left (top:14/left:14/bottom:14,
-       width 320) and #panel's content can grow taller than the viewport on
-       the right (top:14/right:14, no bottom set) - so both leaflet-bottom
-       corners, and the top-right corner, can have their bounding boxes
-       overlap Leaflet's default zoom control position. Pin the control with
-       `position: fixed` (escaping Leaflet's per-corner absolute containers)
-       into the open gap between the two panels, clear of both regardless of
-       viewport size or panel content height, and raise its z-index above
-       both panels (1000) so it also renders on top if it were ever visually
-       close. */
+       width 320); the right side only has the slim #control-rail plus
+       whichever popover is open, both of which can still overlap Leaflet's
+       default zoom control position. Pin the control with `position: fixed`
+       (escaping Leaflet's per-corner absolute containers) into the open gap
+       clear of the sidebar regardless of viewport size, and raise its
+       z-index above the rail/popovers (1000) so it also renders on top if
+       it were ever visually close. */
     .leaflet-control-zoom {
       position: fixed !important;
       top: auto !important;
@@ -39,44 +39,242 @@
       z-index: 1200;
     }
 
-    /* ---------- Control panel ---------- */
-    #panel {
+    /* ---------- National summary bar (below the topbar, above the map) ---------- */
+    /* The totals here (active fires, ha, risk, wind) are a NATIONAL
+       overview - hidden while a single incident's detail is open (see
+       showIncidentDetail in app.js), since those nationwide numbers read as
+       if they described the one incident on screen otherwise, which is
+       confusing rather than useful. */
+    .summary-bar.summary-bar-hidden { display: none; }
+    .summary-bar {
+      flex-shrink: 0;
+      display: flex;
+      gap: 28px;
+      padding: 10px 20px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-soft);
+      box-shadow: var(--card-shadow);
+      overflow-x: auto;
+    }
+    .summary-stat {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      flex-shrink: 0;
+    }
+    .summary-stat-value {
+      font-family: var(--font-display);
+      font-size: 19px;
+      font-weight: 800;
+      color: var(--text-primary);
+      letter-spacing: -0.01em;
+      font-variant-numeric: tabular-nums;
+    }
+    .summary-stat-wind .summary-stat-value { color: var(--wind); }
+    .risk-text-low { color: var(--ok); }
+    .risk-text-moderate { color: var(--degraded); }
+    .risk-text-high { color: #e8590c; }
+    .risk-text-critical { color: var(--accent); }
+    .summary-stat-label {
+      font-size: 10.5px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    @media (max-width: 768px) {
+      .summary-bar { gap: 18px; padding: 8px 14px; }
+      .summary-stat-value { font-size: 16px; }
+    }
+
+    /* ---------- Bottom timeline scrubber - drag to replay today's
+       detections up to a given hour, same "playback" pattern as Windy's
+       own forecast slider (see the fire-spread tool's hour slider, which
+       this deliberately echoes visually). Filters lastFires in app.js;
+       never touches the incident list. ---------- */
+    .timeline-scrubber {
+      position: absolute;
+      left: 50%;
+      bottom: 14px;
+      transform: translateX(-50%);
+      z-index: 1000;
+      width: min(560px, calc(100vw - 28px));
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-soft);
+      border-radius: 999px;
+      box-shadow: var(--card-shadow);
+      padding: 8px 8px 8px 6px;
+      color: var(--text-primary);
+    }
+    .scrubber-play, .scrubber-reset {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      border: 1px solid var(--border-soft);
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      cursor: pointer;
+      font-family: var(--font-ui);
+    }
+    .scrubber-play { width: 32px; height: 32px; }
+    .scrubber-play:hover, .scrubber-reset:hover { border-color: var(--accent); color: var(--accent); }
+    .scrubber-play.is-playing { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+    .scrubber-reset { font-size: 11px; font-weight: 700; padding: 0 12px; height: 32px; }
+    .scrubber-track-wrap { flex: 1; min-width: 0; }
+    .scrubber-labels {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      color: var(--text-muted);
+      padding: 0 2px 2px;
+    }
+    .scrubber-now, #scrubber-label-current { color: var(--accent); font-weight: 700; }
+    #scrubber-label-current.future { color: var(--wind); }
+    .scrubber-range {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 4px;
+      border-radius: 999px;
+      background: var(--border-strong);
+      cursor: pointer;
+      outline: none;
+      margin: 0;
+    }
+    .scrubber-range::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 2px solid var(--bg-panel);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+      cursor: pointer;
+    }
+    .scrubber-range::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 2px solid var(--bg-panel);
+      cursor: pointer;
+    }
+    @media (max-width: 768px) {
+      .timeline-scrubber { width: calc(100vw - 28px); }
+    }
+
+    /* ---------- Wind vector marker (per active/critical incident) ----------
+       A small rotated arrow, colored with the dedicated --wind token so it
+       never reads as "more fire" next to a severity dot. */
+    .wind-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      pointer-events: none;
+    }
+    .wind-arrow svg { filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35)); }
+    .wind-arrow-tooltip { font-family: var(--font-mono); }
+
+    /* ---------- National cluster overview (very low zoom) ----------
+       Colored, sized count bubbles standing in for individual dots at a
+       zoom level where hundreds of them would just overlap into noise -
+       see CLUSTER_OVERVIEW_MAX_ZOOM/renderClusterOverview in app.js. */
+    .cluster-bubble-icon { background: none; border: none; }
+    .cluster-bubble {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.75);
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35);
+      color: #fff;
+      font-family: var(--font-display);
+      font-weight: 800;
+      font-size: 12px;
+      cursor: pointer;
+      transition: transform 0.12s ease;
+    }
+    .cluster-bubble:hover { transform: scale(1.08); }
+
+    /* ---------- Control rail ----------
+       Replaces the old fixed 290px settings sidebar. Only a slim icon rail
+       is permanently on screen; each icon drops a popover with the section
+       it used to always show, so the map stays the protagonist and nothing
+       occupies real estate until asked for. */
+    #control-rail {
       position: absolute;
       top: 14px;
       right: 14px;
       z-index: 1000;
-      width: 290px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
       background: var(--bg-panel);
-      backdrop-filter: blur(14px) saturate(140%);
-      -webkit-backdrop-filter: blur(14px) saturate(140%);
       border: 1px solid var(--border-soft);
       border-radius: 14px;
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
-      color: var(--text-primary);
-      font-size: 13px;
-      overflow: hidden;
+      box-shadow: var(--card-shadow);
+      padding: 4px;
     }
-
-    .panel-header {
+    .rail-btn {
+      position: relative;
+      width: 38px;
+      height: 38px;
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 14px 16px 12px;
-      border-bottom: 1px solid var(--border-soft);
+      justify-content: center;
+      border-radius: 10px;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      padding: 0;
     }
-    .panel-header h1 {
-      margin: 0;
-      font-size: 13.5px;
-      font-weight: 650;
-      letter-spacing: 0.01em;
+    .rail-btn:hover { background: var(--bg-elevated-hover); color: var(--text-primary); border-color: transparent; }
+    .rail-btn.active { background: var(--accent-dim); color: var(--accent); }
+    .rail-btn:active { transform: none; }
+    .rail-sep { height: 1px; background: var(--border-soft); margin: 3px 6px; }
+    .rail-dot {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
     }
-    .panel-header .sub {
-      margin-left: auto;
-      font-family: var(--font-mono);
-      font-size: 10.5px;
-      color: var(--text-muted);
-      letter-spacing: 0.04em;
+
+    /* Popover dropped from a rail button - anchored via JS (see
+       positionPopover() in app.js) so it always points back at the icon
+       that opened it, regardless of viewport size. */
+    .rail-popover {
+      position: absolute;
+      top: 18px; /* aligns with the first (layers) rail button; JS repositions per-button on open */
+      right: 66px;
+      z-index: 1000;
+      width: 290px;
+      max-height: calc(100vh - 28px);
+      overflow-y: auto;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-soft);
+      border-radius: 16px;
+      box-shadow: var(--card-shadow-lg);
+      color: var(--text-primary);
+      font-size: 13px;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(6px) scale(0.98);
+      transform-origin: top right;
+      transition: opacity 0.14s ease, transform 0.14s ease;
     }
+    .rail-popover.open { opacity: 1; pointer-events: auto; transform: translateX(0) scale(1); }
 
     .panel-section {
       padding: 12px 16px;
@@ -91,6 +289,36 @@
       color: var(--text-muted);
       margin-bottom: 8px;
     }
+
+    /* ---------- Bottom-right pill: the two controls people touch
+       constantly (basemap, time window) stay one click away instead of
+       buried inside a popover. ---------- */
+    .bottom-pill {
+      position: absolute;
+      bottom: 14px;
+      right: 14px;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      box-shadow: var(--card-shadow);
+      padding: 4px;
+    }
+    .bottom-pill select {
+      width: auto;
+      max-width: 130px;
+      border: none;
+      background: transparent;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 7px 8px;
+      border-radius: 8px;
+    }
+    .bottom-pill select:hover { background: var(--bg-elevated-hover); border-color: transparent; }
+    .bottom-pill-sep { width: 1px; align-self: stretch; margin: 4px 0; background: var(--border-soft); flex-shrink: 0; }
 
     .legend-row {
       display: flex;
@@ -113,6 +341,7 @@
       box-shadow: 0 0 6px rgba(45, 212, 191, 0.6);
       flex-shrink: 0;
     }
+    .legend-wind-arrow { display: inline-flex; color: var(--wind); flex-shrink: 0; }
     .legend-hint { margin-top: 6px; font-size: 11px; color: var(--text-muted); }
 
     /* Discrete recency-bucket swatches (see RECENCY_LEGEND in app.js) -
@@ -314,15 +543,13 @@
       min-height: 14px;
     }
 
-    /* ---------- Leaflet popup chrome, dark themed ---------- */
+    /* ---------- Leaflet popup chrome ---------- */
     .leaflet-popup-content-wrapper {
       background: var(--bg-panel);
-      backdrop-filter: blur(14px) saturate(140%);
-      -webkit-backdrop-filter: blur(14px) saturate(140%);
       color: var(--text-primary);
       border: 1px solid var(--border-soft);
-      border-radius: 12px;
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+      border-radius: 14px;
+      box-shadow: var(--card-shadow-lg);
       font-family: var(--font-ui);
     }
     .leaflet-popup-tip { background: var(--bg-panel); box-shadow: none; }
@@ -333,10 +560,10 @@
       background: var(--bg-elevated);
       color: var(--text-primary);
       border: 1px solid var(--border-soft);
-      border-radius: 6px;
+      border-radius: 8px;
       font-family: var(--font-ui);
       font-size: 11.5px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+      box-shadow: var(--card-shadow);
     }
     .leaflet-tooltip-top:before { border-top-color: var(--bg-elevated); }
 
@@ -405,11 +632,9 @@
       width: 320px;
       max-width: calc(100vw - 28px);
       background: var(--bg-panel);
-      backdrop-filter: blur(14px) saturate(140%);
-      -webkit-backdrop-filter: blur(14px) saturate(140%);
       border: 1px solid var(--border-soft);
-      border-radius: 14px;
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      border-radius: 16px;
+      box-shadow: var(--card-shadow);
       color: var(--text-primary);
       display: flex;
       flex-direction: column;
@@ -426,9 +651,10 @@
     }
     .sidebar-header h2 {
       margin: 0;
-      font-size: 13.5px;
-      font-weight: 650;
-      letter-spacing: 0.01em;
+      font-family: var(--font-display);
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: -0.01em;
     }
     .sidebar-header .count {
       margin-left: auto;
@@ -447,44 +673,33 @@
     .sidebar-back:hover { color: var(--text-primary); }
 
     /* ---------- Sidebar filters ---------- */
-    .filter-panel {
+    /* ---------- Filter bar ----------
+       Replaces the old collapsible block of three stacked
+       label+checkbox-chip-row groups (Nivel de riesgo / Estado del
+       incidente / Confirmado por) with a single row of dropdown pills, the
+       same pattern as the control rail's popovers on the map side. Default
+       filter state (critical risk + active status) needed its own "Solo
+       crítico + activo" shortcut button before; now that state IS the
+       default, so the button is gone and the pills just reflect it. */
+    .filter-bar {
       padding: 10px 12px 12px;
       border-bottom: 1px solid var(--border-soft);
       flex-shrink: 0;
-    }
-    .filter-panel-toggle {
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      width: 100%;
-      background: none;
-      border: none;
-      padding: 0;
-      margin-bottom: 10px;
-      font-size: 9.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-      color: var(--text-muted);
-      cursor: pointer;
+      flex-direction: column;
+      gap: 8px;
     }
-    .filter-panel-toggle:hover { color: var(--text-primary); }
-    .filter-panel-chevron { transition: transform 0.15s ease; font-size: 11px; }
-    .filter-panel.collapsed .filter-panel-toggle { margin-bottom: 0; }
-    .filter-panel.collapsed .filter-panel-chevron { transform: rotate(-90deg); }
-    .filter-panel.collapsed .filter-panel-body { display: none; }
-
-    .filter-group { margin-bottom: 10px; }
-    .filter-group:last-child { margin-bottom: 0; }
-
-    .search-row {
-      position: relative;
-      display: flex;
-      align-items: center;
-    }
+    /* Hidden (not just collapsed) while an incident's detail card occupies
+       the sidebar - filters apply to the list, not a single incident, so
+       reclaim the space instead of leaving them above the detail for no
+       reason. Restored on "back to list" (see showIncidentDetail in app.js). */
+    .filter-bar.filter-bar-hidden { display: none; }
+    .search-field { position: relative; }
     .search-icon {
       position: absolute;
-      left: 9px;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
       color: var(--text-muted);
       pointer-events: none;
     }
@@ -493,9 +708,9 @@
       background: var(--bg-elevated);
       color: var(--text-primary);
       border: 1px solid var(--border-soft);
-      border-radius: 8px;
-      padding: 7px 9px 7px 30px;
-      font-size: 12.5px;
+      border-radius: 10px;
+      padding: 8px 9px 8px 32px;
+      font-size: 13px;
       font-family: var(--font-ui);
       outline: none;
       transition: border-color 0.15s ease;
@@ -504,77 +719,95 @@
     #locality-search:focus { border-color: var(--accent); }
     #locality-search::placeholder { color: var(--text-muted); }
 
-    .quick-filter-btn {
-      width: 100%;
-      font-family: var(--font-ui);
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--accent);
-      background: var(--accent-dim);
-      border: 1px solid var(--accent);
-      border-radius: 8px;
-      padding: 7px 11px;
-      cursor: pointer;
-      transition: opacity 0.15s ease;
-    }
-    .quick-filter-btn:hover { opacity: 0.85; }
-    .quick-filter-btn.active {
-      background: var(--accent);
-      color: #1a1a1a;
-    }
-    .filter-group-label {
-      font-size: 9.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-    }
-    .chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
-    .chip { cursor: pointer; display: inline-flex; }
-    .chip input {
-      position: absolute;
-      opacity: 0;
-      width: 0;
-      height: 0;
-    }
-    .chip span {
+    .filter-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .filter-dd { position: relative; }
+    .fbtn {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
-      padding: 4px 9px;
+      gap: 6px;
+      padding: 7px 11px;
       border-radius: 999px;
-      font-size: 10.5px;
-      font-weight: 600;
+      font-size: 12px;
+      font-weight: 650;
+      font-family: var(--font-ui);
+      cursor: pointer;
+      white-space: nowrap;
       border: 1px solid var(--border-soft);
       background: var(--bg-elevated);
       color: var(--text-secondary);
       transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-      user-select: none;
-      white-space: nowrap;
     }
-    .chip:hover span { border-color: var(--border-strong); }
-    .chip input:checked + span {
-      background: var(--accent-dim);
-      border-color: var(--accent);
-      color: var(--text-primary);
-    }
-    .chip.chip-risk-low input:checked + span { background: rgba(74, 222, 128, 0.18); border-color: #4ade80; color: #4ade80; }
-    .chip.chip-risk-moderate input:checked + span { background: rgba(250, 204, 21, 0.18); border-color: #facc15; color: #facc15; }
-    .chip.chip-risk-high input:checked + span { background: rgba(251, 146, 60, 0.2); border-color: #fb923c; color: #fb923c; }
-    .chip.chip-risk-critical input:checked + span { background: rgba(248, 113, 113, 0.22); border-color: #f87171; color: #f87171; }
-    .filter-reset {
-      margin-top: 8px;
-      font-size: 10.5px;
+    .fbtn:hover { border-color: var(--border-strong); }
+    .fbtn.set { background: var(--accent-dim); border-color: var(--accent); color: var(--text-primary); }
+    .fbtn-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .fbtn-chev { font-size: 9px; color: var(--text-muted); margin-left: -1px; }
+    .fbtn.set .fbtn-chev { color: var(--accent); }
+    .fbtn-reset {
+      margin-left: auto;
+      width: 30px;
+      height: 30px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      background: transparent;
       color: var(--text-muted);
-      background: none;
-      border: none;
-      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       cursor: pointer;
-      text-decoration: underline;
-      text-underline-offset: 2px;
+      flex-shrink: 0;
+      padding: 0;
     }
-    .filter-reset:hover { color: var(--text-primary); }
+    .fbtn-reset:hover { background: var(--bg-elevated-hover); color: var(--text-primary); border-color: transparent; }
+
+    .fdropdown {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 20;
+      width: 210px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-soft);
+      border-radius: 14px;
+      box-shadow: var(--card-shadow-lg);
+      padding: 6px;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(4px) scale(0.98);
+      transform-origin: top left;
+      transition: opacity 0.13s ease, transform 0.13s ease;
+    }
+    .fdropdown.open { opacity: 1; pointer-events: auto; transform: translateY(0) scale(1); }
+    .fdrow {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px;
+      border-radius: 9px;
+      cursor: pointer;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text-primary);
+      user-select: none;
+    }
+    .fdrow:hover { background: var(--bg-elevated-hover); }
+    .fdrow input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .fdrow-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+    .fdrow-text { flex: 1; min-width: 0; }
+    .fdrow-box {
+      width: 16px;
+      height: 16px;
+      border-radius: 5px;
+      border: 1.5px solid var(--border-strong);
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 11px;
+      transition: background 0.12s ease, border-color 0.12s ease;
+    }
+    .fdrow input:checked ~ .fdrow-box { background: var(--accent); border-color: var(--accent); }
+    .fdrow input:checked ~ .fdrow-box::after { content: "\2713"; }
 
     .sidebar-body { flex: 1; overflow-y: auto; padding: 8px; }
     .incident-section-label {
@@ -672,8 +905,9 @@
     }
     .incident-metric { display: flex; flex-direction: column; }
     .incident-metric-value {
-      font-size: 26px;
-      font-weight: 700;
+      font-family: var(--font-display);
+      font-size: 27px;
+      font-weight: 800;
       color: var(--text-primary);
       line-height: 1.1;
       font-variant-numeric: tabular-nums;
@@ -893,6 +1127,24 @@
     }
     .timeline-btn { font-size: 11px; padding: 6px 10px; }
 
+    /* ---------- Priority card ----------
+       Wraps the sidebar's "medios actuando" (regional status) section - of
+       everything shown for an incident, active personnel/aircraft deployed
+       is what a stressed-out user most needs to see, so it gets its own
+       accent-colored card instead of blending in as one more bordered
+       block among daily chart / satellite / telegram. The map popup keeps
+       using the plain .regional-card look (see regionalSectionHtml) since
+       that context is a quick glance, not the primary detail read. */
+    .priority-card {
+      margin: 0 16px 14px;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--accent);
+      background: var(--accent-dim);
+    }
+    .priority-card .regional-card { margin-top: 0; padding-top: 0; border-top: none; }
+    .priority-card .regional-status-pill { background: var(--ok); color: #fff; }
+
     /* ---------- Official regional status (popup + timeline) ---------- */
     .regional-card {
       margin-top: 10px;
@@ -947,6 +1199,38 @@
       font-size: 10.5px;
       color: var(--text-secondary);
     }
+
+    /* ---------- Vegetation quemada (Copernicus EMS, sidebar only - rare) ---------- */
+    .vegetation-card {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .vegetation-card-title {
+      font-size: 11.5px;
+      font-weight: 650;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .veg-total { margin-left: auto; font-size: 10.5px; font-weight: 600; color: var(--text-muted); }
+    .veg-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11px; }
+    .veg-swatch { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+    .veg-label { width: 96px; flex-shrink: 0; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .veg-bar-wrap { flex: 1; height: 6px; border-radius: 3px; background: var(--bg-elevated-hover); overflow: hidden; }
+    .veg-bar { display: block; height: 100%; border-radius: 3px; }
+    .veg-ha { flex-shrink: 0; font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+
+    /* ---------- Weather (current-hour reading, sidebar only) ---------- */
+    .weather-card {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .weather-card-title { font-size: 11.5px; font-weight: 650; color: var(--text-primary); }
+    .weather-row { display: flex; gap: 16px; margin-top: 8px; }
+    .weather-item { display: flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600; color: var(--text-secondary); }
 
     /* ---------- Webcams (map popup, Windy-style viewer) ---------- */
     .webcam-thumb {
@@ -1079,6 +1363,25 @@
     .status-page-link { font-size: 11.5px; color: var(--accent); text-decoration: none; }
     .status-page-link:hover { text-decoration: underline; }
 
+    .full-info-row { padding: 14px 16px; border-top: 1px solid var(--border-soft); }
+    .full-info-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      width: 100%;
+      background: var(--text-primary);
+      color: var(--bg-panel);
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 12.5px;
+      font-weight: 700;
+      text-decoration: none;
+      font-family: var(--font-ui);
+      transition: opacity 0.15s ease;
+    }
+    .full-info-btn:hover { opacity: 0.85; }
+
     /* ---------- Mobile: floating panels become full-screen overlays ---------- */
     .mobile-panel-toggle {
       display: none;
@@ -1086,6 +1389,7 @@
       justify-content: center;
       width: 30px;
       height: 30px;
+      margin-left: auto;
       border-radius: 999px;
       border: 1px solid var(--border-soft);
       background: var(--bg-elevated);
@@ -1115,7 +1419,7 @@
       .mobile-panel-toggle { display: inline-flex; }
       .topbar-tabs { display: none; } /* reclaim header space - Mapa/Fuentes still reachable, just not as tabs */
 
-      #incident-sidebar, #panel {
+      #incident-sidebar {
         position: fixed;
         inset: 0;
         top: 49px; /* below the topbar */
@@ -1127,14 +1431,37 @@
         transform: translateY(100%);
         transition: transform 0.2s ease;
       }
-      #incident-sidebar.mobile-open, #panel.mobile-open { transform: translateY(0); }
+      #incident-sidebar.mobile-open { transform: translateY(0); }
       .mobile-panel-close { display: flex; }
+
+      /* The rail itself stays put as a compact floating control (there's
+         room for it even on a phone); only the popover it drops becomes a
+         full-screen sheet, matching the sidebar's mobile treatment above. */
+      .rail-popover {
+        position: fixed;
+        inset: 0;
+        top: 49px;
+        right: auto;
+        width: auto;
+        max-width: none;
+        max-height: none;
+        bottom: 0;
+        border-radius: 0;
+        z-index: 1500;
+        transform: translateY(100%);
+      }
+      .rail-popover.open { transform: translateY(0); }
+
+      /* Lift the basemap/time-window pill clear of the timeline scrubber,
+         which grows to near-full-width on narrow viewports (see
+         .timeline-scrubber above) and would otherwise sit underneath it. */
+      .bottom-pill { bottom: 70px; }
     }
   </style>
 </head>
 <body class="has-topbar-map">
   <nav class="topbar">
-    <span class="topbar-brand"><span class="pulse" id="topbar-pulse"></span>Wildfire Monitor</span>
+    <a class="topbar-brand" href="/index.html" aria-label="Vigía"><img class="topbar-logo" src="/favicon.svg" alt="Vigía" /></a>
     <div class="topbar-tabs">
       <a class="topbar-tab active" href="/index.html">Mapa</a>
       <a class="topbar-tab" href="/ranking.html">Ranking</a>
@@ -1143,96 +1470,148 @@
     <button class="mobile-panel-toggle" id="mobile-sidebar-toggle" aria-label="Ver incidentes">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
     </button>
-    <button class="mobile-panel-toggle" id="mobile-settings-toggle" aria-label="Ver ajustes">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 0 1-4 0v-.09A1.7 1.7 0 0 0 8.96 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 0 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.96a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.04-1.56V3a2 2 0 0 1 4 0v.09a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.04H21a2 2 0 0 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.04z"/></svg>
-    </button>
-    <button class="theme-toggle" id="theme-toggle" title="Cambiar a modo claro" aria-label="Cambiar tema">🌙</button>
   </nav>
+  <div class="summary-bar" id="summary-bar">
+    <div class="summary-stat">
+      <span class="summary-stat-value" id="summary-active">–</span>
+      <span class="summary-stat-label">Incendios activos</span>
+    </div>
+    <div class="summary-stat">
+      <span class="summary-stat-value" id="summary-area">–</span>
+      <span class="summary-stat-label">Ha estimadas (activos)</span>
+    </div>
+    <div class="summary-stat">
+      <span class="summary-stat-value summary-risk" id="summary-risk">–</span>
+      <span class="summary-stat-label">Riesgo máximo</span>
+    </div>
+    <div class="summary-stat summary-stat-wind">
+      <span class="summary-stat-value" id="summary-wind">–</span>
+      <span class="summary-stat-label">Viento medio (focos)</span>
+    </div>
+  </div>
   <div id="map-wrap">
   <div id="map"></div>
+  <div class="timeline-scrubber" id="timeline-scrubber">
+    <button class="scrubber-play" id="scrubber-play" aria-label="Reproducir evolución del día">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" id="scrubber-play-icon"><path d="M6 4l14 8-14 8z"/></svg>
+    </button>
+    <div class="scrubber-track-wrap">
+      <div class="scrubber-labels">
+        <span id="scrubber-label-start">–</span>
+        <span class="scrubber-now" id="scrubber-label-current">Ahora</span>
+        <span id="scrubber-label-end">Ahora</span>
+      </div>
+      <input type="range" id="scrubber-range" class="scrubber-range" min="0" max="100" value="100" step="1" />
+    </div>
+    <button class="scrubber-reset" id="scrubber-reset" title="Volver a 'ahora'">Ahora</button>
+  </div>
   <div id="incident-sidebar">
     <button class="mobile-panel-close" id="mobile-sidebar-close" aria-label="Cerrar">✕</button>
     <div class="sidebar-header" id="sidebar-header">
       <h2>Incendios por gravedad</h2>
       <span class="count" id="incident-count"></span>
     </div>
-    <div class="filter-panel" id="filter-panel">
-      <button class="filter-panel-toggle" id="filter-panel-toggle">
-        <span>Filtros</span>
-        <span class="filter-panel-chevron" id="filter-panel-chevron">▾</span>
-      </button>
-      <div class="filter-panel-body" id="filter-panel-body">
-        <div class="filter-group">
-          <div class="search-row">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="search-icon"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-            <input type="text" id="locality-search" placeholder="Buscar localidad o provincia... ( / )" autocomplete="off" />
+    <div class="filter-bar" id="filter-bar">
+      <div class="search-field">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="search-icon"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input type="text" id="locality-search" placeholder="Buscar localidad o provincia... ( / )" autocomplete="off" />
+      </div>
+      <div class="filter-row">
+        <div class="filter-dd">
+          <button class="fbtn" id="filter-risk-btn" data-dropdown="filter-dropdown-risk">
+            <span class="fbtn-dot" id="filter-risk-dot"></span><span id="filter-risk-label">Riesgo</span><span class="fbtn-chev">▾</span>
+          </button>
+          <div class="fdropdown" id="filter-dropdown-risk">
+            <label class="fdrow"><input type="checkbox" class="filter-risk" value="low" /><span class="fdrow-dot" style="background:var(--ok);"></span><span class="fdrow-text">Bajo</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-risk" value="moderate" /><span class="fdrow-dot" style="background:var(--degraded);"></span><span class="fdrow-text">Moderado</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-risk" value="high" /><span class="fdrow-dot" style="background:#e8590c;"></span><span class="fdrow-text">Alto</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-risk" value="critical" checked /><span class="fdrow-dot" style="background:var(--accent);"></span><span class="fdrow-text">Crítico</span><span class="fdrow-box"></span></label>
           </div>
         </div>
-        <div class="filter-group">
-          <button class="quick-filter-btn active" id="quick-filter-critical">Solo crítico + activo</button>
-        </div>
-        <div class="filter-group">
-          <div class="filter-group-label">Nivel de riesgo</div>
-          <div class="chip-row">
-            <label class="chip chip-risk-low"><input type="checkbox" class="filter-risk" value="low" /><span>Bajo</span></label>
-            <label class="chip chip-risk-moderate"><input type="checkbox" class="filter-risk" value="moderate" /><span>Moderado</span></label>
-            <label class="chip chip-risk-high"><input type="checkbox" class="filter-risk" value="high" /><span>Alto</span></label>
-            <label class="chip chip-risk-critical"><input type="checkbox" class="filter-risk" value="critical" checked /><span>Crítico</span></label>
+        <div class="filter-dd">
+          <button class="fbtn" id="filter-status-btn" data-dropdown="filter-dropdown-status">
+            <span id="filter-status-label">Estado</span><span class="fbtn-chev">▾</span>
+          </button>
+          <div class="fdropdown" id="filter-dropdown-status">
+            <label class="fdrow"><input type="checkbox" class="filter-status" value="active" checked /><span class="fdrow-text">Activo</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-status" value="cooling" /><span class="fdrow-text">En enfriamiento</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-status" value="archived" /><span class="fdrow-text">Archivado</span><span class="fdrow-box"></span></label>
           </div>
         </div>
-        <div class="filter-group">
-          <div class="filter-group-label">Estado del incidente</div>
-          <div class="chip-row">
-            <label class="chip"><input type="checkbox" class="filter-status" value="active" checked /><span>Activo</span></label>
-            <label class="chip"><input type="checkbox" class="filter-status" value="cooling" /><span>En enfriamiento</span></label>
-            <label class="chip"><input type="checkbox" class="filter-status" value="archived" /><span>Archivado</span></label>
+        <div class="filter-dd">
+          <button class="fbtn" id="filter-source-btn" data-dropdown="filter-dropdown-source">
+            <span id="filter-source-label">Fuente</span><span class="fbtn-chev">▾</span>
+          </button>
+          <div class="fdropdown" id="filter-dropdown-source">
+            <label class="fdrow"><input type="checkbox" class="filter-source" value="has_regional_status" /><span class="fdrow-text">Estado oficial</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-source" value="has_telegram_mentions" /><span class="fdrow-text">Telegram</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-source" value="has_satellite_imagery" /><span class="fdrow-text">Satélite</span><span class="fdrow-box"></span></label>
+            <label class="fdrow"><input type="checkbox" class="filter-source" value="has_ems_activation" /><span class="fdrow-text">Copernicus EMS</span><span class="fdrow-box"></span></label>
           </div>
         </div>
-        <div class="filter-group">
-          <div class="filter-group-label">Confirmado por</div>
-          <div class="chip-row">
-            <label class="chip"><input type="checkbox" class="filter-source" value="has_regional_status" /><span>Estado oficial</span></label>
-            <label class="chip"><input type="checkbox" class="filter-source" value="has_telegram_mentions" /><span>Telegram</span></label>
-            <label class="chip"><input type="checkbox" class="filter-source" value="has_satellite_imagery" /><span>Satélite</span></label>
-            <label class="chip"><input type="checkbox" class="filter-source" value="has_ems_activation" /><span>Copernicus EMS</span></label>
-          </div>
-        </div>
-        <button class="filter-reset" id="filter-reset">Restablecer filtros</button>
+        <button class="fbtn-reset" id="filter-reset" title="Restablecer filtros" aria-label="Restablecer filtros">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+        </button>
       </div>
     </div>
     <div class="sidebar-body" id="sidebar-body">
       <div class="sidebar-empty">Cargando incidentes…</div>
     </div>
   </div>
-  <div id="panel">
-    <button class="mobile-panel-close" id="mobile-settings-close" aria-label="Cerrar">✕</button>
-    <div class="panel-header">
-      <span class="pulse" id="header-pulse"></span>
-      <h1>Wildfire Monitor</h1>
-      <span class="sub">ES</span>
-    </div>
+  <!-- ---------- Control rail ----------
+       Replaces the old always-open 290px settings sidebar: only this slim
+       icon rail sits on the map permanently, each button dropping the
+       popover it used to always show (see positionPopover()/togglePopover()
+       in app.js). Basemap + time window move out into the bottom-right
+       pill below since those two are touched far more often than anything
+       else in here and don't deserve to be a click away. -->
+  <div id="control-rail">
+    <button class="rail-btn active" id="rail-btn-layers" data-popover="popover-layers" aria-label="Capas">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6l5-1.5 6 1.5 6-1.5v13.5l-6 1.5-6-1.5-5 1.5z"/><path d="M9 4.5v13.5M15 6v13.5"/></svg>
+    </button>
+    <button class="rail-btn" id="rail-btn-tools" data-popover="popover-tools" aria-label="Herramientas">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 1 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.1 2.1-2.6-.7-.7-2.6z"/></svg>
+    </button>
+    <button class="rail-btn" id="rail-btn-alerts" data-popover="popover-alerts" aria-label="Alertas">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      <span class="rail-dot" id="alerts-rail-dot" style="display:none;"></span>
+    </button>
+    <div class="rail-sep"></div>
+    <button class="rail-btn" id="rail-btn-data" data-popover="popover-data" aria-label="Datos">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+    </button>
+  </div>
 
-    <!-- ---------- Visualización ---------- -->
+  <!-- ---------- Capas (was "Visualización") ---------- -->
+  <div class="rail-popover open" id="popover-layers">
+    <button class="mobile-panel-close popover-close" aria-label="Cerrar">✕</button>
     <div class="panel-section">
-      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6l5-1.5 6 1.5 6-1.5v13.5l-6 1.5-6-1.5-5 1.5z"/><path d="M9 4.5v13.5M15 6v13.5"/></svg></span> Visualización</div>
+      <div class="settings-group-title">Capas</div>
 
       <div class="settings-block">
         <div class="legend-row">
           <div class="legend-item"><span class="legend-ring"></span>Foco de detección</div>
           <div class="legend-item"><span class="legend-dot"></span>Reportes de usuarios</div>
+          <div class="legend-item"><span class="legend-wind-arrow"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg></span>Viento en el foco</div>
         </div>
-        <div class="legend-hint">Cada foco tiene siempre el mismo tamaño; el color indica su antigüedad en franjas horarias (más reciente = colores cálidos), así se aprecia la dirección de avance del incendio. El polígono sombreado marca el perímetro estimado del área afectada.</div>
+        <div class="legend-hint">Color = antigüedad del foco · Polígono = área estimada · Flecha = viento</div>
         <div class="recency-legend" id="recency-legend"></div>
       </div>
 
       <div class="settings-block">
-        <div class="field-row" style="margin-bottom:8px;">
-          <label for="basemap-style" style="font-size:12.5px; color:var(--text-secondary); display:flex; align-items:center; gap:6px;"><span class="icon"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6l5-1.5 6 1.5 6-1.5v13.5l-6 1.5-6-1.5-5 1.5z"/><path d="M9 4.5v13.5M15 6v13.5"/></svg></span> Mapa base</label>
+        <div class="settings-row">
+          <span class="settings-row-label">
+            <span class="settings-row-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/><path d="M4 10l-2 2 2 2M20 10l2 2-2 2" opacity="0.5"/></svg></span>
+            <span class="settings-row-text">
+              Campo de viento
+              <span class="settings-row-hint">Flechas en toda la vista, por hora - arrastra la barra inferior</span>
+            </span>
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="wind-field-toggle" />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </label>
         </div>
-        <select id="basemap-style">
-          <option value="streets">Calles (OpenStreetMap)</option>
-          <option value="topo">Topográfico / relieve</option>
-        </select>
       </div>
 
       <div class="settings-block">
@@ -1248,24 +1627,14 @@
         </div>
         <div class="field" style="margin-top:8px;"><input type="date" id="satellite-date" /></div>
       </div>
-
-      <div class="settings-block">
-        <div class="field-row" style="margin-bottom:8px;">
-          <label for="date-range" style="font-size:12.5px; color:var(--text-secondary);">Ventana temporal</label>
-        </div>
-        <select id="date-range">
-          <option value="1">Último día</option>
-          <option value="3">Últimos 3 días</option>
-          <option value="7" selected>Últimos 7 días</option>
-          <option value="14">Últimos 14 días</option>
-          <option value="30">Últimos 30 días</option>
-        </select>
-      </div>
     </div>
+  </div>
 
-    <!-- ---------- Herramientas ---------- -->
+  <!-- ---------- Herramientas ---------- -->
+  <div class="rail-popover" id="popover-tools">
+    <button class="mobile-panel-close popover-close" aria-label="Cerrar">✕</button>
     <div class="panel-section">
-      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 1 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.1 2.1-2.6-.7-.7-2.6z"/></svg></span> Herramientas</div>
+      <div class="settings-group-title">Herramientas</div>
 
       <div class="settings-row">
         <span class="settings-row-label">
@@ -1288,23 +1657,26 @@
           <span class="tool-experimental-chevron">▾</span>
         </button>
         <div class="tool-experimental-body">
-          <div class="legend-hint" style="margin-top:6px;">Pulsa "Colocar origen" y luego haz clic en el mapa donde se inició el incendio. Arrastra el control para recorrer la previsión de viento de 24h.</div>
+          <div class="legend-hint" style="margin-top:6px;">Pulsa "Colocar origen" y luego haz clic en el mapa donde se inició el incendio. Arrastra el control para recorrer la previsión de viento de 8h.</div>
           <div class="btn-row" style="margin-top:8px;">
             <button id="fire-spread-place">Colocar origen</button>
             <button id="fire-spread-clear">Borrar</button>
           </div>
           <div id="fire-spread-slider-row" class="fire-spread-slider-row" style="display:none;">
-            <input type="range" id="fire-spread-slider" min="0" max="23" step="1" value="0" />
+            <input type="range" id="fire-spread-slider" min="0" max="7" step="1" value="0" />
             <span id="fire-spread-hour-label" class="fire-spread-hour-label">+1h</span>
           </div>
           <div id="fire-spread-info" class="fire-spread-info"></div>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- ---------- Alertas ---------- -->
+  <!-- ---------- Alertas ---------- -->
+  <div class="rail-popover" id="popover-alerts">
+    <button class="mobile-panel-close popover-close" aria-label="Cerrar">✕</button>
     <div class="panel-section">
-      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></span> Alertas</div>
+      <div class="settings-group-title">Alertas</div>
 
       <div class="settings-row">
         <span class="settings-row-label">
@@ -1322,20 +1694,38 @@
       </div>
       <div id="location-alerts-status" class="legend-hint" style="margin-top:8px;"></div>
     </div>
+  </div>
 
-    <!-- ---------- Datos ---------- -->
+  <!-- ---------- Datos ---------- -->
+  <div class="rail-popover" id="popover-data">
+    <button class="mobile-panel-close popover-close" aria-label="Cerrar">✕</button>
     <div class="panel-section">
-      <div class="settings-group-title"><span class="icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></span> Datos</div>
+      <div class="settings-group-title">Datos</div>
       <div class="btn-row">
         <button id="reload">Recargar mapa</button>
       </div>
       <div id="status"></div>
       <div id="stale-data-warning" class="stale-data-warning" style="display:none;"></div>
     </div>
-
     <div class="panel-section">
       <a href="/sources.html" class="status-page-link">&rarr; Ver todas las fuentes</a>
     </div>
+  </div>
+
+  <!-- ---------- Bottom-right pill: basemap + time window, always one click away ---------- -->
+  <div class="bottom-pill">
+    <select id="date-range" aria-label="Ventana temporal">
+      <option value="1">Último día</option>
+      <option value="3">Últimos 3 días</option>
+      <option value="7" selected>Últimos 7 días</option>
+      <option value="14">Últimos 14 días</option>
+      <option value="30">Últimos 30 días</option>
+    </select>
+    <div class="bottom-pill-sep"></div>
+    <select id="basemap-style" aria-label="Mapa base">
+      <option value="streets">Claro (CARTO Positron)</option>
+      <option value="topo">Topográfico / relieve</option>
+    </select>
   </div>
   </div>
 

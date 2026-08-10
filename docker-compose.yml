@@ -43,11 +43,15 @@ services:
   frontend:
     build: ./frontend
     environment:
-      # Sent to the BROWSER via GET /config (see frontend/server.js) - must be
-      # an address the client can reach, not the container's own localhost.
-      # Defaults to localhost for local dev; production must override this in
-      # .env to the server's public host (see .env.example).
-      API_BASE_URL: ${API_BASE_URL:-http://localhost:8000}
+      # Sent to the BROWSER via GET /config (see frontend/server.js). Leave
+      # unset/empty (the default) so the browser calls this same origin and
+      # server.js proxies /api and /media to the backend internally - this
+      # works regardless of what public host/tunnel serves port 3000, and
+      # never requires the backend's port 8000 to be publicly reachable.
+      # Only set this if the backend must be called directly by the browser.
+      API_BASE_URL: ${API_BASE_URL:-}
+      # Address to reach the backend from inside the Docker network.
+      BACKEND_INTERNAL_URL: http://backend:8000
       PORT: 3000
     ports:
       - "3000:3000"

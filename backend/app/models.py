@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -21,6 +22,12 @@ class FireDetection(Base):
     __tablename__ = "fire_detections"
     __table_args__ = (
         UniqueConstraint("source", "external_id", name="uq_source_external_id"),
+        # _detections_near_incident (routers/incidents.py) filters by
+        # acquired_at range then latitude/longitude bounding box for every
+        # incident on the rankings page - without this, that's a sequential
+        # scan of the whole table per incident (confirmed live: ~22s for a
+        # 50-incident rankings request).
+        Index("ix_fire_detections_acquired_lat_lon", "acquired_at", "latitude", "longitude"),
     )
 
     id = Column(Integer, primary_key=True)

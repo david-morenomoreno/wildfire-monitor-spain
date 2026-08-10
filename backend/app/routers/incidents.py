@@ -21,9 +21,11 @@ from app.schemas import (
     IncidentMergeRequest,
     IncidentRenameRequest,
     IncidentReportOut,
+    IncidentVegetationOut,
     RankedIncidentOut,
 )
-from app.services.area_estimate import estimate_area_ha
+from app.services.area_estimate import estimate_area_and_hull, estimate_area_ha
+from app.services.copernicus_ems import get_incident_vegetation_stats
 from app.services.incidents import INCIDENT_REASSOCIATION_DEG
 from app.services.incidents import merge_incidents as _merge_incidents_core
 from app.services.incidents import merge_reassociable_incidents as _merge_reassociable_incidents
@@ -116,14 +118,26 @@ def _detections_near_incident(db: Session, incident: FireIncident) -> list[tuple
     and active window. It's best-effort, not an authoritative stored set -
     two incidents whose windows/areas overlap could double-count a
     detection. Shared by both _detection_source_breakdown (which source) and
-    _estimate_incident_area_ha (spatial extent) so they don't each re-run the
-    query independently.
+    _estimate_incident_area_and_hull (spatial extent/shape) so they don't
+    each re-run the query independently.
     """
     window_start = incident.first_detected_at - timedelta(hours=1)
     window_end = incident.last_detected_at + timedelta(hours=1)
+    # Bounding-box pre-filter pushed into SQL (backed by
+    # ix_fire_detections_acquired_lat_lon) so Postgres narrows this to a
+    # handful of rows instead of handing the whole time-window slice to
+    # Python - the exact circular distance check below still applies on top,
+    # since a square box is only an approximation of the real radius.
     candidates = (
         db.query(FireDetection.source, FireDetection.latitude, FireDetection.longitude)
-        .filter(FireDetection.acquired_at >= window_start, FireDetection.acquired_at <= window_end)
+        .filter(
+            FireDetection.acquired_at >= window_start,
+            FireDetection.acquired_at <= window_end,
+            FireDetection.latitude >= incident.centroid_lat - INCIDENT_REASSOCIATION_DEG,
+            FireDetection.latitude <= incident.centroid_lat + INCIDENT_REASSOCIATION_DEG,
+            FireDetection.longitude >= incident.centroid_lon - INCIDENT_REASSOCIATION_DEG,
+            FireDetection.longitude <= incident.centroid_lon + INCIDENT_REASSOCIATION_DEG,
+        )
         .all()
     )
     return [
@@ -145,18 +159,66 @@ def _detection_source_breakdown(db: Session, incident: FireIncident) -> list[Inc
     ]
 
 
-def _estimate_incident_area_ha(db: Session, incident: FireIncident) -> float | None:
+def _estimate_incident_area_and_hull(
+    db: Session, incident: FireIncident
+) -> tuple[float | None, list[tuple[float, float]] | None]:
     """
-    Best-effort hectare estimate for incidents with no official EFFIS
-    area_ha (see area_estimate.estimate_area_ha's module docstring for why
-    this exists and how it differs from the map's client-side estimate).
-    Only worth computing when the official figure is actually missing -
-    EFFIS's own reported area always takes precedence over an estimate.
+    Single-incident best-effort hectare + shape estimate for incidents with
+    no official EFFIS area_ha (see area_estimate.estimate_area_and_hull's
+    docstring for why this exists and how it differs from the map's
+    client-side estimate). Used by the report endpoint, which needs the
+    actual traced shape to draw on its map, not just the area figure - see
+    _bulk_area_ha_estimates below for the rankings page's area-only, N-at-
+    once counterpart. Only worth computing when the official figure is
+    actually missing - EFFIS's own reported area always takes precedence
+    over an estimate.
     """
     if incident.area_ha is not None:
-        return None
+        return None, None
     points = [(lat, lon) for _source, lat, lon in _detections_near_incident(db, incident)]
-    return estimate_area_ha(points)
+    return estimate_area_and_hull(points)
+
+
+def _bulk_area_ha_estimates(db: Session, incidents: list[FireIncident]) -> dict[int, float | None]:
+    """
+    Batched version of _estimate_incident_area_and_hull's area-only math for
+    the rankings page,
+    which needs this for every ranked incident at once (confirmed live:
+    calling _detections_near_incident per-incident there meant N separate
+    round-trips to fire_detections, ~190ms each - 9.5s total for a 50-row
+    page even after the acquired_at/lat/lon index). fire_detections is only
+    tens of thousands of rows total, so fetching everything in the ranked
+    set's combined time span ONCE and doing the per-incident window/box/
+    circle filtering in Python is far cheaper than repeating the round trip.
+    Revisit (e.g. a real spatial index/PostGIS, or persisting the estimate
+    at incident-rebuild time) if fire_detections grows enough that a single
+    combined-window fetch stops being cheap.
+    """
+    needing_estimate = [inc for inc in incidents if inc.area_ha is None]
+    if not needing_estimate:
+        return {}
+
+    window_start = min(inc.first_detected_at for inc in needing_estimate) - timedelta(hours=1)
+    window_end = max(inc.last_detected_at for inc in needing_estimate) + timedelta(hours=1)
+    all_detections = (
+        db.query(FireDetection.latitude, FireDetection.longitude, FireDetection.acquired_at)
+        .filter(FireDetection.acquired_at >= window_start, FireDetection.acquired_at <= window_end)
+        .all()
+    )
+
+    estimates: dict[int, float | None] = {}
+    for incident in needing_estimate:
+        inc_start = incident.first_detected_at - timedelta(hours=1)
+        inc_end = incident.last_detected_at + timedelta(hours=1)
+        points = [
+            (lat, lon)
+            for lat, lon, acquired_at in all_detections
+            if inc_start <= acquired_at <= inc_end
+            and ((lat - incident.centroid_lat) ** 2 + (lon - incident.centroid_lon) ** 2) ** 0.5
+            <= INCIDENT_REASSOCIATION_DEG
+        ]
+        estimates[incident.id] = estimate_area_ha(points)
+    return estimates
 
 
 @router.get("/rankings", response_model=list[RankedIncidentOut])
@@ -188,11 +250,12 @@ def get_incident_rankings(
     deduped = _dedupe_by_place(query.all())
     ranked = sorted(deduped, key=_SORT_METRICS[sort], reverse=True)[:limit]
     enriched = _with_source_flags(db, ranked)
+    area_ha_estimates = _bulk_area_ha_estimates(db, ranked)
 
     result = []
     for position, (incident, out) in enumerate(zip(ranked, enriched), start=1):
         duration_hours = (incident.last_detected_at - incident.first_detected_at).total_seconds() / 3600
-        area_ha_estimated = _estimate_incident_area_ha(db, incident)
+        area_ha_estimated = area_ha_estimates.get(incident.id)
         result.append(
             RankedIncidentOut(
                 **out.model_dump(exclude={"area_ha_estimated"}),
@@ -248,6 +311,22 @@ def get_incident_timeline(
     return query.order_by(IncidentEvent.occurred_at.asc()).all()
 
 
+@router.get("/{incident_id}/vegetation", response_model=Optional[IncidentVegetationOut])
+def get_incident_vegetation(incident_id: int, db: Session = Depends(get_db)):
+    """
+    Structured land-use/burnt-area breakdown for the map sidebar's lazy
+    "Vegetación quemada" fetch (parallels /regional-incidents,
+    /telegram/messages, /copernicus/scenes) - see
+    get_incident_vegetation_stats for why this is null for the large
+    majority of incidents (no Copernicus EMS activation), not a 404.
+    """
+    incident = db.query(FireIncident).filter(FireIncident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    stats = get_incident_vegetation_stats(db, incident_id)
+    return IncidentVegetationOut.from_stats(stats) if stats is not None else None
+
+
 @router.get("/{incident_id}/report", response_model=IncidentReportOut)
 def get_incident_report(incident_id: int, db: Session = Depends(get_db)):
     """
@@ -262,7 +341,8 @@ def get_incident_report(incident_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Incident not found")
 
     incident_out = _with_source_flags(db, [incident])[0]
-    incident_out = incident_out.model_copy(update={"area_ha_estimated": _estimate_incident_area_ha(db, incident)})
+    estimated_area_ha, estimated_hull = _estimate_incident_area_and_hull(db, incident)
+    incident_out = incident_out.model_copy(update={"area_ha_estimated": estimated_area_ha})
     timeline = (
         db.query(IncidentEvent)
         .filter(IncidentEvent.incident_id == incident_id)
@@ -288,6 +368,7 @@ def get_incident_report(incident_id: int, db: Session = Depends(get_db)):
         .all()
     )
     duration_hours = (incident.last_detected_at - incident.first_detected_at).total_seconds() / 3600
+    vegetation_stats = get_incident_vegetation_stats(db, incident_id)
 
     return IncidentReportOut(
         incident=incident_out,
@@ -297,6 +378,8 @@ def get_incident_report(incident_id: int, db: Session = Depends(get_db)):
         satellite_scenes=satellite_scenes,
         telegram_messages=telegram_messages,
         detection_sources=_detection_source_breakdown(db, incident),
+        estimated_hull=estimated_hull,
+        vegetation=IncidentVegetationOut.from_stats(vegetation_stats) if vegetation_stats is not None else None,
     )
 
 
