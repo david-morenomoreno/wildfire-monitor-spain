@@ -195,6 +195,38 @@ class IncidentDetectionSourceCount(BaseModel):
     count: int
 
 
+class LandUseHectares(BaseModel):
+    label: str
+    hectares: float
+
+
+class IncidentVegetationOut(BaseModel):
+    """
+    Structured form of get_incident_vegetation_stats (services/copernicus_ems.py) -
+    only ever populated from an official Copernicus EMS Rapid Mapping
+    activation, so this is None for the vast majority of incidents (see that
+    function's docstring for why 0-15 activations/year, not a routine feed).
+    """
+
+    top_land_use: list[LandUseHectares] = []
+    burnt_area_ha: Optional[float] = None
+    active_flames: Optional[int] = None
+    population_affected: Optional[int] = None
+
+    @classmethod
+    def from_stats(cls, stats: dict) -> "IncidentVegetationOut":
+        """stats is the raw dict get_incident_vegetation_stats returns -
+        top_land_use there is a list of (label, hectares) tuples, not
+        already-labeled objects, since that function is shared with the
+        plain-prose timeline description (_format_product_stats_summary)."""
+        return cls(
+            top_land_use=[LandUseHectares(label=label, hectares=ha) for label, ha in stats["top_land_use"]],
+            burnt_area_ha=stats["burnt_area_ha"],
+            active_flames=stats["active_flames"],
+            population_affected=stats["population_affected"],
+        )
+
+
 class IncidentReportOut(BaseModel):
     """
     Everything this app tracks about one FireIncident, assembled server-side
@@ -212,6 +244,13 @@ class IncidentReportOut(BaseModel):
     # Best-effort - see _detection_source_breakdown in routers/incidents.py
     # for why this is a proximity re-query rather than a stored FK.
     detection_sources: list[IncidentDetectionSourceCount] = []
+    # Closed ring of (lat, lon) vertices tracing this incident's estimated
+    # extent (see area_estimate.estimate_area_and_hull) - only populated when
+    # there's no official EFFIS area_ha AND enough detections to trace a
+    # meaningful shape from. None means "draw a centroid marker instead",
+    # never a fabricated outline.
+    estimated_hull: list[tuple[float, float]] | None = None
+    vegetation: Optional[IncidentVegetationOut] = None
 
 
 class WebcamOut(BaseModel):

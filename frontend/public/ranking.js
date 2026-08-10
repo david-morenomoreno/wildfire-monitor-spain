@@ -21,6 +21,11 @@ async function loadConfig() {
 
 // ---------- Shared label/badge helpers (kept consistent with app.js) ----------
 const RISK_LABELS = { low: "Bajo", moderate: "Moderado", high: "Alto", critical: "Crítico" };
+// Same hex values as the .risk-low/.risk-moderate/.risk-high/.risk-critical
+// badge colors (see <style> above) so the report map's marker always matches
+// the risk badge sitting right next to it, instead of introducing a second,
+// slightly-different color language just for the map.
+const RISK_MARKER_COLORS = { low: "#4ade80", moderate: "#facc15", high: "#fb923c", critical: "#f87171" };
 const STATUS_LABELS = { active: "Activo", cooling: "En enfriamiento", archived: "Archivado" };
 const SORT_METRIC_LABEL = {
   severity: "Gravedad",
@@ -38,6 +43,7 @@ const ICONS = {
   clock: `<svg ${ICON_SVG_ATTRS} width="11" height="11"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
   flame: `<svg ${ICON_SVG_ATTRS} width="12" height="12"><path d="M12 2c1 3-3 4-3 8a3 3 0 0 0 6 0c0-1-.5-2-1-2.5.5 2 .5 4-1 5.5a4 4 0 0 1-4-4c0-3 2-4 2-7-2 1-4 4-4 7a5 5 0 0 0 10 0c0-5-3-6-5-7z"/></svg>`,
   badge: `<svg ${ICON_SVG_ATTRS} width="12" height="12"><circle cx="12" cy="9" r="6"/><path d="M9 14l-2 7 5-3 5 3-2-7"/></svg>`,
+  pin: `<svg ${ICON_SVG_ATTRS} width="12" height="12"><path d="M12 22s7-6.5 7-11a7 7 0 1 0-14 0c0 4.5 7 11 7 11z"/><circle cx="12" cy="11" r="2.5"/></svg>`,
 };
 
 const EVENT_TYPE_ICON = {
@@ -282,6 +288,34 @@ function detectionSourceBreakdownHtml(sources) {
   );
 }
 
+// Same rank-cycled 3-color palette as the map sidebar's vegetationSectionHtml
+// (app.js) - the actual CORINE-style labels vary too much to hand-map a
+// color per category, and there are never more than 3 (top_land_use's [:3]
+// cap in the backend).
+const VEGETATION_BAR_COLORS = ["var(--accent)", "var(--degraded)", "var(--wind)"];
+
+function vegetationSectionHtml(vegetation) {
+  if (!vegetation || !vegetation.top_land_use || vegetation.top_land_use.length === 0) {
+    return `<div class="report-section-empty">Sin datos de vegetación quemada (solo disponible para incidentes con activación Copernicus EMS).</div>`;
+  }
+  const max = Math.max(...vegetation.top_land_use.map((row) => row.hectares));
+  const rows = vegetation.top_land_use
+    .map(
+      (row, i) =>
+        `<div class="source-breakdown-row">` +
+        `<span class="source-breakdown-label">${row.label}</span>` +
+        `<div class="source-breakdown-bar-wrap"><div class="source-breakdown-bar" style="width:${Math.max(4, (row.hectares / max) * 100)}%; background:${VEGETATION_BAR_COLORS[i]};"></div></div>` +
+        `<span class="source-breakdown-count">${Math.round(row.hectares).toLocaleString("es-ES")} ha</span>` +
+        `</div>`
+    )
+    .join("");
+  const totalLine =
+    vegetation.burnt_area_ha != null
+      ? `<div class="report-section-empty" style="margin-top:8px; font-style:normal;">${Math.round(vegetation.burnt_area_ha).toLocaleString("es-ES")} ha totales quemadas · fuente: activación Copernicus EMS.</div>`
+      : "";
+  return `<div class="source-breakdown">${rows}</div>` + totalLine;
+}
+
 function satelliteCarouselHtml(scenes) {
   if (!scenes || scenes.length === 0) {
     return `<div class="report-section-empty">Sin escenas de satélite (Copernicus) descubiertas para este incidente.</div>`;
@@ -444,12 +478,21 @@ function reportHtml(report) {
     `</div>` +
     `</div>` +
     `<div class="report-section">` +
+    `<div class="report-section-title">${ICONS.pin} Ubicación</div>` +
+    `<div class="report-map-wrap" id="report-map"></div>` +
+    `<div id="report-weather"></div>` +
+    `</div>` +
+    `<div class="report-section">` +
     `<div class="report-section-title">${ICONS.satellite} Detecciones por satélite</div>` +
     detectionSourceBreakdownHtml(report.detection_sources) +
     `</div>` +
     `<div class="report-section">` +
     `<div class="report-section-title">${ICONS.shield} Estado oficial y medios desplegados</div>` +
     regionalStatusSectionHtml(report.regional_status) +
+    `</div>` +
+    `<div class="report-section">` +
+    `<div class="report-section-title">${ICONS.flame} Vegetación quemada</div>` +
+    vegetationSectionHtml(report.vegetation) +
     `</div>` +
     `<div class="report-section">` +
     `<div class="report-section-title">${ICONS.camera} Imágenes de satélite (Copernicus)</div>` +
@@ -466,6 +509,83 @@ function reportHtml(report) {
   );
 }
 
+// Kept module-level so re-entering the report view (a different incident,
+// or the same one again) can tear down the previous Leaflet instance first -
+// calling L.map() a second time on a fresh #report-map div without doing so
+// leaks the old map's tile layer/event listeners, and reusing the same div
+// id outright throws "Map container is already initialized".
+let reportMap = null;
+
+function initReportMap(incident, estimatedHull) {
+  const mapEl = document.getElementById("report-map");
+  if (!mapEl || incident.centroid_lat == null || incident.centroid_lon == null) return;
+  if (reportMap) {
+    reportMap.remove();
+    reportMap = null;
+  }
+  const color = RISK_MARKER_COLORS[incident.risk_level] || "#f87171";
+  reportMap = L.map("report-map", { zoomControl: false, attributionControl: false }).setView(
+    [incident.centroid_lat, incident.centroid_lon],
+    12
+  );
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", { maxZoom: 19 }).addTo(reportMap);
+
+  // The real traced extent (see estimated_hull on IncidentReportOut) when
+  // there are enough of this incident's own detections to trace one -
+  // otherwise fall back to a plain centroid marker rather than fabricating
+  // a shape. An incident WITH an official EFFIS area_ha never gets a hull
+  // either (backend only estimates when the official figure is missing) -
+  // there's no stored perimeter geometry for those, only the scalar
+  // hectare figure already shown in the metrics above.
+  if (estimatedHull && estimatedHull.length >= 3) {
+    const polygon = L.polygon(estimatedHull, {
+      color,
+      weight: 2,
+      fillColor: color,
+      fillOpacity: 0.3,
+    }).addTo(reportMap);
+    reportMap.fitBounds(polygon.getBounds(), { padding: [20, 20] });
+  } else {
+    L.circleMarker([incident.centroid_lat, incident.centroid_lon], {
+      radius: 10,
+      color,
+      weight: 2,
+      fillColor: color,
+      fillOpacity: 0.35,
+    }).addTo(reportMap);
+  }
+}
+
+// Same "just the current hour" pattern as the map's own wind-arrow markers
+// (app.js's windArrowIcon comment) - max_hours=1 against the same
+// fire-spread/predict endpoint, whose Open-Meteo call already carries
+// temperature/humidity alongside the wind fields the spread model itself
+// uses (see fetch_wind_series in backend/app/services/fire_spread.py).
+async function loadReportWeather(incident) {
+  const slot = document.getElementById("report-weather");
+  if (!slot || incident.centroid_lat == null || incident.centroid_lon == null) return;
+  try {
+    const res = await fetch(
+      `${apiBaseUrl}/api/fire-spread/predict?lat=${incident.centroid_lat}&lon=${incident.centroid_lon}&max_hours=1`
+    );
+    if (!res.ok) return;
+    const data = await res.json();
+    const hour = data.hourly && data.hourly[0];
+    if (!hour) return;
+    const rotation = hour.wind_direction_from_deg;
+    slot.innerHTML =
+      `<div class="weather-row">` +
+      `<span class="weather-item" style="color:var(--wind);"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${rotation}deg);"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg> ${Math.round(hour.wind_speed_kmh)} km/h</span>` +
+      `<span class="weather-item">🌡️ ${Math.round(hour.temperature_c)}°C</span>` +
+      `<span class="weather-item">💧 ${Math.round(hour.humidity_pct)}% hum.</span>` +
+      `</div>`;
+  } catch {
+    // Best-effort, same as the map sidebar's own enableIncidentPrediction -
+    // a flaky Open-Meteo call shouldn't surface an error on a report page
+    // whose primary content has nothing to do with live weather.
+  }
+}
+
 async function loadReport(incidentId) {
   const content = document.getElementById("report-content");
   content.innerHTML = `<div class="empty">Cargando informe…</div>`;
@@ -474,6 +594,8 @@ async function loadReport(incidentId) {
     if (!res.ok) throw new Error(res.status === 404 ? "Incidente no encontrado" : `HTTP ${res.status}`);
     const report = await res.json();
     content.innerHTML = reportHtml(report);
+    initReportMap(report.incident, report.estimated_hull);
+    loadReportWeather(report.incident);
     attachLightboxHandlers();
     attachRenameHandlers(incidentId);
   } catch (err) {
@@ -651,21 +773,6 @@ document.getElementById("merge-modal-confirm").addEventListener("click", async (
     confirmBtn.textContent = "Confirmar fusión";
   }
 });
-
-(function initThemeToggle() {
-  const btn = document.getElementById("theme-toggle");
-  const applyIcon = (theme) => {
-    btn.textContent = theme === "light" ? "☀️" : "🌙";
-    btn.title = theme === "light" ? "Cambiar a modo oscuro" : "Cambiar a modo claro";
-  };
-  applyIcon(document.documentElement.dataset.theme || "dark");
-  btn.addEventListener("click", () => {
-    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    document.documentElement.dataset.theme = next;
-    localStorage.setItem("wm-theme", next);
-    applyIcon(next);
-  });
-})();
 
 (async function init() {
   await loadConfig();

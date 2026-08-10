@@ -3,25 +3,43 @@ let apiBaseUrl = "http://localhost:8000";
 
 // Default zoom control (topleft) sits exactly under #incident-sidebar (also
 // anchored top:14px/left:14px, full height) - blocked its clicks entirely,
-// mouse-wheel zoom was the only way in. #panel (the right control panel)
-// only anchors top:14px, not bottom, so bottomright is the one corner
-// neither overlay panel covers.
+// mouse-wheel zoom was the only way in. #control-rail/its popovers only
+// anchor top:14px, not bottom, so bottomright is the one corner neither
+// overlay covers.
 const map = L.map("map", { zoomControl: false }).setView([40.0, -3.7], 6); // centered on Spain
 L.control.zoom({ position: "bottomright" }).addTo(map);
 
-const osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  attribution: "&copy; OpenStreetMap contributors",
+// CARTO Positron - light, neutral basemap (no API key) that matches this
+// app's consumer-map design direction (Google/Apple Maps-style light mode)
+// far better than a standard OSM street layer, which is busier/more
+// saturated than this UI's flat white cards want to sit on top of.
+const positronLayer = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+  maxZoom: 20,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
 });
 // Windy-style outdoor/topo basemap - free, no key, standard attribution required.
 const topoLayer = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", {
   maxZoom: 17,
   attribution: '&copy; OpenStreetMap contributors, SRTM | &copy; <a href="https://opentopomap.org">OpenTopoMap</a>',
 });
-let currentBaseLayer = osmLayer;
+let currentBaseLayer = positronLayer;
 currentBaseLayer.addTo(map);
+
+// Explicit panes so stacking order is guaranteed by z-index, not by DOM
+// insertion order. Without this, the hull polygon (SVG) and hotspot dots
+// (canvas) both land in Leaflet's shared default overlayPane, and whichever
+// renderer's container happens to get created first in the DOM sits on top -
+// in practice the hull's semi-transparent gray fill was landing above the
+// dots and washing out their real recency colors.
+map.createPane("hullPane").style.zIndex = 350; // below overlayPane (400)
+map.createPane("hotspotPane").style.zIndex = 450; // above overlayPane, below shadowPane (500)
 
 const markersLayer = L.layerGroup().addTo(map);
 const webcamsLayer = L.layerGroup();
+const windLayer = L.layerGroup().addTo(map);
+// Windy-style arrow field (many points, not just one per active incident -
+// see windLayer above) for the current viewport - see reloadWindField.
+const windFieldLayer = L.layerGroup().addTo(map);
 
 // Shared canvas renderer for hotspot dots. Leaflet's default SVG renderer
 // creates one DOM node per circleMarker, which starts to choke once you get
@@ -33,7 +51,7 @@ const webcamsLayer = L.layerGroup();
 // hide the fire's spread-direction "comet tail" density Pyrofire shows) stays
 // smooth. Created once and reused so every hotspot dot shares one canvas
 // instead of Leaflet allocating a new one per marker.
-const hotspotRenderer = L.canvas({ padding: 0.5 });
+const hotspotRenderer = L.canvas({ padding: 0.5, pane: "hotspotPane" });
 
 // NASA GIBS true-color satellite imagery (no API key needed). "best" auto-picks
 // the least cloudy available product for the requested date; GoogleMapsCompatible_Level9
@@ -69,7 +87,7 @@ function updateSatelliteLayer() {
 // currently showing, just swaps which layer is "waiting" for when satellite
 // gets toggled off, rather than fighting it for the map's base slot now.
 function setBasemapStyle(style) {
-  const nextLayer = style === "topo" ? topoLayer : osmLayer;
+  const nextLayer = style === "topo" ? topoLayer : positronLayer;
   if (nextLayer === currentBaseLayer) return;
   const satelliteShowing = document.getElementById("satellite-toggle").checked && satelliteLayer;
   if (!satelliteShowing) map.removeLayer(currentBaseLayer);
@@ -85,7 +103,19 @@ function setBasemapStyle(style) {
 // spreading" (red = recent edge, yellow = where it started). Encoding a
 // second variable (size = detection count) on top of that would compete with
 // and muddy the color signal.
-const HOTSPOT_STROKE = "#333"; // outline on the map's light OSM basemap, not the dark panel/popups
+// Two DIFFERENT stroke colors, not one shared constant - they have opposite
+// requirements. A polygon outline is drawn ONCE per fire event, so a dark
+// stroke (contrast against the light CARTO tiles) is exactly right. An
+// individual hotspot dot's ring is drawn once PER DETECTION though, and a
+// hotspot that keeps re-detecting at nearly the same coordinates for days
+// (e.g. a small, long-lived 2ha fire with 900+ detections) stacks hundreds
+// of opaque dark 1px rings on the exact same pixels - which accumulates
+// into a solid black blob that hides the recency-color fill entirely
+// (confirmed live on Niebla/Huelva: 942 detections, 21 days active, once
+// the basemap went light enough to make that obvious). A light dot ring
+// keeps overlapping dots blending into warm fill colors instead of black.
+const POLYGON_OUTLINE = "#333";
+const DOT_RING_COLOR = "#fff8f0";
 const REPORT_COLOR = "#2dd4bf";
 const HOTSPOT_DOT_RADIUS = 4; // fixed for every dot at every zoom - see note above
 
@@ -95,23 +125,31 @@ function setStatus(text) {
 
 // FIXED absolute age buckets (not relative to whatever date-range window
 // happens to be selected - an 18h-old detection should look the same whether
-// you're browsing "Last 24h" or "Last 7 days"). This now actually matches the
-// <12h/<24h/<48h/<72h discrete-bucket convention other fire-monitoring maps
-// use (e.g. Bseed WATCH/Pyrofire) that this comment already referenced before
-// this change - the previous version only ever interpolated red-to-yellow
-// across the full 72h span, which (a) never reached anything past yellow, so
-// "72h old" and "6h old" were both indistinguishable shades of orange-red in
-// the middle of the range, and (b) couldn't represent >72h detections as
-// anything other than that same washed-out yellow. Four visually distinct
-// hues instead of one continuous gradient make both the recent/stale
-// contrast AND a fire's spread direction (red edge = where it's currently
-// active) easier to read at a glance - matching RECENCY_LEGEND below.
+// you're browsing "Last 24h" or "Last 7 days"). Tried a finer 7-bucket
+// red-to-violet ramp aligned to the 3h FIRMS poll cadence (backend/app/
+// config.py's fetch_interval_minutes) - reverted live: FIRMS doesn't
+// actually refresh often/evenly enough (see that config comment - combined
+// VIIRS/MODIS passes cluster into ~2 windows/day, not continuous coverage)
+// for sub-12h buckets to carry real signal, and splitting the "recent"
+// range that finely diluted exactly the red/orange contrast that matters
+// most here - reading which edge of a fire is its actively advancing front.
+// Four visually distinct hues (matching the <12h/<24h/<48h/<72h convention
+// other fire-monitoring maps use, e.g. Bseed WATCH/Pyrofire) plus a flat
+// gray for anything older keeps that red/orange contrast concentrated where
+// it's actually useful - matching RECENCY_LEGEND below.
 const RECENCY_LEGEND = [
-  { maxHours: 12, color: "#ef4444", label: "< 12 h" },
+  // The freshest bucket gets its own extra-saturated red AND a bigger dot
+  // (see FRESH_RECENCY_MAX_HOURS/hotspotMarker below) - these are the
+  // detections that matter most for "where is the active front right now",
+  // so they need to visually punch through the rest of the pack, not just
+  // sit as another shade in the red family.
+  { maxHours: 6, color: "#ff0000", label: "< 6 h" },
+  { maxHours: 12, color: "#ef4444", label: "6-12 h" },
   { maxHours: 24, color: "#f97316", label: "12-24 h" },
   { maxHours: 48, color: "#eab308", label: "24-48 h" },
   { maxHours: 72, color: "#3b82f6", label: "48-72 h" },
 ];
+const FRESH_RECENCY_MAX_HOURS = RECENCY_LEGEND[0].maxHours;
 const RECENCY_STALE_COLOR = "#6b7280"; // older than the oldest bucket (72h+) - clearly "cold", not another shade of the active-fire palette
 
 function recencyColor(acquiredAtIso) {
@@ -157,17 +195,33 @@ function sourceShapeIcon(source, fillColor, ringColor, ringWeight) {
 // consistent whether it's part of a loose fragment or the main dot layer.
 function hotspotMarker(fire, { radius, ringColor, ringWeight, renderer }) {
   const fillColor = recencyColor(fire.acquired_at);
+  const ageHours = (Date.now() - new Date(fire.acquired_at).getTime()) / 3600000;
+  // The <6h bucket renders larger, not just redder - it's the leading edge
+  // of the fire right now, and at a shared fixed radius it read as just
+  // another dot in the red cluster instead of the thing to look at first.
+  const isFresh = ageHours <= FRESH_RECENCY_MAX_HOURS;
+  const effectiveRadius = isFresh ? radius * 1.6 : radius;
   const icon = sourceShapeIcon(fire.source, fillColor, ringColor, ringWeight);
   if (icon) {
     return L.marker([fire.latitude, fire.longitude], { icon });
   }
   return L.circleMarker([fire.latitude, fire.longitude], {
     renderer,
-    radius,
+    radius: effectiveRadius,
     color: ringColor,
     weight: ringWeight,
     fillColor,
-    fillOpacity: 0.9,
+    // Not fully opaque - a long-running fire with thousands of detections
+    // packed into a small area (e.g. an incident active for weeks) paints
+    // hundreds of overlapping same-radius dots on the same few screen
+    // pixels; at full opacity the canvas painter's algorithm just shows
+    // whichever dot happened to be drawn last, so a tiny zoom change (which
+    // shifts pixel rounding) can make a completely different dot "win" and
+    // the rest look like they vanished. Partial opacity lets overlapping
+    // dots alpha-blend into a visibly denser/darker patch instead - an
+    // honest "lots of activity here" signal that isn't order-dependent,
+    // rather than occluding down to a single arbitrary dot.
+    fillOpacity: 0.6,
   });
 }
 
@@ -510,6 +564,11 @@ function areaSummaryHtml(growth) {
 const DAILY_CHART_WIDTH = 280;
 const DAILY_CHART_HEIGHT = 60;
 const DAILY_CHART_MAX_BARS = 21; // ~3 weeks before bars get too thin to read; INCIDENTS_WINDOW_HOURS caps real incidents at 30 days anyway
+// A run of at least this many consecutive zero-detection days is treated as
+// a genuine dead stretch (as opposed to normal day-to-day noise) when
+// looking for the fire's real onset - see the onset-detection comment in
+// dailyDetectionCounts below.
+const DAILY_CHART_GAP_DAYS = 5;
 
 // The current backend templates (services/incidents.py) both start a
 // "detection" event's TITLE with the count - "N detección(es) nueva(s)" or
@@ -547,13 +606,47 @@ function dailyDetectionCounts(events) {
     series.push({ day: key, count: perDay.get(key) || 0 });
   }
 
+  // Detect the REAL onset of sustained fire activity instead of always
+  // windowing from the incident's absolute first day. merge_reassociable_incidents
+  // (backend/app/services/incidents.py) can fold an old, small, unrelated
+  // incident into a real fire's record purely because their centroids end
+  // up within INCIDENT_REASSOCIATION_DEG of each other (up to
+  // ARCHIVED_REASSOCIATION_MAX_AGE_DAYS = 45 days apart) - since
+  // first_detected_at is then the min() across the merge, that stray
+  // handful of weeks-old detections can pull this chart's start far ahead
+  // of when the fire itself actually ignited, leaving 2-3 weeks of
+  // near-zero noise before the real ramp-up (confirmed live: "Villarino de
+  // los Aires" showed ~15-20 flat days before its real, 374-detection
+  // spike). A run of DAILY_CHART_GAP_DAYS+ consecutive zero-count days
+  // followed by renewed activity marks such a dead stretch; keep only the
+  // LAST one found (there could be more than one) so the window starts
+  // right before the real ramp, not at the literal earliest detection ever
+  // merged into this incident.
+  let onsetIndex = 0;
+  let zeroRun = 0;
+  for (let i = 0; i < series.length; i++) {
+    if (series[i].count === 0) {
+      zeroRun++;
+    } else {
+      if (zeroRun >= DAILY_CHART_GAP_DAYS) onsetIndex = i;
+      zeroRun = 0;
+    }
+  }
+  // onsetIndex - 1 is already a real zero-count day whenever a gap was
+  // found (it's part of the run that triggered it), so it doubles as the
+  // "day before" padding below - no synthetic day needed in that case.
+  const windowed = onsetIndex > 0 ? series.slice(onsetIndex - 1) : series;
+
   // Pad with a real zero-detection day immediately before the first real one
   // (always true - there were 0 detections for this incident the day before
   // its very first one) so the line/area visibly rises FROM zero instead of
-  // starting mid-height at the chart's left edge.
-  const dayBefore = new Date(first);
-  dayBefore.setUTCDate(dayBefore.getUTCDate() - 1);
-  series.unshift({ day: dayBefore.toISOString().slice(0, 10), count: 0 });
+  // starting mid-height at the chart's left edge. Only needed as a synthetic
+  // day when the onset detection above didn't already supply one.
+  if (onsetIndex === 0) {
+    const dayBefore = new Date(first);
+    dayBefore.setUTCDate(dayBefore.getUTCDate() - 1);
+    windowed.unshift({ day: dayBefore.toISOString().slice(0, 10), count: 0 });
+  }
 
   // Same on the trailing end, but ONLY if that day has actually elapsed with
   // zero detections - the day after "today" hasn't happened yet, so padding
@@ -563,12 +656,14 @@ function dailyDetectionCounts(events) {
   const dayAfter = new Date(last);
   dayAfter.setUTCDate(dayAfter.getUTCDate() + 1);
   const dayAfterKey = dayAfter.toISOString().slice(0, 10);
-  if (dayAfterKey < todayKey) series.push({ day: dayAfterKey, count: 0 });
+  if (dayAfterKey < todayKey) windowed.push({ day: dayAfterKey, count: 0 });
 
-  // Long-running incidents (up to INCIDENTS_WINDOW_HOURS = 30 days) would
-  // otherwise render unreadably thin bars - keep only the most recent
-  // DAILY_CHART_MAX_BARS days rather than silently mis-scaling every bar.
-  return series.slice(-DAILY_CHART_MAX_BARS);
+  // Long-running incidents (up to INCIDENTS_WINDOW_HOURS = 30 days), or ones
+  // whose real active stretch itself runs long, would otherwise render
+  // unreadably thin bars - keep only the most recent DAILY_CHART_MAX_BARS
+  // days of the (already onset-trimmed) window rather than silently
+  // mis-scaling every bar.
+  return windowed.slice(-DAILY_CHART_MAX_BARS);
 }
 
 // Catmull-Rom -> cubic Bezier smoothing for an OPEN line (unlike the map's
@@ -872,6 +967,81 @@ function satelliteSectionHtml(scenes) {
   );
 }
 
+// Cache of vegetation/burnt-area stats matched to an incident (parallel to
+// telegramCache/regionalCache/satelliteCache) - only ever non-null for
+// incidents with a Copernicus EMS activation (see
+// get_incident_vegetation_stats in the backend), a small minority, so most
+// incidents' entry here is a cached `null` rather than never being fetched
+// twice for nothing.
+const vegetationCache = new Map();
+const pendingVegetation = new Map();
+
+async function getVegetationStats(incidentId) {
+  if (vegetationCache.has(incidentId)) return vegetationCache.get(incidentId);
+  if (pendingVegetation.has(incidentId)) return pendingVegetation.get(incidentId);
+  const promise = (async () => {
+    const res = await fetch(`${apiBaseUrl}/api/incidents/${incidentId}/vegetation`);
+    return res.json();
+  })().then((data) => {
+    vegetationCache.set(incidentId, data);
+    pendingVegetation.delete(incidentId);
+    return data;
+  });
+  pendingVegetation.set(incidentId, promise);
+  return promise;
+}
+
+// Same 3-step palette cycled by rank, not a per-category color (the actual
+// CORINE-style labels - "matorral", "bosque", "pastos"...- vary too much to
+// hand-map every one, and there are never more than 3 shown, see
+// top_land_use's [:3] cap in the backend).
+const VEGETATION_BAR_COLORS = ["var(--accent)", "var(--degraded)", "var(--wind)"];
+
+function vegetationSectionHtml(stats) {
+  if (!stats || !stats.top_land_use || stats.top_land_use.length === 0) return "";
+  const maxHa = Math.max(...stats.top_land_use.map((row) => row.hectares));
+  const rows = stats.top_land_use
+    .map(
+      (row, i) =>
+        `<div class="veg-row">` +
+        `<span class="veg-swatch" style="background:${VEGETATION_BAR_COLORS[i]};"></span>` +
+        `<span class="veg-label">${row.label}</span>` +
+        `<span class="veg-bar-wrap"><span class="veg-bar" style="width:${((row.hectares / maxHa) * 100).toFixed(0)}%; background:${VEGETATION_BAR_COLORS[i]};"></span></span>` +
+        `<span class="veg-ha">${Math.round(row.hectares).toLocaleString("es-ES")} ha</span>` +
+        `</div>`
+    )
+    .join("");
+  return (
+    `<div class="vegetation-card">` +
+    `<div class="vegetation-card-title">${ICONS.flame} Vegetación quemada` +
+    (stats.burnt_area_ha != null ? ` <span class="veg-total">${Math.round(stats.burnt_area_ha).toLocaleString("es-ES")} ha totales</span>` : "") +
+    `</div>` +
+    rows +
+    `<div class="legend-hint">Fuente: activación Copernicus EMS (cartografía oficial de emergencia).</div>` +
+    `</div>`
+  );
+}
+
+// Current-hour reading from the same Open-Meteo series enableIncidentPrediction
+// already fetches for the fire-spread wind scrubber (index 0 = current hour) -
+// temperature/humidity ride along on that same request/response
+// (fetch_wind_series, backend/app/services/fire_spread.py), not a second
+// weather source, so this never needs its own network call.
+function weatherSectionHtml(hour) {
+  if (!hour) return "";
+  const windArrow = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${hour.wind_direction_from_deg}deg);"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg>`;
+  return (
+    `<div class="weather-card">` +
+    `<div class="weather-card-title">Previsión ahora</div>` +
+    `<div class="weather-row">` +
+    `<span class="weather-item" style="color:var(--wind);">${windArrow} ${Math.round(hour.wind_speed_kmh)} km/h</span>` +
+    `<span class="weather-item">🌡️ ${Math.round(hour.temperature_c)}°C</span>` +
+    `<span class="weather-item">💧 ${Math.round(hour.humidity_pct)}% hum.</span>` +
+    `</div>` +
+    `</div>`
+  );
+}
+
 function telegramSectionHtml(messages) {
   if (!messages || messages.length === 0) return "";
   const withPhoto = messages.find((m) => m.media_path);
@@ -976,34 +1146,24 @@ function regionPopupHtml(
 // matches a backend FireIncident (matchedIncident), also surfaces Telegram
 // mentions/images for that fire and a button into its full event timeline.
 function attachGeocode(polygon, group, earliest, mostRecent, matchedIncident, growth) {
-  let geo = geocodeCache.get(geocodeCacheKey(earliest.latitude, earliest.longitude)) || null;
-  let telegramMessages = matchedIncident ? telegramCache.get(matchedIncident.id) || null : null;
-  let regionalRecords =
-    matchedIncident && matchedIncident.has_regional_status
-      ? regionalCache.get(matchedIncident.id) || null
-      : null;
-  let satelliteScenes =
-    matchedIncident && matchedIncident.has_satellite_imagery
-      ? satelliteCache.get(matchedIncident.id) || null
-      : null;
+  // A matched incident already has its own, richer view in the sidebar -
+  // opening a second, differently-formatted popup on top of it duplicated
+  // the same information in two places at once. Clicking the map now jumps
+  // straight to that same panel (exactly like clicking it in the sidebar
+  // list), so there's only ever one place an incident's detail lives. Only
+  // a truly unmatched fire cluster (no backend incident yet - just raw
+  // detections) still gets its own lightweight geocode popup below, since
+  // there's no sidebar destination to send it to.
+  if (matchedIncident) {
+    polygon.bindTooltip(displayName(matchedIncident), { sticky: true });
+    polygon.on("click", () => showIncidentDetail(matchedIncident));
+    return;
+  }
 
-  const render = () =>
-    regionPopupHtml(
-      group,
-      earliest,
-      mostRecent,
-      geo,
-      matchedIncident,
-      telegramMessages,
-      regionalRecords,
-      satelliteScenes,
-      growth
-    );
-  // Same "prefer the incident's own canonical name" rule as regionPopupHtml's
-  // title - keeps the hover tooltip consistent with the popup instead of
-  // showing a different per-point nearest-town name for a fire that spans
-  // more than one.
-  const displayLocality = () => (matchedIncident ? displayName(matchedIncident) : geo && geo.locality);
+  let geo = geocodeCache.get(geocodeCacheKey(earliest.latitude, earliest.longitude)) || null;
+
+  const render = () => regionPopupHtml(group, earliest, mostRecent, geo, null, null, null, null, growth);
+  const displayLocality = () => geo && geo.locality;
 
   polygon.bindPopup(render());
   if (displayLocality()) polygon.bindTooltip(displayLocality(), { sticky: true });
@@ -1013,13 +1173,6 @@ function attachGeocode(polygon, group, earliest, mostRecent, matchedIncident, gr
     const copyBtn = container.querySelector(".copy-btn");
     if (copyBtn) {
       copyBtn.onclick = () => navigator.clipboard.writeText(copyBtn.dataset.hashtag);
-    }
-    const timelineBtn = container.querySelector(".timeline-btn");
-    if (timelineBtn && matchedIncident) {
-      timelineBtn.onclick = () => {
-        map.closePopup();
-        showIncidentDetail(matchedIncident);
-      };
     }
     const btn = container.querySelector(".geocode-btn");
     if (!btn) return;
@@ -1046,99 +1199,128 @@ function attachGeocode(polygon, group, earliest, mostRecent, matchedIncident, gr
       })
       .catch(() => {}); // manual button above still works as a retry
   }
-
-  if (matchedIncident && telegramMessages === null) {
-    getTelegramMentions(matchedIncident.id)
-      .then((data) => {
-        telegramMessages = data;
-        polygon.setPopupContent(render());
-      })
-      .catch(() => {});
-  }
-
-  if (matchedIncident && matchedIncident.has_regional_status && regionalRecords === null) {
-    getRegionalStatus(matchedIncident.id)
-      .then((data) => {
-        regionalRecords = data;
-        polygon.setPopupContent(render());
-      })
-      .catch(() => {});
-  }
-
-  if (matchedIncident && matchedIncident.has_satellite_imagery && satelliteScenes === null) {
-    getSatelliteScenes(matchedIncident.id)
-      .then((data) => {
-        satelliteScenes = data;
-        polygon.setPopupContent(render());
-      })
-      .catch(() => {});
-  }
 }
 
-// Below this zoom, overlapping big circles get unreadable - show only the
-// region shapes (with a date gradient) instead of clustered circles.
-const LOW_ZOOM_POLYGON_ONLY = 8;
+// ---------- National cluster overview (low/mid zoom) ----------
+// The very first thing a user sees - default zoom is 6, a whole-Spain view
+// (see the map's own initial setView call) - used to be the same detailed
+// per-incident rendering just zoomed out, which read as a scatter of tiny,
+// meaningless dots. This replaces that with colored, sized count bubbles
+// instead - an immediate "where is it bad right now" read (bigger + redder
+// = more detections), same visual language as the classic Leaflet
+// marker-cluster convention - across a wide enough zoom range that it stays
+// useful while zooming in, not just at the very first paint. Past this
+// zoom, the detailed per-incident rendering (polygons, wind arrows,
+// individual dots) everything below already handles takes over.
+const CLUSTER_OVERVIEW_MAX_ZOOM = 8;
+const clusterOverviewLayer = L.layerGroup().addTo(map);
 
-// Injects/replaces a <linearGradient> in the map's SVG so a polygon's fill
-// can go from one color to another instead of a single flat color.
-function ensureLinearGradient(svgRoot, id, stops) {
-  if (!svgRoot) return false;
-  let defs = svgRoot.querySelector("defs");
-  if (!defs) {
-    defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-    svgRoot.insertBefore(defs, svgRoot.firstChild);
+// How far apart (degrees) two incidents can be and still merge into one
+// bubble, at zoom 4 (roughly the whole-Spain view) - shrinks as you zoom in
+// (see clusterIncidentsForOverview) so bubbles stay meaningfully sized
+// instead of a handful of giant blobs covering half the country at the most
+// zoomed-out level. Deliberately generous rather than a small fixed grid
+// cell: a single large, irregularly-shaped fire's own detections can easily
+// span more raw distance than a small cell would cover, which used to
+// fragment ONE incident across several adjacent bubbles (confirmed live:
+// Niebla's ~2000 detections split into separate green/yellow/orange bubbles
+// that were all the same fire). Clustering INCIDENTS (each already a
+// correctly-shaped, single real fire - see lastIncidents) rather than raw
+// per-detection points is what actually fixes that; the generous merge
+// radius on top additionally folds separate-but-nearby incidents together
+// for a cleaner national read.
+const CLUSTER_GROUP_BASE_DEG = 1.1;
+
+// Thresholds are raw detection counts within one bubble, not incident
+// severity - a single very active fire can rack up hundreds/thousands of
+// detections on its own, which is exactly the "needs attention" signal this
+// overview exists to surface at a glance. No upper bound: a big enough fire
+// (or cluster of them) should show its real count, however large, not be
+// capped into looking the same as a much smaller one.
+function clusterBubbleStyle(count) {
+  if (count >= 150) return { color: "#c92a2a", radius: 24 };
+  if (count >= 50) return { color: "#e8590c", radius: 20 };
+  if (count >= 10) return { color: "#f0b429", radius: 17 };
+  return { color: "#40a02b", radius: 14 };
+}
+
+// Greedy proximity clustering (same shape as the backend's
+// _cluster_recent_points in fire_spread.py) over incident centroids,
+// weighted by each incident's own detection_count - both for the merged
+// bubble's total count AND for where it's centered (a 2000-detection fire
+// pulls the bubble toward itself far more than a 2-detection one 30km away).
+function clusterIncidentsForOverview(incidents) {
+  const zoom = map.getZoom();
+  const clusterDeg = CLUSTER_GROUP_BASE_DEG / Math.pow(1.6, Math.max(0, zoom - 4));
+  const remaining = incidents.map((incident) => ({
+    lat: incident.centroid_lat,
+    lon: incident.centroid_lon,
+    count: incident.detection_count,
+  }));
+  const groups = [];
+  while (remaining.length) {
+    const seed = remaining.pop();
+    const group = [seed];
+    for (let i = remaining.length - 1; i >= 0; i--) {
+      if (Math.hypot(remaining[i].lat - seed.lat, remaining[i].lon - seed.lon) <= clusterDeg) {
+        group.push(remaining[i]);
+        remaining.splice(i, 1);
+      }
+    }
+    groups.push(group);
   }
-  const existing = defs.querySelector(`#${id}`);
-  if (existing) existing.remove();
-  const gradient = document.createElementNS("http://www.w3.org/2000/svg", "linearGradient");
-  gradient.setAttribute("id", id);
-  gradient.setAttribute("x1", "0%");
-  gradient.setAttribute("y1", "0%");
-  gradient.setAttribute("x2", "100%");
-  gradient.setAttribute("y2", "100%");
-  stops.forEach(([offset, color]) => {
-    const stop = document.createElementNS("http://www.w3.org/2000/svg", "stop");
-    stop.setAttribute("offset", `${offset}%`);
-    stop.setAttribute("stop-color", color);
-    gradient.appendChild(stop);
+  return groups.map((group) => {
+    const totalCount = group.reduce((sum, item) => sum + item.count, 0);
+    const lat = group.reduce((sum, item) => sum + item.lat * item.count, 0) / totalCount;
+    const lon = group.reduce((sum, item) => sum + item.lon * item.count, 0) / totalCount;
+    return { lat, lon, count: totalCount };
   });
-  defs.appendChild(gradient);
-  return true;
 }
 
-// Red (latest detection in this group) -> blue (earliest), matching the same
-// RECENCY_LEGEND endpoints the dots use (red = most recent, blue = ~72h old)
-// so the polygon backdrop and the dots on top of it read as one consistent
-// color language. Scaled to the group's OWN date range rather than the
-// display window - so a fire spanning just a couple of days still shows
-// visible contrast, not near-identical hues.
-function regionGradientStops(group) {
-  const times = group.map((f) => new Date(f.acquired_at).getTime());
-  const min = Math.min(...times);
-  const max = Math.max(...times);
-  if (min === max) {
-    const solid = RECENCY_LEGEND[1].color; // single-timestamp group: flat mid-tone
-    return [[0, solid], [100, solid]];
-  }
-  return [
-    [0, RECENCY_LEGEND[0].color], // newest = red
-    [100, RECENCY_LEGEND[RECENCY_LEGEND.length - 1].color], // oldest (within the group's own span) = blue
-  ];
+function renderClusterOverview(incidents) {
+  clusterOverviewLayer.clearLayers();
+  if (!incidents.length) return;
+
+  clusterIncidentsForOverview(incidents).forEach((cluster) => {
+    const style = clusterBubbleStyle(cluster.count);
+    const size = style.radius * 2;
+    L.marker([cluster.lat, cluster.lon], {
+      icon: L.divIcon({
+        className: "cluster-bubble-icon",
+        html: `<div class="cluster-bubble" style="width:${size}px; height:${size}px; background:${style.color};">${cluster.count.toLocaleString("es-ES")}</div>`,
+        iconSize: [size, size],
+        iconAnchor: [style.radius, style.radius],
+      }),
+    })
+      .on("click", () => map.setView([cluster.lat, cluster.lon], CLUSTER_OVERVIEW_MAX_ZOOM + 2))
+      .addTo(clusterOverviewLayer);
+  });
 }
 
 // Pure rendering pass over already-fetched data - re-run on zoom changes
-// without re-hitting the API, since polygon halo/stroke weight still depend
-// on the current zoom (see lowZoom below), even though hotspot dots
-// themselves no longer do.
+// without re-hitting the API (only the cluster-overview/detailed-render
+// split above actually depends on zoom now that hotspot dots themselves
+// render at a fixed radius everywhere).
 function renderMap() {
+  const zoom = map.getZoom();
+
+  if (zoom <= CLUSTER_OVERVIEW_MAX_ZOOM) {
+    markersLayer.clearLayers();
+    incidentEstimatesById.clear();
+    // Same risk/status/source filters the sidebar list applies - the
+    // overview matches what's actually listed, and picks up this session's
+    // detection-count sort for free (not that order matters for bubbles).
+    renderClusterOverview(applyFilters(lastIncidents));
+    return;
+  }
+  clusterOverviewLayer.clearLayers();
+
   markersLayer.clearLayers();
   incidentEstimatesById.clear();
   const hours = getSelectedDays() * 24;
-  const zoom = map.getZoom();
-  const lowZoom = zoom < LOW_ZOOM_POLYGON_ONLY;
 
   const pointFires = [];
-  lastFires.forEach((fire) => {
+  scrubberFilteredFires(lastFires).forEach((fire) => {
     let geometry = null;
     if (fire.geometry_geojson) {
       try {
@@ -1157,7 +1339,7 @@ function renderMap() {
         (fire.area_ha != null ? `Área afectada &nbsp;${fire.area_ha.toLocaleString()} ha` : "") +
         `</div>`;
       L.geoJSON(geometry, {
-        style: { color: HOTSPOT_STROKE, weight: 2, fillColor, fillOpacity: 0.5 },
+        style: { color: POLYGON_OUTLINE, weight: 2, fillColor, fillOpacity: 0.5 },
       })
         .bindPopup(popupHtml)
         .addTo(markersLayer);
@@ -1183,7 +1365,7 @@ function renderMap() {
   // this used to fall back to in the visiblePointFires loop below.
   const incidentInfoByFire = new Map();
 
-  proximityGroups.forEach((group, idx) => {
+  proximityGroups.forEach((group) => {
     // Filtering must run BEFORE the <3-points hull bail-out below - a fire
     // with only 1-2 detections (common for a lower detection_count incident)
     // never reaches the hull-building code, so checking filters only after
@@ -1269,27 +1451,23 @@ function renderMap() {
     // regardless (see visiblePointFires below), just without a polygon.
     if (ringAreaHectares(hull) < MIN_HULL_AREA_HA) return;
 
-    // A thin dark outline (the old HOTSPOT_STROKE) reads fine against plain
-    // OSM tiles, but gets visually lost once dot markers sit on top of it -
+    // A thin dark outline (POLYGON_OUTLINE) reads fine against the light
+    // basemap tiles, but gets visually lost once dot markers sit on top of it -
     // the polygon's extent stopped being readable at a glance. A bold white
     // halo underneath a solid, fairly thick dark line gives a contour that
     // reads against any basemap color AND against the dots sitting on top
-    // of it. Now that dots render at a small FIXED radius everywhere (no
-    // more size-scaled cluster circles obscuring the interior), the
-    // polygon's fill is the primary "this is the fire's shape" signal at
-    // every zoom, so it's kept bold and solid rather than fading out or
-    // going dashed as you zoom in.
-    const gradientId = `region-gradient-${idx}`;
-    const haloWeight = lowZoom ? 6 : 5.5;
-    const strokeWeight = lowZoom ? 3 : 2.5;
+    // of it.
+    const haloWeight = 5.5;
+    const strokeWeight = 2.5;
 
-    // Draws the halo + gradient-filled polygon for a given ring/multi-ring
-    // shape, and returns both layers so the caller can remove them again -
-    // shared by the initial plain-hull render below AND by the
-    // water-subtracted replacement (see waterSubtractedHullLatLngs above),
-    // so both paths get IDENTICAL styling with no drift between them.
+    // Draws the halo + filled polygon for a given ring/multi-ring shape, and
+    // returns both layers so the caller can remove them again - shared by
+    // the initial plain-hull render below AND by the water-subtracted
+    // replacement (see waterSubtractedHullLatLngs above), so both paths get
+    // IDENTICAL styling with no drift between them.
     const drawHullShape = (latlngsForLeaflet) => {
       const shapeHalo = L.polygon(latlngsForLeaflet, {
+        pane: "hullPane",
         color: "#ffffff",
         weight: haloWeight,
         opacity: 0.9,
@@ -1297,29 +1475,26 @@ function renderMap() {
       });
       shapeHalo.addTo(markersLayer);
 
-      // Kept deliberately faint (vs. the old 0.48/0.62) - every raw detection
-      // dot now renders on top of this fill at every zoom (see the
-      // visiblePointFires rendering pass below), and since both use the SAME
-      // red-to-yellow hue scale, a strong fill made hot (red) dots blend into an
-      // already-red backdrop - confirmed live: a dense recent cluster read as
-      // one solid orange blob with no visible hot/cool contrast. A faint tint
-      // still communicates "this is the fire's extent" without competing with
-      // the dots for the same color signal - matching how Copernicus's own
+      // Flat neutral gray, not a color-coded (e.g. recency) fill - every raw
+      // detection dot already renders its OWN recency color on top of this
+      // fill at every zoom (see the visiblePointFires rendering pass below),
+      // so a second color-coded fill underneath just muddies the two
+      // signals together (confirmed live: a red-to-blue recency gradient
+      // fill mixed with the dots' own red/orange/yellow into an
+      // unreadable purple wash over a dense cluster). A plain gray still
+      // communicates "this is the fire's extent" without competing with the
+      // dots for the same color channel - matching how Copernicus's own
       // EMSR grading maps use a flat, muted burnt-area fill with small vivid
       // point markers on top, rather than color-coding the fill itself.
       const shapePolygon = L.polygon(latlngsForLeaflet, {
-        color: HOTSPOT_STROKE,
+        pane: "hullPane",
+        color: POLYGON_OUTLINE,
         weight: strokeWeight,
-        fillColor: "#888", // placeholder until the gradient is attached below
-        fillOpacity: lowZoom ? 0.32 : 0.22,
+        fillColor: "#8a8577",
+        fillOpacity: 0.14,
       });
       attachGeocode(shapePolygon, group, earliest, mostRecent, matchedIncident, growth);
       shapePolygon.addTo(markersLayer);
-
-      const svgRoot = shapePolygon.getElement() && shapePolygon.getElement().ownerSVGElement;
-      if (ensureLinearGradient(svgRoot, gradientId, regionGradientStops(group))) {
-        shapePolygon.setStyle({ fillColor: `url(#${gradientId})` });
-      }
       return { shapeHalo, shapePolygon };
     };
 
@@ -1357,7 +1532,7 @@ function renderMap() {
   visiblePointFires.forEach((fire) => {
     const marker = hotspotMarker(fire, {
       radius: HOTSPOT_DOT_RADIUS,
-      ringColor: HOTSPOT_STROKE,
+      ringColor: DOT_RING_COLOR,
       ringWeight: 1,
       renderer: hotspotRenderer,
     });
@@ -1519,7 +1694,12 @@ function incidentPassesFilters(incident, filters) {
 
 function applyFilters(incidents) {
   const filters = getActiveFilters();
-  return incidents.filter((incident) => incidentPassesFilters(incident, filters));
+  // Detection count, highest first - a more concrete, at-a-glance read of
+  // "how much satellite activity is really behind this fire" than the
+  // backend's own severity_score ordering (which also folds in area/
+  // duration and can put a small-but-old smoldering fire above a fresh,
+  // fast-growing one with far more actual detections).
+  return incidents.filter((incident) => incidentPassesFilters(incident, filters)).sort((a, b) => b.detection_count - a.detection_count);
 }
 
 // Re-derives the visible sidebar list from lastIncidents + the current
@@ -1585,6 +1765,25 @@ function durationLabel(startIso, endIso) {
   if (hours < 1) return "<1h";
   if (hours < 48) return `${Math.round(hours)}h`;
   return `${Math.round(hours / 24)}d`;
+}
+
+// incident.first_detected_at can be far older than when this fire actually
+// ignited: merge_reassociable_incidents (backend/app/services/incidents.py)
+// folds an old, small, unrelated detection cluster into a real fire's record
+// whenever their centroids happen to fall within reach of each other, and
+// first_detected_at is then the min() across that merge - see the identical
+// problem/fix already applied to the daily chart in dailyDetectionCounts'
+// onset-detection comment above. Reuses that exact same onset day so "Tiempo
+// activo" and the chart right below it never quote two different starts for
+// the same incident. Returns null (no correction) if there's no detection
+// history to derive an onset from, or if the incident's very first tracked
+// day already IS its real onset (nothing to correct).
+function effectiveFirstDetectedAt(events, rawFirstDetectedAt) {
+  const series = dailyDetectionCounts(events);
+  const onsetDay = series.find((d) => d.count > 0)?.day;
+  if (!onsetDay) return null;
+  const onsetIso = `${onsetDay}T00:00:00Z`;
+  return onsetIso > rawFirstDetectedAt ? onsetIso : null;
 }
 
 // Telegram events store {"media_path": "..."} - a filename served from our
@@ -1749,17 +1948,30 @@ function satelliteCarouselHtml(events) {
 async function showIncidentDetail(incident) {
   map.flyTo([incident.centroid_lat, incident.centroid_lon], Math.max(map.getZoom(), 11));
 
-  // Filters apply to the list, not to a single incident's detail - collapse
-  // them to give the detail card the space instead of leaving them expanded
+  // Filters apply to the list, not to a single incident's detail - hide
+  // them to give the detail card the space instead of leaving them shown
   // above it for no reason. Restored (below) when going back to the list.
-  document.getElementById("filter-panel").classList.add("collapsed");
+  document.getElementById("filter-bar").classList.add("filter-bar-hidden");
+  // Same reasoning for the top summary bar - its counts are a NATIONAL
+  // overview, unrelated to (and confusable with) the one incident now on
+  // screen.
+  document.getElementById("summary-bar").classList.add("summary-bar-hidden");
 
   document.getElementById("sidebar-header").innerHTML =
     `<button class="sidebar-back" id="sidebar-back" title="Volver a la lista">&larr;</button><h2>Detalle del incidente</h2>`;
   document.getElementById("sidebar-back").addEventListener("click", () => {
-    document.getElementById("filter-panel").classList.remove("collapsed");
+    document.getElementById("filter-bar").classList.remove("filter-bar-hidden");
+    document.getElementById("summary-bar").classList.remove("summary-bar-hidden");
+    disableIncidentPrediction();
     refreshIncidentList();
   });
+
+  // Extends the bottom scrubber past "Ahora" with this incident's own wind
+  // forecast (same model/endpoint the standalone "place origin" tool uses,
+  // just aimed at the incident's centroid automatically) - see
+  // enableIncidentPrediction. Fire-and-forget: the detail card itself
+  // doesn't wait on this network round-trip.
+  enableIncidentPrediction(incident);
 
   const name = displayName(incident);
   const body = document.getElementById("sidebar-body");
@@ -1786,10 +1998,12 @@ async function showIncidentDetail(incident) {
     `</div>` +
     `<div class="incident-detail-metrics">` +
     `<div class="incident-metric"><div class="incident-metric-value">${incident.detection_count}</div><div class="incident-metric-label">Detecciones</div></div>` +
-    `<div class="incident-metric"><div class="incident-metric-value">${durationLabel(incident.first_detected_at, incident.last_detected_at)}</div><div class="incident-metric-label">Tiempo activo</div></div>` +
+    `<div class="incident-metric" id="incident-duration-metric"><div class="incident-metric-value">${durationLabel(incident.first_detected_at, incident.last_detected_at)}</div><div class="incident-metric-label">Tiempo activo</div></div>` +
+    `<div class="incident-metric" id="incident-area-metric">` +
     (areaHa != null
-      ? `<div class="incident-metric"><div class="incident-metric-value">${Math.round(areaHa).toLocaleString()}</div><div class="incident-metric-label">Hectáreas${hasOfficialArea ? "" : " (estimado)"}</div></div>`
-      : `<div class="incident-metric"><div class="incident-metric-value" style="font-size:15px;">${relativeTime(incident.last_detected_at)}</div><div class="incident-metric-label">Última actualización</div></div>`) +
+      ? `<div class="incident-metric-value">${Math.round(areaHa).toLocaleString()}</div><div class="incident-metric-label">Hectáreas${hasOfficialArea ? "" : " (estimado)"}</div>`
+      : `<div class="incident-metric-value" style="font-size:15px;">${relativeTime(incident.last_detected_at)}</div><div class="incident-metric-label">Última actualización</div>`) +
+    `</div>` +
     `</div>` +
     // Placeholder - filled in once the full-history timeline loads below.
     // The old version rendered this synchronously from `growth.timestamps`
@@ -1799,16 +2013,50 @@ async function showIncidentDetail(incident) {
     // reflects the incident's REAL full history regardless of that filter.
     `<div id="daily-chart-slot"></div>` +
     `</div>` +
+    // Ordered by what a stressed-out user needs most: active personnel/
+    // aircraft first (accent-highlighted, see .priority-card), then the
+    // visual "what does it look like" satellite read, then the lower-signal
+    // Telegram mentions, with the full event-by-event log collapsed at the
+    // very bottom since it's supporting detail, not the primary read.
+    `<div id="regional-status-slot"></div>` +
     `<div id="satellite-carousel-slot"></div>` +
+    `<div id="vegetation-slot"></div>` +
+    `<div id="weather-slot"></div>` +
+    `<div id="telegram-section-slot"></div>` +
     `<button class="timeline-toggle" id="timeline-toggle">` +
     `<span>Ver cronología</span><span class="timeline-toggle-chevron">▾</span>` +
     `</button>` +
-    `<div class="timeline-list" id="timeline-list"><div class="sidebar-empty">Cargando cronología…</div></div>`;
+    `<div class="timeline-list" id="timeline-list"><div class="sidebar-empty">Cargando cronología…</div></div>` +
+    // Ranking's own report view for this incident already has strictly more
+    // depth than this panel (source breakdown, a real map, personnel grid,
+    // full satellite/Telegram/timeline) - rather than growing this sidebar
+    // into a third copy of the same thing, it's the one deep-dive
+    // destination every "tell me everything" path leads to.
+    `<div class="full-info-row"><a class="full-info-btn" href="/ranking.html#/incident/${incident.id}" target="_blank" rel="noopener">Información completa &rarr;</a></div>`;
 
   document.getElementById("timeline-toggle").addEventListener("click", () => {
     document.getElementById("timeline-toggle").classList.toggle("expanded");
     document.getElementById("timeline-list").classList.toggle("expanded");
   });
+
+  // Fire-and-forget, same pattern as the map popup's async sections - each
+  // slot fills in independently as its own fetch resolves, instead of
+  // blocking the whole detail card on the slowest of the three.
+  getRegionalStatus(incident.id).then((records) => {
+    const html = regionalSectionHtml(records);
+    document.getElementById("regional-status-slot").innerHTML = html ? `<div class="priority-card">${html}</div>` : "";
+  });
+  getTelegramMentions(incident.id).then((messages) => {
+    document.getElementById("telegram-section-slot").innerHTML = telegramSectionHtml(messages);
+  });
+  // Skip the round-trip entirely for the vast majority of incidents that
+  // never had a Copernicus EMS activation - has_ems_activation is already
+  // known from the incident list, no need to ask just to get null back.
+  if (incident.has_ems_activation) {
+    getVegetationStats(incident.id).then((stats) => {
+      document.getElementById("vegetation-slot").innerHTML = vegetationSectionHtml(stats);
+    });
+  }
 
   try {
     // Deliberately NOT filtered by the map/sidebar's date-range selector
@@ -1823,10 +2071,22 @@ async function showIncidentDetail(incident) {
     document.getElementById("daily-chart-slot").innerHTML = dailyActivityChartHtml(events);
     document.getElementById("satellite-carousel-slot").innerHTML = satelliteCarouselHtml(events);
 
+    // Correct "Tiempo activo" to the same real-onset day the chart above
+    // already trims to, so the two never disagree about when this fire
+    // actually started (see effectiveFirstDetectedAt).
+    const correctedStart = effectiveFirstDetectedAt(events, incident.first_detected_at);
+    if (correctedStart) {
+      const metric = document.getElementById("incident-duration-metric");
+      metric.querySelector(".incident-metric-value").textContent = durationLabel(correctedStart, incident.last_detected_at);
+      metric.querySelector(".incident-metric-label").textContent = "Tiempo activo (real)";
+      metric.title = "Corregido: la fecha de primera detección incluye una fusión con una detección antigua no relacionada.";
+    }
+
     const list = document.getElementById("timeline-list");
     list.innerHTML = events.length
       ? groupTimelineEvents(events).map(timelineItemHtml).join("")
       : `<div class="sidebar-empty">Sin eventos registrados para este incidente.</div>`;
+    document.querySelector("#timeline-toggle span").textContent = `Ver cronología (${events.length})`;
   } catch (err) {
     document.getElementById("timeline-list").innerHTML =
       `<div class="sidebar-empty">No se pudo cargar la cronología.</div>`;
@@ -1853,17 +2113,6 @@ function findMatchingIncident(lat, lon) {
   return best;
 }
 
-// The header dot next to the app name only pulses when there's something
-// actually happening right now - a permanently-animating indicator trains
-// users to ignore it, which is the opposite of what it's for in an emergency
-// monitoring app.
-function updateHeaderPulse(incidents) {
-  const hasActive = incidents.some((incident) => incident.status === "active");
-  document.querySelectorAll("#topbar-pulse, #header-pulse").forEach((el) => {
-    el.classList.toggle("is-active", hasActive);
-  });
-}
-
 async function loadIncidents() {
   try {
     // Same hours window as the map's date-range filter (getSelectedDays), so
@@ -1873,7 +2122,6 @@ async function loadIncidents() {
     const res = await fetch(`${apiBaseUrl}/api/incidents?sort=severity&hours=${hours}`);
     lastIncidents = await res.json();
     renderIncidentList(applyFilters(lastIncidents));
-    updateHeaderPulse(lastIncidents);
     notifyNewCriticalIncidents(lastIncidents);
   } catch (err) {
     document.getElementById("sidebar-body").innerHTML =
@@ -1894,10 +2142,412 @@ async function loadFires() {
     // backend incident (findMatchingIncident) as soon as they're drawn -
     // otherwise the first paint would have no incidents loaded yet to match against.
     await loadIncidents();
+    initTimelineScrubber(lastFires);
     renderMap();
+    // Fire-and-forget - wind vectors + the summary bar's wind figure depend
+    // on a handful of extra network round-trips (one per active incident)
+    // and shouldn't block the map's first paint.
+    refreshWindVectors(lastIncidents);
   } catch (err) {
     setStatus(`No se pudieron cargar los datos: ${err.message}`);
   }
+}
+
+// ---------- Wind vectors (per active incident, distinct from severity) ----------
+// A small rotated arrow at each active incident's centroid shows current
+// wind speed/direction, reusing the same Open-Meteo-backed endpoint the
+// experimental fire-spread tool already calls for its 24h forecast - here
+// capped to 1h since this only needs "right now". Capped to a handful of
+// incidents at once so a busy day doesn't fire dozens of concurrent
+// requests against Open-Meteo just to paint arrows.
+const MAX_WIND_VECTORS = 20;
+const windCacheByIncidentId = new Map(); // id -> { speedKmh, directionFromDeg } | null (fetch failed)
+
+function windArrowIcon(directionFromDeg, speedKmh) {
+  // Arrow points where the wind is blowing TOWARD (180deg from the "from"
+  // direction the API returns) - i.e. the direction the fire is being
+  // pushed, matching how the fire-spread tool's own hourly ellipses orient.
+  const rotation = (directionFromDeg + 180) % 360;
+  const opacity = Math.min(1, 0.55 + speedKmh / 60).toFixed(2);
+  return L.divIcon({
+    className: "wind-arrow-icon",
+    html:
+      `<div class="wind-arrow" style="transform:rotate(${rotation}deg); opacity:${opacity};">` +
+      `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--wind)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V3M12 3l-6 6M12 3l6 6"/></svg>` +
+      `</div>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+  });
+}
+
+async function fetchWindForIncident(incident) {
+  if (windCacheByIncidentId.has(incident.id)) return windCacheByIncidentId.get(incident.id);
+  try {
+    const res = await fetch(
+      `${apiBaseUrl}/api/fire-spread/predict?lat=${incident.centroid_lat}&lon=${incident.centroid_lon}&max_hours=1`
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const first = data.hourly && data.hourly[0];
+    const wind = first ? { speedKmh: first.wind_speed_kmh, directionFromDeg: first.wind_direction_from_deg } : null;
+    windCacheByIncidentId.set(incident.id, wind);
+    return wind;
+  } catch {
+    windCacheByIncidentId.set(incident.id, null);
+    return null;
+  }
+}
+
+async function refreshWindVectors(incidents) {
+  const active = incidents.filter((incident) => incident.status === "active").slice(0, MAX_WIND_VECTORS);
+  const winds = await Promise.all(active.map(fetchWindForIncident));
+  windLayer.clearLayers();
+  active.forEach((incident, idx) => {
+    const wind = winds[idx];
+    if (!wind) return;
+    L.marker([incident.centroid_lat, incident.centroid_lon], {
+      icon: windArrowIcon(wind.directionFromDeg, wind.speedKmh),
+      interactive: true,
+      zIndexOffset: 500,
+    })
+      .bindTooltip(`${Math.round(wind.speedKmh)} km/h desde el ${compassLabel(wind.directionFromDeg)}`, {
+        className: "wind-arrow-tooltip",
+      })
+      .addTo(windLayer);
+  });
+  updateSummaryBar(incidents, winds.filter(Boolean));
+}
+
+// ---------- National summary bar ----------
+function riskRank(riskLevel) {
+  return { low: 0, moderate: 1, high: 2, critical: 3 }[riskLevel] ?? -1;
+}
+
+function updateSummaryBar(incidents, resolvedWinds) {
+  const active = incidents.filter((incident) => incident.status === "active");
+  document.getElementById("summary-active").textContent = active.length;
+
+  const totalHa = active.reduce((sum, incident) => {
+    const area = incidentAreaHa(incident);
+    return sum + (area ? area.areaHa : 0);
+  }, 0);
+  document.getElementById("summary-area").textContent = totalHa > 0 ? Math.round(totalHa).toLocaleString() : "–";
+
+  const maxRisk = active.reduce(
+    (best, incident) => (riskRank(incident.risk_level) > riskRank(best) ? incident.risk_level : best),
+    "low"
+  );
+  const riskEl = document.getElementById("summary-risk");
+  riskEl.textContent = active.length ? RISK_LABELS[maxRisk] || maxRisk : "–";
+  riskEl.className = `summary-stat-value summary-risk${active.length ? ` risk-text-${maxRisk}` : ""}`;
+
+  const windEl = document.getElementById("summary-wind");
+  if (resolvedWinds && resolvedWinds.length) {
+    const avgSpeed = resolvedWinds.reduce((sum, wind) => sum + wind.speedKmh, 0) / resolvedWinds.length;
+    windEl.textContent = `${Math.round(avgSpeed)} km/h`;
+  } else {
+    windEl.textContent = "–";
+  }
+}
+
+// ---------- Bottom timeline scrubber ----------
+// Drag (or hit play) to replay the currently-loaded window's detections up
+// to a given moment, so a fire's spread over the day becomes watchable
+// instead of a single static snapshot. Filters lastFires client-side and
+// re-renders - never re-fetches, so scrubbing stays instant.
+//
+// When an incident's detail view is open, the SAME control extends past
+// "Ahora" with that incident's own wind-driven spread forecast (see
+// enableIncidentPrediction below) - dragging into that zone doesn't filter
+// detections (the map keeps showing the current, unfiltered state) but
+// instead draws the predicted ellipse for the corresponding hour and
+// projects the incident's hectares metric forward. "Ahora" stops being
+// pinned to the right edge in that mode; it sits wherever the past/future
+// split falls (scrubberNowFraction), and the reset button always returns
+// to it regardless of where that is.
+const SCRUBBER_DATE_FORMAT = { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" };
+let scrubberBounds = null; // { startMs, endMs } spanning the currently loaded historical window
+let scrubberPlayTimer = null;
+let scrubberFutureMs = 0; // 0 unless a prediction is active (see enableIncidentPrediction)
+let scrubberFutureHours = 0;
+let predictionIncident = null; // the incident the active forecast belongs to, or null
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// Two independent features can each extend the scrubber past "Ahora" - a
+// single incident's fire-spread prediction (scrubberFutureHours/Ms) and the
+// viewport-wide wind field (windFieldFutureHours/Ms). Neither knows about
+// the other, so the scrubber itself always uses whichever extends further -
+// they're never meaningfully different in practice (both request a 24h
+// Open-Meteo window), but this keeps either one alone, or both together,
+// correct without special-casing which one is active.
+function effectiveFutureHours() {
+  return Math.max(scrubberFutureHours, windFieldFutureHours);
+}
+function effectiveFutureMs() {
+  return Math.max(scrubberFutureMs, windFieldFutureMs);
+}
+
+// Where "Ahora" falls on the 0-100 track - 100 (the right edge) with no
+// prediction active, or an interior point once the future span stretches
+// the track's total span past "now".
+function scrubberNowFraction() {
+  if (!scrubberBounds) return 100;
+  const pastSpan = scrubberBounds.endMs - scrubberBounds.startMs;
+  const total = pastSpan + effectiveFutureMs();
+  return total > 0 ? (pastSpan / total) * 100 : 100;
+}
+
+function updateScrubberEndLabel() {
+  const hours = effectiveFutureHours();
+  document.getElementById("scrubber-label-end").textContent = hours > 0 ? `+${hours}h` : "Ahora";
+}
+
+function initTimelineScrubber(fires) {
+  disableIncidentPrediction(); // a fresh full data load always drops any per-incident forecast in progress
+  stopScrubberPlayback();
+  const range = document.getElementById("scrubber-range");
+  const startLabel = document.getElementById("scrubber-label-start");
+  range.value = 100;
+  document.getElementById("scrubber-label-current").textContent = "";
+  if (!fires.length) {
+    scrubberBounds = null;
+    startLabel.textContent = "–";
+    updateScrubberEndLabel();
+    return;
+  }
+  // Reduce, not Math.min/max(...times) - this map already deals with 10k+
+  // detections on a wide date range, well past the argument-count ceiling
+  // spreading an array into Math.min/max would hit on some engines.
+  let startMs = Infinity;
+  let endMs = Date.now();
+  fires.forEach((fire) => {
+    const ms = new Date(fire.acquired_at).getTime();
+    if (ms < startMs) startMs = ms;
+    if (ms > endMs) endMs = ms;
+  });
+  scrubberBounds = { startMs, endMs };
+  startLabel.textContent = new Date(startMs).toLocaleString("es-ES", SCRUBBER_DATE_FORMAT);
+  updateScrubberEndLabel();
+}
+
+// Used by renderMap() in place of the raw lastFires array - returns
+// everything at "Ahora" or later (including anywhere in the predicted
+// future zone, which doesn't filter detections at all), otherwise only
+// detections at or before the scrubbed instant.
+function scrubberFilteredFires(allFires) {
+  const range = document.getElementById("scrubber-range");
+  if (!scrubberBounds) return allFires;
+  const nowFraction = scrubberNowFraction();
+  const value = Number(range.value);
+  if (value >= nowFraction) return allFires;
+  const pastSpan = scrubberBounds.endMs - scrubberBounds.startMs;
+  const fraction = nowFraction > 0 ? value / nowFraction : 1;
+  const cutoffMs = scrubberBounds.startMs + pastSpan * Math.min(1, Math.max(0, fraction));
+  return allFires.filter((fire) => new Date(fire.acquired_at).getTime() <= cutoffMs);
+}
+
+function onScrubberInput() {
+  const range = document.getElementById("scrubber-range");
+  const currentLabel = document.getElementById("scrubber-label-current");
+  const value = Number(range.value);
+
+  currentLabel.classList.remove("future");
+
+  if (!scrubberBounds) {
+    currentLabel.textContent = "";
+    renderMap();
+    return;
+  }
+
+  const nowFraction = scrubberNowFraction();
+  if (value < nowFraction) {
+    // Past: filter detections up to the scrubbed instant, same behavior as
+    // before prediction existed.
+    clearPredictionEllipse();
+    clearWindField();
+    const pastSpan = scrubberBounds.endMs - scrubberBounds.startMs;
+    const fraction = nowFraction > 0 ? value / nowFraction : 1;
+    const cutoffMs = scrubberBounds.startMs + pastSpan * Math.min(1, Math.max(0, fraction));
+    currentLabel.textContent = new Date(cutoffMs).toLocaleString("es-ES", SCRUBBER_DATE_FORMAT);
+    renderMap();
+    return;
+  }
+
+  if (value <= nowFraction + 0.01 || effectiveFutureHours() === 0) {
+    // Sitting exactly at "Ahora" (or no forecast to show past it).
+    currentLabel.textContent = "";
+    clearPredictionEllipse();
+    if (windFieldData) renderWindFieldAtHour(1);
+    else clearWindField();
+    renderMap();
+    return;
+  }
+
+  // Future: base map stays at its unfiltered "now" state; overlay the
+  // predicted spread ellipse and/or wind field for the corresponding
+  // forecast hour instead.
+  renderMap();
+  const futureHours = effectiveFutureHours();
+  const futureFraction = (value - nowFraction) / (100 - nowFraction || 1);
+  const hoursAhead = Math.min(futureHours, Math.max(1, Math.round(futureFraction * futureHours)));
+  currentLabel.classList.add("future");
+  currentLabel.textContent = `+${hoursAhead}h (previsto)`;
+  applyPredictionEllipse(hoursAhead);
+  renderWindFieldAtHour(hoursAhead);
+}
+
+function stopScrubberPlayback() {
+  if (scrubberPlayTimer) {
+    clearInterval(scrubberPlayTimer);
+    scrubberPlayTimer = null;
+  }
+  document.getElementById("scrubber-play").classList.remove("is-playing");
+  document.getElementById("scrubber-play-icon").innerHTML = `<path d="M6 4l14 8-14 8z"/>`;
+}
+
+function toggleScrubberPlayback() {
+  if (scrubberPlayTimer) {
+    stopScrubberPlayback();
+    return;
+  }
+  if (!scrubberBounds) return;
+  const range = document.getElementById("scrubber-range");
+  if (Number(range.value) >= 100) range.value = 0; // replaying from the end restarts from the beginning
+  document.getElementById("scrubber-play").classList.add("is-playing");
+  document.getElementById("scrubber-play-icon").innerHTML =
+    `<rect x="5" y="4" width="4" height="16" rx="1"/><rect x="15" y="4" width="4" height="16" rx="1"/>`;
+  scrubberPlayTimer = setInterval(() => {
+    const next = Math.min(100, Number(range.value) + 1.2);
+    range.value = next;
+    onScrubberInput();
+    if (next >= 100) stopScrubberPlayback();
+  }, 90);
+}
+
+document.getElementById("scrubber-range").addEventListener("input", onScrubberInput);
+document.getElementById("scrubber-play").addEventListener("click", toggleScrubberPlayback);
+document.getElementById("scrubber-reset").addEventListener("click", () => {
+  stopScrubberPlayback();
+  document.getElementById("scrubber-range").value = scrubberNowFraction();
+  onScrubberInput();
+});
+
+// ---------- Scrubber <-> fire-spread prediction bridge ----------
+// Opening an incident's detail view auto-runs a multi-front wind-forecast
+// prediction FROM the fire's own recent leading edge(s) (see
+// /api/fire-spread/predict-incident and predict_incident_spread in the
+// backend) - unlike the standalone "place origin" experimental tool below
+// (a single manually-clicked point, its own separate fireSpreadData/slider),
+// this one starts from wherever the incident has actually been active
+// lately, can draw more than one ellipse when the fire has more than one
+// active flank, and won't grow an ellipse backward into ground the fire
+// already burnt. One scrubber control for both "what happened" and "where
+// this might go next".
+let incidentFireSpreadData = null; // { fronts: [{ hourly: [...] }, ...], burnt_area_hull } | null
+
+async function enableIncidentPrediction(incident) {
+  predictionIncident = incident;
+  fireSpreadOriginLayer.clearLayers();
+  incidentFireSpreadData = null;
+  scrubberFutureMs = 0;
+  scrubberFutureHours = 0;
+  updateScrubberEndLabel();
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/fire-spread/predict-incident/${incident.id}?max_hours=8`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    // Stale guard: the user may have gone back to the list, or opened a
+    // different incident, before this network round-trip resolved.
+    if (predictionIncident !== incident) return;
+    incidentFireSpreadData = data;
+    const firstFront = data.fronts[0];
+    const weatherSlot = document.getElementById("weather-slot");
+    if (weatherSlot && firstFront) weatherSlot.innerHTML = weatherSectionHtml(firstFront.hourly[0]);
+    scrubberFutureHours = firstFront ? firstFront.hourly.length : 0;
+    scrubberFutureMs = scrubberFutureHours * 3600000;
+    updateScrubberEndLabel();
+    // Land on "Ahora" by default - the user drags right to see the
+    // forecast, rather than every incident click jumping straight to the end.
+    document.getElementById("scrubber-range").value = scrubberNowFraction();
+    onScrubberInput();
+  } catch {
+    // Wind/elevation lookups can fail (Open-Meteo hiccup, missing slope
+    // data, etc.), or a very quiet/tiny incident may have too few recent
+    // detections to trace a front from - leave the scrubber as a plain
+    // historical control rather than surfacing an error for what's
+    // presented as a bonus on top of the detail view, not its primary purpose.
+  }
+}
+
+function disableIncidentPrediction() {
+  predictionIncident = null;
+  incidentFireSpreadData = null;
+  scrubberFutureMs = 0;
+  scrubberFutureHours = 0;
+  fireSpreadLayer.clearLayers();
+  restoreAreaMetric();
+  updateScrubberEndLabel();
+}
+
+function clearPredictionEllipse() {
+  fireSpreadLayer.clearLayers();
+  restoreAreaMetric();
+}
+
+// Swaps the incident detail card's hectares metric for a live "current +
+// predicted growth" figure while scrubbing through the forecast - reverted
+// (restoreAreaMetric) the moment the scrubber leaves the future zone.
+let originalAreaMetricHtml = null;
+
+function applyPredictionEllipse(hoursAhead) {
+  if (!incidentFireSpreadData) return;
+  const windColor = cssVar("--wind") || "#0c7f8c";
+  fireSpreadLayer.clearLayers();
+  // Summed across every active front - a fire with two flanks predicts (and
+  // projects hectares for) both at once, not just whichever one happened to
+  // be picked as "the" origin. Fronts are clustered far enough apart that
+  // double-counting overlap is a non-issue in practice (see FRONT_CLUSTER_DEG).
+  let totalEllipseHa = 0;
+  let representativeHourEntry = null;
+  incidentFireSpreadData.fronts.forEach((front) => {
+    const hourEntry = front.hourly[hoursAhead - 1] || front.hourly[front.hourly.length - 1];
+    if (!hourEntry) return;
+    representativeHourEntry = representativeHourEntry || hourEntry;
+    totalEllipseHa += ringAreaHectares(hourEntry.polygon);
+    L.polygon(hourEntry.polygon, {
+      color: windColor,
+      weight: 2,
+      dashArray: "5 4",
+      fillColor: windColor,
+      fillOpacity: 0.16,
+    })
+      .bindTooltip(
+        `Previsión +${hourEntry.hour}h · ${hourEntry.wind_speed_kmh} km/h desde el ${compassLabel(hourEntry.wind_direction_from_deg)}`,
+        { sticky: true }
+      )
+      .addTo(fireSpreadLayer);
+  });
+  if (!representativeHourEntry) return;
+
+  const areaMetricEl = document.getElementById("incident-area-metric");
+  if (!areaMetricEl || !predictionIncident) return;
+  if (originalAreaMetricHtml === null) originalAreaMetricHtml = areaMetricEl.innerHTML;
+  const baseAreaHa = incidentAreaHa(predictionIncident);
+  const projectedHa = (baseAreaHa ? baseAreaHa.areaHa : 0) + totalEllipseHa;
+  areaMetricEl.innerHTML =
+    `<div class="incident-metric-value" style="color:var(--wind);">${Math.round(projectedHa).toLocaleString()}</div>` +
+    `<div class="incident-metric-label">Ha previstas (+${representativeHourEntry.hour}h)</div>`;
+}
+
+function restoreAreaMetric() {
+  const areaMetricEl = document.getElementById("incident-area-metric");
+  if (areaMetricEl && originalAreaMetricHtml !== null) {
+    areaMetricEl.innerHTML = originalAreaMetricHtml;
+  }
+  originalAreaMetricHtml = null;
 }
 
 // ---------- Webcams (Windy-style: pins on the map, click for a live
@@ -2028,6 +2678,90 @@ function toggleWebcamsLayer() {
   }
 }
 
+// ---------- Wind field (Windy-style arrow grid) ----------
+// A grid of wind arrows across the current viewport (not just one per
+// active incident - see windLayer/refreshWindVectors above), each carrying
+// its own hourly forecast series from /api/fire-spread/wind-field. Dragging
+// the bottom timeline scrubber into its future zone re-indexes into that
+// already-fetched series (see renderWindFieldAtHour) instead of refetching
+// per hour - exactly the pattern the single-incident fire-spread ellipse
+// already uses. windFieldFutureHours/Ms feed into the SAME scrubber state
+// fire-spread prediction uses (scrubberNowFraction/onScrubberInput below
+// take the max of both), so the one control drives whichever of the two
+// (or both) is currently active.
+let windFieldData = null; // [{lat, lon, hours: [{speed_kmh, direction_from_deg}, ...]}, ...] | null
+let windFieldFutureHours = 0;
+let windFieldFutureMs = 0;
+
+function clearWindField() {
+  windFieldLayer.clearLayers();
+}
+
+// hoursAhead uses the same 1-indexed "+Nh" convention as
+// applyPredictionEllipse's own fireSpreadData.hourly indexing, so a single
+// hoursAhead value from onScrubberInput drives both layers identically.
+function renderWindFieldAtHour(hoursAhead) {
+  windFieldLayer.clearLayers();
+  if (!windFieldData || !windFieldData.length) return;
+  windFieldData.forEach((point) => {
+    const idx = Math.min(hoursAhead - 1, point.hours.length - 1);
+    if (idx < 0) return;
+    const hourEntry = point.hours[idx];
+    if (!hourEntry) return;
+    L.marker([point.lat, point.lon], {
+      icon: windArrowIcon(hourEntry.direction_from_deg, hourEntry.speed_kmh),
+      interactive: false,
+    }).addTo(windFieldLayer);
+  });
+}
+
+async function reloadWindField() {
+  const toggle = document.getElementById("wind-field-toggle");
+  if (!toggle || !toggle.checked) return;
+  const bounds = map.getBounds();
+  const params = new URLSearchParams({
+    west: bounds.getWest(),
+    south: bounds.getSouth(),
+    east: bounds.getEast(),
+    north: bounds.getNorth(),
+    hours: 24,
+  });
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/fire-spread/wind-field?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!toggle.checked) return; // toggled off while this request was in flight
+    windFieldData = data;
+    windFieldFutureHours = data.length ? Math.max(...data.map((p) => p.hours.length)) : 0;
+    windFieldFutureMs = windFieldFutureHours * 3600000;
+    updateScrubberEndLabel();
+    onScrubberInput(); // re-render at whatever hour the scrubber is currently sitting on
+  } catch {
+    // Best-effort, same as this app's other Open-Meteo-backed features -
+    // a flaky upstream call shouldn't block the rest of the map.
+  }
+}
+
+function toggleWindFieldLayer() {
+  const enabled = document.getElementById("wind-field-toggle").checked;
+  if (enabled) {
+    reloadWindField();
+    return;
+  }
+  windFieldData = null;
+  windFieldFutureHours = 0;
+  windFieldFutureMs = 0;
+  clearWindField();
+  updateScrubberEndLabel();
+  // If the scrubber was sitting in a future zone that only existed because
+  // of the wind field (no incident prediction of its own keeping it open),
+  // snap back to "now" rather than leaving it stranded past the new,
+  // possibly-shorter (or zero) future span.
+  const range = document.getElementById("scrubber-range");
+  if (Number(range.value) > scrubberNowFraction()) range.value = scrubberNowFraction();
+  onScrubberInput();
+}
+
 // ---------- Fire spread prediction (experimental POC) ----------
 // Click "Place origin", then click the map: fetches /api/fire-spread/predict
 // (an hourly series, up to 24h, driven by the Open-Meteo forecast - not a
@@ -2109,7 +2843,7 @@ async function predictFireSpread(lat, lon) {
     .addTo(fireSpreadOriginLayer);
 
   try {
-    const res = await fetch(`${apiBaseUrl}/api/fire-spread/predict?lat=${lat}&lon=${lon}&max_hours=24`);
+    const res = await fetch(`${apiBaseUrl}/api/fire-spread/predict?lat=${lat}&lon=${lon}&max_hours=8`);
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.detail || `HTTP ${res.status}`);
@@ -2150,6 +2884,7 @@ document.getElementById("date-range").addEventListener("change", loadFires);
 document.getElementById("satellite-toggle").addEventListener("change", updateSatelliteLayer);
 document.getElementById("satellite-date").addEventListener("change", updateSatelliteLayer);
 document.getElementById("webcams-toggle").addEventListener("change", toggleWebcamsLayer);
+document.getElementById("wind-field-toggle").addEventListener("change", toggleWindFieldLayer);
 document.getElementById("basemap-style").addEventListener("change", (e) => setBasemapStyle(e.target.value));
 document.getElementById("fire-spread-place").addEventListener("click", () => {
   placingFireOrigin = true;
@@ -2176,62 +2911,159 @@ map.on("zoomend", renderMap);
 // nationwide at once) - refetch whenever the visible area actually changes,
 // but only while the layer is turned on.
 map.on("moveend", reloadWebcams);
+// Same per-viewport pattern for the wind field grid - both moveend (pan)
+// and zoomend (grid spacing/point count depends on the bbox span) matter
+// here, unlike webcams which only cares about moveend.
+map.on("moveend", reloadWindField);
+map.on("zoomend", reloadWindField);
 
-// Sidebar filters are pure client-side re-derivations of lastIncidents - no
-// extra API round-trip on every checkbox click.
+// ---------- Filter bar: dropdown pills replacing the old stacked
+// label+chip-row groups. Each pill's own label reflects the current
+// selection (its specific value when exactly one is picked, a "(n)" count
+// otherwise) so the filter state is readable without opening anything -
+// the dropdowns themselves stay pure client-side re-derivations of
+// lastIncidents, no extra API round-trip on every checkbox click. ----------
+const FILTER_RISK_LABELS = { low: "Bajo", moderate: "Moderado", high: "Alto", critical: "Crítico" };
+const FILTER_RISK_DOTS = { low: "var(--ok)", moderate: "var(--degraded)", high: "#e8590c", critical: "var(--accent)" };
+const FILTER_STATUS_LABELS = { active: "Activo", cooling: "En enfriamiento", archived: "Archivado" };
+const FILTER_SOURCE_TOTAL = 4;
+
+function updateFilterPillLabel({ btnId, labelId, dotId, checkedValues: values, labels, totalCount, dots, fallbackLabel }) {
+  const btn = document.getElementById(btnId);
+  const labelEl = document.getElementById(labelId);
+  // Checking none is equivalent to checking all (see incidentPassesFilters) -
+  // both mean "no constraint on this facet", so both read as the neutral pill.
+  const isFiltered = values.length > 0 && values.length < totalCount;
+  btn.classList.toggle("set", isFiltered);
+  if (!isFiltered) labelEl.textContent = fallbackLabel;
+  else if (values.length === 1) labelEl.textContent = labels[values[0]];
+  else labelEl.textContent = `${fallbackLabel} (${values.length})`;
+  if (dotId) {
+    const dotEl = document.getElementById(dotId);
+    dotEl.style.display = isFiltered ? "" : "none";
+    dotEl.style.background = values.length === 1 ? dots[values[0]] : "var(--accent)";
+  }
+}
+function updateFilterPillLabels() {
+  updateFilterPillLabel({
+    btnId: "filter-risk-btn", labelId: "filter-risk-label", dotId: "filter-risk-dot",
+    checkedValues: checkedValues(".filter-risk"), labels: FILTER_RISK_LABELS, dots: FILTER_RISK_DOTS,
+    totalCount: Object.keys(FILTER_RISK_LABELS).length, fallbackLabel: "Riesgo",
+  });
+  updateFilterPillLabel({
+    btnId: "filter-status-btn", labelId: "filter-status-label",
+    checkedValues: checkedValues(".filter-status"), labels: FILTER_STATUS_LABELS,
+    totalCount: Object.keys(FILTER_STATUS_LABELS).length, fallbackLabel: "Estado",
+  });
+  updateFilterPillLabel({
+    btnId: "filter-source-btn", labelId: "filter-source-label",
+    checkedValues: checkedValues(".filter-source"), labels: {}, totalCount: FILTER_SOURCE_TOTAL, fallbackLabel: "Fuente",
+  });
+}
 document.querySelectorAll(".filter-risk, .filter-status, .filter-source").forEach((checkbox) => {
-  checkbox.addEventListener("change", refreshIncidentList);
+  checkbox.addEventListener("change", () => {
+    updateFilterPillLabels();
+    refreshIncidentList();
+  });
 });
 document.getElementById("filter-reset").addEventListener("click", () => {
-  document.querySelectorAll(".filter-risk, .filter-status").forEach((el) => (el.checked = true));
+  // Resets to the app's default view (critical + active), not to "show
+  // everything" - that default no longer has its own shortcut button, so
+  // this is the only way back to it once you've drifted away.
+  document.querySelectorAll(".filter-risk").forEach((el) => (el.checked = el.value === "critical"));
+  document.querySelectorAll(".filter-status").forEach((el) => (el.checked = el.value === "active"));
   document.querySelectorAll(".filter-source").forEach((el) => (el.checked = false));
   document.getElementById("locality-search").value = "";
-  document.getElementById("quick-filter-critical").classList.remove("active");
+  closeAllFilterDropdowns();
+  updateFilterPillLabels();
   refreshIncidentList();
 });
-document.getElementById("filter-panel-toggle").addEventListener("click", () => {
-  document.getElementById("filter-panel").classList.toggle("collapsed");
+
+// One dropdown open at a time, closed by an outside click, Escape, or
+// picking another pill - mirrors the control rail's popover behavior on
+// the map side of the app for a consistent interaction language.
+function closeAllFilterDropdowns() {
+  document.querySelectorAll(".fdropdown.open").forEach((dropdown) => dropdown.classList.remove("open"));
+}
+document.querySelectorAll(".fbtn[data-dropdown]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const dropdown = document.getElementById(button.dataset.dropdown);
+    const wasOpen = dropdown.classList.contains("open");
+    closeAllFilterDropdowns();
+    if (!wasOpen) dropdown.classList.add("open");
+  });
+});
+document.addEventListener("click", (e) => {
+  if (e.target.closest(".filter-dd")) return;
+  closeAllFilterDropdowns();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeAllFilterDropdowns();
 });
 
 // ---------- Mobile: floating panels become full-screen overlays, opened one
-// at a time via the topbar's toggle buttons instead of both being crammed
-// onto a phone-width viewport at once. ----------
-function openMobilePanel(panelEl) {
-  document.getElementById("incident-sidebar").classList.remove("mobile-open");
-  document.getElementById("panel").classList.remove("mobile-open");
-  panelEl.classList.add("mobile-open");
+// at a time via the topbar's sidebar toggle / the control rail's buttons
+// instead of being crammed onto a phone-width viewport at once. ----------
+function closeAllPopovers() {
+  document.querySelectorAll(".rail-popover.open").forEach((popover) => popover.classList.remove("open"));
+  document.querySelectorAll(".rail-btn.active").forEach((button) => button.classList.remove("active"));
 }
 function closeMobilePanels() {
   document.getElementById("incident-sidebar").classList.remove("mobile-open");
-  document.getElementById("panel").classList.remove("mobile-open");
+  closeAllPopovers();
 }
-document.getElementById("mobile-sidebar-toggle").addEventListener("click", () =>
-  openMobilePanel(document.getElementById("incident-sidebar"))
-);
-document.getElementById("mobile-settings-toggle").addEventListener("click", () =>
-  openMobilePanel(document.getElementById("panel"))
-);
+document.getElementById("mobile-sidebar-toggle").addEventListener("click", () => {
+  closeAllPopovers();
+  document.getElementById("incident-sidebar").classList.add("mobile-open");
+});
 document.getElementById("mobile-sidebar-close").addEventListener("click", closeMobilePanels);
-document.getElementById("mobile-settings-close").addEventListener("click", closeMobilePanels);
+
+// ---------- Control rail: each button drops its own popover, one at a time
+// (replaces the old always-open right settings sidebar). positionPopover()
+// aligns the popover's top edge with whichever button opened it - the rail
+// stacks several icons, so a fixed top offset would only line up with the
+// first one. On mobile the popover becomes a full-screen sheet instead (see
+// the @media rules in index.html), so no positioning is needed there. ----------
+function positionPopover(button, popover) {
+  if (window.matchMedia("(max-width: 768px)").matches) return;
+  popover.style.top = `${button.getBoundingClientRect().top}px`;
+}
+document.querySelectorAll(".rail-btn[data-popover]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const popover = document.getElementById(button.dataset.popover);
+    const wasOpen = popover.classList.contains("open");
+    document.getElementById("incident-sidebar").classList.remove("mobile-open");
+    closeAllPopovers();
+    if (wasOpen) return;
+    positionPopover(button, popover);
+    popover.classList.add("open");
+    button.classList.add("active");
+  });
+});
+document.querySelectorAll(".popover-close").forEach((button) => {
+  button.addEventListener("click", closeAllPopovers);
+});
+document.addEventListener("click", (e) => {
+  if (window.matchMedia("(max-width: 768px)").matches) return;
+  if (e.target.closest("#control-rail") || e.target.closest(".rail-popover")) return;
+  closeAllPopovers();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeAllPopovers();
+});
+// Small unread-style dot on the Alertas rail icon while proximity alerts are
+// armed, so the one setting that keeps running invisibly in the background
+// stays visible at a glance without reopening the popover. Called both from
+// the checkbox's own "change" event and everywhere enableLocationAlerts()/
+// disableLocationAlerts() set .checked programmatically, since that never
+// fires "change" on its own.
+function updateAlertsRailDot() {
+  document.getElementById("alerts-rail-dot").style.display =
+    document.getElementById("location-alerts-toggle").checked ? "" : "none";
+}
+document.getElementById("location-alerts-toggle").addEventListener("change", updateAlertsRailDot);
 
 document.getElementById("locality-search").addEventListener("input", refreshIncidentList);
-
-// One-tap "only what matters under stress" - checks critical risk + active
-// status only. Clicking again while active restores every risk/status
-// checkbox instead of leaving the user stuck narrowed down with no visible
-// way back (the existing "Restablecer filtros" link is easy to miss).
-document.getElementById("quick-filter-critical").addEventListener("click", (e) => {
-  const btn = e.currentTarget;
-  const turningOn = !btn.classList.contains("active");
-  btn.classList.toggle("active", turningOn);
-  if (turningOn) {
-    document.querySelectorAll(".filter-risk").forEach((el) => (el.checked = el.value === "critical"));
-    document.querySelectorAll(".filter-status").forEach((el) => (el.checked = el.value === "active"));
-  } else {
-    document.querySelectorAll(".filter-risk, .filter-status").forEach((el) => (el.checked = true));
-  }
-  refreshIncidentList();
-});
 
 // Click-to-zoom for any thumbnail (timeline scenes, Telegram photos,
 // satellite previews) - event-delegated on document since these images are
@@ -2398,21 +3230,6 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-(function initThemeToggle() {
-  const btn = document.getElementById("theme-toggle");
-  const applyIcon = (theme) => {
-    btn.textContent = theme === "light" ? "☀️" : "🌙";
-    btn.title = theme === "light" ? "Cambiar a modo oscuro" : "Cambiar a modo claro";
-  };
-  applyIcon(document.documentElement.dataset.theme || "dark");
-  btn.addEventListener("click", () => {
-    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    document.documentElement.dataset.theme = next;
-    localStorage.setItem("wm-theme", next);
-    applyIcon(next);
-  });
-})();
-
 (function initSatelliteDate() {
   // Default to 2 days ago - GIBS "best available" imagery often lags a day or two.
   const d = new Date();
@@ -2514,12 +3331,14 @@ function enableLocationAlerts() {
   if (typeof Notification === "undefined" || !("geolocation" in navigator)) {
     setLocationAlertsStatus("Tu navegador no soporta geolocalización o notificaciones.");
     document.getElementById("location-alerts-toggle").checked = false;
+    updateAlertsRailDot();
     return;
   }
   Notification.requestPermission().then((permission) => {
     if (permission !== "granted") {
       setLocationAlertsStatus("Permiso de notificaciones denegado - actívalo en los ajustes del navegador para usar esta función.");
       document.getElementById("location-alerts-toggle").checked = false;
+      updateAlertsRailDot();
       return;
     }
     setLocationAlertsStatus("Buscando tu ubicación...");
@@ -2605,6 +3424,7 @@ function renderRecencyLegend() {
 
 (async function init() {
   renderRecencyLegend();
+  updateFilterPillLabels();
   await loadConfig();
   await loadFires();
   checkStaleData();
@@ -2615,6 +3435,7 @@ function renderRecencyLegend() {
   // immediately re-notify for fires the user already knows about.
   if (localStorage.getItem(LOCATION_ALERTS_STORAGE_KEY) === "1") {
     document.getElementById("location-alerts-toggle").checked = true;
+    updateAlertsRailDot();
     enableLocationAlerts();
   }
 })();

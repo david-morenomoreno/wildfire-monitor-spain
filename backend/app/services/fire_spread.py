@@ -1,8 +1,10 @@
 """
 Experimental wildfire spread POC - NOT an operational fire behavior model.
 
-Given a clicked origin point, estimates how far a fire might spread over the
-next ~24 hours using the elliptical growth model (Huygens' wavelet
+Given a clicked origin point (or, for a tracked incident, its own recent
+active front(s) - see predict_incident_spread), estimates how far a fire
+might spread over the next few hours (MAX_PREDICTION_HOURS) using the
+elliptical growth model (Huygens' wavelet
 principle) that Canada's FBP (Fire Behaviour Prediction) System and FARSITE
 both use: wind speed sets the ellipse's length-to-breadth ratio, which then
 splits one base rate of spread into head/flank/back rates.
@@ -12,7 +14,7 @@ forecasted wind (Open-Meteo) drives that hour's head/flank/back increment,
 and increments are summed cumulatively (a simplified stand-in for proper
 multi-point Huygens' perimeter propagation, which would need polygon-union
 geometry across many perimeter points - out of scope for a POC). The
-resulting shape can bend over the 24h window as wind direction shifts,
+resulting shape can bend over the prediction window as wind direction shifts,
 via a ROS-weighted vector-average bearing, rather than assuming one fixed
 direction for the whole forecast.
 
@@ -30,6 +32,8 @@ from functools import reduce
 import httpx
 from shapely.geometry import Point, Polygon
 from shapely.geometry.base import BaseGeometry
+
+from app.services.area_estimate import estimate_area_and_hull
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,39 @@ METERS_PER_DEGREE_LAT = 111_320.0
 # plausible real scenario without fetching/holding an unreasonably large
 # polygon set for the common case).
 WATER_FETCH_RADIUS_M = 20_000.0
+
+# The elliptical Van Wagner model only holds up for the first few hours,
+# where wind is genuinely the dominant driver - past that, real fires bend
+# around terrain/fuel discontinuities (valleys, fields, firebreaks) this POC
+# has no way to represent, and the compounding wind-forecast uncertainty
+# itself grows fast enough by hour ~12-24 to make the ellipse more
+# misleading than informative. 8h keeps predictions inside the window where
+# "wind-driven ellipse" is still a defensible approximation - was 24h.
+MAX_PREDICTION_HOURS = 8
+
+# How far back to look for "currently active" detections when picking a
+# fire's leading edge(s) to predict FROM (see predict_incident_spread) -
+# recent enough that a quiet flank isn't mistaken for still-advancing, wide
+# enough that a single satellite pass gap doesn't wrongly read as "no longer
+# active" here.
+RECENT_HOTSPOT_WINDOW_HOURS = 6
+# Detections within this many degrees (~3km) of each other are treated as
+# the same active front rather than two separate ones - tuned to separate
+# genuinely distinct flanks (e.g. two sides of a ridge) without fragmenting
+# one contiguous edge's own GPS/pixel jitter into spurious extra fronts.
+FRONT_CLUSTER_DEG = 0.03
+# Hard cap on how many simultaneous fronts get their own prediction - a
+# heavily fragmented detection set (many small satellite-noise clusters)
+# would otherwise explode into dozens of near-duplicate, hard-to-read
+# ellipses instead of the fire's few real leading edges.
+MAX_ACTIVE_FRONTS = 3
+# How close (degrees, ~1.1km) a recent detection needs to be to the burnt
+# extent's own boundary to still count as a leading-edge candidate rather
+# than an interior re-detection (see _is_exterior_point) - loose enough that
+# a real edge point just inside the hull (concave hulls are an
+# approximation, not a perfect boundary) isn't wrongly excluded, tight
+# enough that it doesn't just let the whole interior back in.
+FRONT_BOUNDARY_BUFFER_DEG = 0.01
 
 # CLC (Corine Land Cover) 3-digit codes -> (label, base ROS in m/min at a
 # reference ~10 km/h wind on flat ground). These are rough order-of-magnitude
@@ -93,17 +130,26 @@ NON_FLAMMABLE_PREFIXES = ("1", "4", "5")  # urban fabric (1xx), wetlands (4xx), 
 def fetch_wind_series(lat: float, lon: float, max_hours: int = 24) -> list[dict]:
     """
     Hourly wind speed (km/h) + direction (degrees, meteorological 'from'
-    convention) for the next `max_hours` hours starting at the current hour,
-    via Open-Meteo - free, no API key, confirmed live. forecast_days=3 keeps
-    a safety margin so "current hour + 24" never runs past the end of the
-    returned series regardless of what time of day "now" is.
+    convention), temperature (°C) and relative humidity (%) for the next
+    `max_hours` hours starting at the current hour, via Open-Meteo - free, no
+    API key, confirmed live. forecast_days=3 keeps a safety margin so
+    "current hour + 24" never runs past the end of the returned series
+    regardless of what time of day "now" is.
+
+    Temperature/humidity were added alongside the wind fields this function
+    already fetched for the spread model - same request, same free API, no
+    extra round-trip - so the map sidebar's "Previsión" section (index[0] of
+    this series, i.e. the current hour) can show more than wind without a
+    second weather source. Neither factors into the spread model itself
+    (still wind/fuel/slope only, see predict_spread) - they're carried
+    through purely for display.
     """
     response = httpx.get(
         OPEN_METEO_URL,
         params={
             "latitude": lat,
             "longitude": lon,
-            "hourly": "windspeed_10m,winddirection_10m",
+            "hourly": "windspeed_10m,winddirection_10m,temperature_2m,relativehumidity_2m",
             "forecast_days": 3,
             "timezone": "UTC",
         },
@@ -124,9 +170,102 @@ def fetch_wind_series(lat: float, lon: float, max_hours: int = 24) -> list[dict]
             "time": times[i],
             "speed_kmh": hourly["windspeed_10m"][i],
             "direction_from_deg": hourly["winddirection_10m"][i],
+            "temperature_c": hourly["temperature_2m"][i],
+            "humidity_pct": hourly["relativehumidity_2m"][i],
         }
         for i in range(start_idx, end_idx)
     ]
+
+
+# How many grid points to sample per axis at most - a Windy-style arrow
+# field only needs to look dense at typical zoom levels, not literally
+# sample every 0.1 degree; capping this keeps both the Open-Meteo request
+# (one HTTP call, comma-joined lat/lon lists - see fetch_wind_field) and the
+# number of arrows Leaflet has to paint bounded regardless of how far
+# zoomed-out the current viewport is (a whole-Spain view spans ~14 x 8
+# degrees).
+WIND_FIELD_MAX_POINTS_PER_AXIS = 9
+# Floor on grid spacing (degrees) - prevents an absurdly dense request if a
+# caller passes a tiny bbox (deep zoom-in), where "one arrow every few
+# hundred meters" would be meaningless at this forecast's resolution anyway.
+WIND_FIELD_MIN_STEP_DEG = 0.25
+
+
+def _wind_field_grid(west: float, south: float, east: float, north: float) -> list[tuple[float, float]]:
+    lon_step = max((east - west) / WIND_FIELD_MAX_POINTS_PER_AXIS, WIND_FIELD_MIN_STEP_DEG)
+    lat_step = max((north - south) / WIND_FIELD_MAX_POINTS_PER_AXIS, WIND_FIELD_MIN_STEP_DEG)
+
+    lons = []
+    lon = west + lon_step / 2  # offset half a step so points sit inside the bbox, not straddling its edge
+    while lon < east:
+        lons.append(round(lon, 3))
+        lon += lon_step
+
+    lats = []
+    lat = south + lat_step / 2
+    while lat < north:
+        lats.append(round(lat, 3))
+        lat += lat_step
+
+    return [(lat, lon) for lat in lats for lon in lons]
+
+
+def fetch_wind_field(west: float, south: float, east: float, north: float, hours: int = 24) -> list[dict]:
+    """
+    Windy-style wind field: an hourly wind speed/direction series for a grid
+    of points across the given viewport bbox, in ONE Open-Meteo request -
+    it natively supports batching many locations by comma-joining their
+    latitude/longitude lists and returns one result object per location, in
+    the same order (confirmed live) - so this costs the same single round
+    trip as fetch_wind_series' one-point version, not one call per grid
+    point. Each point's own `hours` array is later indexed client-side as
+    the map's timeline scrubber moves, exactly like fetch_wind_series'
+    single-point series already is for the fire-spread ellipse - no
+    refetching per hour dragged.
+    """
+    points = _wind_field_grid(west, south, east, north)
+    if not points:
+        return []
+
+    response = httpx.get(
+        OPEN_METEO_URL,
+        params={
+            "latitude": ",".join(str(lat) for lat, _lon in points),
+            "longitude": ",".join(str(lon) for _lat, lon in points),
+            "hourly": "windspeed_10m,winddirection_10m",
+            "forecast_days": 3,
+            "timezone": "UTC",
+        },
+        timeout=20.0,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    # Open-Meteo returns a bare object (not a list) when only one location
+    # ends up being requested - normalize so the zip below always works.
+    results = payload if isinstance(payload, list) else [payload]
+
+    now_hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00")
+    field = []
+    for (lat, lon), location in zip(points, results):
+        hourly = location.get("hourly")
+        if not hourly:
+            continue
+        times = hourly["time"]
+        try:
+            start_idx = times.index(now_hour)
+        except ValueError:
+            start_idx = 0
+        end_idx = min(start_idx + hours, len(times))
+        series = [
+            {
+                "speed_kmh": hourly["windspeed_10m"][i],
+                "direction_from_deg": hourly["winddirection_10m"][i],
+            }
+            for i in range(start_idx, end_idx)
+        ]
+        if series:
+            field.append({"lat": lat, "lon": lon, "hours": series})
+    return field
 
 
 def fetch_fuel_type(lat: float, lon: float) -> dict:
@@ -314,6 +453,7 @@ def _build_ellipse_from_distances(
     back_dist_m: float,
     flank_dist_m: float,
     water_shape: BaseGeometry | None = None,
+    burnt_shape: BaseGeometry | None = None,
     num_points: int = 72,
 ) -> list[list[float]]:
     """
@@ -322,16 +462,26 @@ def _build_ellipse_from_distances(
     (not the center), because the backing fire spreads slower than the
     heading fire. Points returned as [lat, lon].
 
-    When `water_shape` is given (a precomputed shapely geometry - see
-    _water_shape, fetched/built ONCE per prediction, not rebuilt per hour),
-    the raw ellipse is clipped against it via proper polygon difference, not
-    per-vertex radial clipping back toward the origin - the earlier
-    per-vertex approach created spiky sliver artifacts wherever a ray from
-    the origin grazed a thin arm of water (e.g. a river mouth) close to the
-    origin before returning to land further out, since each vertex was
-    pulled back independently with no awareness of its neighbors or the
-    water shape's actual boundary. A real polygon difference follows the
-    true shoreline contour instead.
+    When `water_shape` and/or `burnt_shape` are given (precomputed shapely
+    geometries - see _water_shape/predict_incident_spread, each built ONCE
+    per prediction, not rebuilt per hour), the raw ellipse is clipped
+    against them via proper polygon difference, not per-vertex radial
+    clipping back toward the origin - the earlier per-vertex approach
+    created spiky sliver artifacts wherever a ray from the origin grazed a
+    thin arm of water (e.g. a river mouth) close to the origin before
+    returning to land further out, since each vertex was pulled back
+    independently with no awareness of its neighbors or the clipping
+    shape's actual boundary. A real polygon difference follows the true
+    shoreline/burnt-perimeter contour instead - and, importantly, still
+    lets head_dist_m/back_dist_m/flank_dist_m themselves keep accumulating
+    normally hour over hour (representing the fire's real cumulative push),
+    with only the DRAWN shape trimmed back to whatever's actually new
+    ground. An earlier version tried to freeze the distance accumulators
+    themselves whenever an edge's offset point landed in burnt_shape - that
+    breaks the moment an origin sits anywhere close enough to the burnt
+    extent to be picked as a front at all: the same hourly increment gets
+    added then immediately subtracted back off every single hour, pinning
+    that edge at 0m forever instead of ever propagating outward.
     """
     major_semi_m = (head_dist_m + back_dist_m) / 2
     minor_semi_m = flank_dist_m
@@ -352,7 +502,7 @@ def _build_ellipse_from_distances(
         lon = origin_lon + east_m / (METERS_PER_DEGREE_LAT * math.cos(math.radians(origin_lat)))
         raw_points_lonlat.append((lon, lat))
 
-    if water_shape is None:
+    if water_shape is None and burnt_shape is None:
         points = [[lat, lon] for lon, lat in raw_points_lonlat]
         points.append(points[0])  # close the ring
         return points
@@ -360,11 +510,16 @@ def _build_ellipse_from_distances(
     ellipse_shape = Polygon(raw_points_lonlat)
     if not ellipse_shape.is_valid:
         ellipse_shape = ellipse_shape.buffer(0)
-    clipped = ellipse_shape.difference(water_shape)
+    clipped = ellipse_shape
+    if water_shape is not None:
+        clipped = clipped.difference(water_shape)
+    if burnt_shape is not None:
+        clipped = clipped.difference(burnt_shape)
 
     if clipped.is_empty:
-        # Degenerate edge case (e.g. origin itself sits in water) - fall back
-        # to the unclipped shape rather than returning nothing to draw.
+        # Degenerate edge case (e.g. origin itself sits in water/burnt
+        # ground) - fall back to the unclipped shape rather than returning
+        # nothing to draw.
         points = [[lat, lon] for lon, lat in raw_points_lonlat]
         points.append(points[0])
         return points
@@ -400,7 +555,7 @@ def _hourly_ros(wind_kmh: float, base_ros: float, slope_factor: float) -> dict:
     return {"head": ros_head, "flank": ros_flank, "back": ros_back, "lb_ratio": lb_ratio}
 
 
-def predict_spread(lat: float, lon: float, max_hours: int = 24) -> dict:
+def predict_spread(lat: float, lon: float, max_hours: int = MAX_PREDICTION_HOURS, burnt_shape: BaseGeometry | None = None) -> dict:
     wind_series = fetch_wind_series(lat, lon, max_hours)
     if not wind_series:
         raise RuntimeError("No wind forecast available for this location")
@@ -443,11 +598,18 @@ def predict_spread(lat: float, lon: float, max_hours: int = 24) -> dict:
         wind_kmh = entry["speed_kmh"]
         ros = _hourly_ros(wind_kmh, base_ros, slope_factor)
 
-        # Distances accumulate unconditionally here - water doesn't stop the
-        # fire's "would-be" progress, it just clips where the drawn perimeter
-        # ends up (_build_ellipse_from_distances below). That keeps the
-        # clipping logic in one place instead of special-casing the head
-        # direction's accumulator.
+        # Distances accumulate unconditionally here - neither water nor this
+        # incident's own already-burnt extent stops the fire's "would-be"
+        # progress, they just clip where the drawn perimeter ends up
+        # (_build_ellipse_from_distances below, via burnt_shape). That keeps
+        # the clipping logic in one place instead of special-casing any one
+        # direction's accumulator - an earlier version tried freezing
+        # cum_back_m/cum_head_m/cum_flank_m directly whenever their offset
+        # point landed in burnt_shape, which breaks the moment an origin
+        # sits anywhere near the burnt extent (as a front origin always
+        # does, by construction - see predict_incident_spread): the same
+        # hourly increment gets added then immediately subtracted back off
+        # every hour, pinning that edge at 0m forever.
         cum_head_m += ros["head"] * 60
         cum_back_m += ros["back"] * 60
         cum_flank_m += ros["flank"] * 60
@@ -459,7 +621,7 @@ def predict_spread(lat: float, lon: float, max_hours: int = 24) -> dict:
         avg_bearing_deg = math.degrees(math.atan2(bearing_east, bearing_north)) % 360
 
         polygon = _build_ellipse_from_distances(
-            lat, lon, avg_bearing_deg, cum_head_m, cum_back_m, cum_flank_m, water_shape
+            lat, lon, avg_bearing_deg, cum_head_m, cum_back_m, cum_flank_m, water_shape, burnt_shape
         )
         leading_lat, leading_lon = _offset_point(lat, lon, avg_bearing_deg, cum_head_m)
         head_blocked_by_water = water_shape is not None and water_shape.contains(Point(leading_lon, leading_lat))
@@ -469,6 +631,8 @@ def predict_spread(lat: float, lon: float, max_hours: int = 24) -> dict:
                 "time": entry["time"],
                 "wind_speed_kmh": wind_kmh,
                 "wind_direction_from_deg": entry["direction_from_deg"],
+                "temperature_c": entry["temperature_c"],
+                "humidity_pct": entry["humidity_pct"],
                 "rate_of_spread_m_per_min": {
                     "head": round(ros["head"], 2),
                     "flank": round(ros["flank"], 2),
@@ -492,4 +656,106 @@ def predict_spread(lat: float, lon: float, max_hours: int = 24) -> dict:
             "no un modelo de combustible Rothermel calibrado ni una herramienta operativa de "
             "comportamiento del fuego. No usar para planificar evacuaciones o extinción."
         ),
+    }
+
+
+def _cluster_recent_points(
+    points: list[tuple[float, float]], max_clusters: int = MAX_ACTIVE_FRONTS
+) -> list[tuple[float, float]]:
+    """
+    Greedy proximity clustering of a fire's most recent detections into
+    distinct active fronts - a fire spreading in more than one direction at
+    once (e.g. around an obstacle, or two separate flanks) has more than one
+    leading edge, and a single incident-wide centroid averages them into an
+    origin that may sit on ground that was never actually burning. Returns
+    each cluster's own centroid, largest cluster first, capped at
+    max_clusters so a noisy/fragmented detection set can't explode into
+    dozens of near-duplicate predictions.
+    """
+    remaining = list(points)
+    clusters: list[list[tuple[float, float]]] = []
+    while remaining:
+        seed = remaining.pop()
+        cluster = [seed]
+        still_remaining = []
+        for point in remaining:
+            if math.hypot(point[0] - seed[0], point[1] - seed[1]) <= FRONT_CLUSTER_DEG:
+                cluster.append(point)
+            else:
+                still_remaining.append(point)
+        clusters.append(cluster)
+        remaining = still_remaining
+
+    clusters.sort(key=len, reverse=True)
+    centroids = []
+    for cluster in clusters[:max_clusters]:
+        lat = sum(p[0] for p in cluster) / len(cluster)
+        lon = sum(p[1] for p in cluster) / len(cluster)
+        centroids.append((lat, lon))
+    return centroids
+
+
+def _is_exterior_point(lat: float, lon: float, burnt_shape: BaseGeometry | None) -> bool:
+    """
+    True if (lat, lon) plausibly sits on the fire's actual leading edge -
+    either already outside its known burnt extent entirely, or close enough
+    to the boundary to effectively be part of it - as opposed to a
+    re-detection deep in the fire's already-consumed interior. A large,
+    long-running fire's "most recent" detections are NOT the same thing as
+    its "leading edge" ones: smoldering/re-igniting spots well inside an
+    already-burnt core keep generating fresh satellite hits for weeks
+    (confirmed live: a 6h recent-detection window for one such incident
+    covered ~its entire multi-week footprint, interior included) - picking a
+    front origin from those would start the ellipse deep inside burnt
+    ground instead of at the fire's real edge.
+    """
+    if burnt_shape is None:
+        return True
+    point = Point(lon, lat)
+    if not burnt_shape.contains(point):
+        return True  # already beyond the known burnt extent - unambiguously a leading-edge point
+    return burnt_shape.boundary.distance(point) <= FRONT_BOUNDARY_BUFFER_DEG
+
+
+def predict_incident_spread(
+    burnt_extent_points: list[tuple[float, float]],
+    recent_front_points: list[tuple[float, float]],
+    max_hours: int = MAX_PREDICTION_HOURS,
+) -> dict:
+    """
+    Multi-front, burnt-aware counterpart to predict_spread, built for an
+    actual tracked incident rather than an arbitrary clicked point:
+
+    - Traces the incident's already-burnt extent from ALL of its detections
+      (same concave-hull algorithm as area_estimate.estimate_area_and_hull)
+      and hands it to predict_spread as burnt_shape, so spread into ground
+      with no fuel left gets suppressed on every edge (see predict_spread).
+    - Narrows its MOST RECENT detections (see RECENT_HOTSPOT_WINDOW_HOURS)
+      down to just the ones near/beyond that burnt extent's own boundary
+      (see _is_exterior_point) before clustering into up to
+      MAX_ACTIVE_FRONTS distinct active fronts - a fire's overall centroid,
+      OR a centroid of merely-recent-but-still-interior detections, may be
+      nowhere near where it's actually still advancing.
+    """
+    _area_ha, hull_latlon = estimate_area_and_hull(burnt_extent_points)
+    burnt_shape = None
+    if hull_latlon:
+        burnt_shape = Polygon([(lon, lat) for lat, lon in hull_latlon]).buffer(0)
+
+    exterior_recent_points = [
+        (lat, lon) for lat, lon in recent_front_points if _is_exterior_point(lat, lon, burnt_shape)
+    ]
+    # Falls back to every recent point (interior included) if literally none
+    # of them are near the edge - a worse-than-ideal origin still beats
+    # refusing to predict at all for a fire that's nominally still active.
+    front_origins = _cluster_recent_points(exterior_recent_points or recent_front_points)
+    if not front_origins:
+        raise RuntimeError("No recent detections to predict from")
+
+    return {
+        "fronts": [
+            predict_spread(front_lat, front_lon, max_hours=max_hours, burnt_shape=burnt_shape)
+            for front_lat, front_lon in front_origins
+        ],
+        "burnt_area_hull": hull_latlon,
     }

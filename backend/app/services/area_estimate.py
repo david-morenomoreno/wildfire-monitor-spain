@@ -26,11 +26,11 @@ used in app.js's incident sidebar).
 from __future__ import annotations
 
 import math
-from functools import reduce
 
 import shapely
 from shapely.geometry import Point, Polygon
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 # Below this point count a "hull" is either impossible (need >= 3 points to
 # enclose any area at all) or so thin on data that any polygon traced over it
@@ -82,27 +82,41 @@ def _multipoint_from(points: list[Point]) -> BaseGeometry:
     # from that vectorized construction path on perfectly valid input
     # (confirmed via direct reproduction - same issue already documented in
     # geo_filter.py's _load_spain_shape and fire_spread.py's _water_shape).
-    # A pairwise `.union()` reduce of individual Points works fine and
-    # produces an equivalent MultiPoint.
-    return reduce(lambda a, b: a.union(b), points)
+    # unary_union() takes a different code path (it doesn't construct a
+    # MultiPoint via that broken path, just unions an iterable of existing
+    # geometries via GEOS's cascaded-union tree) - confirmed working AND
+    # confirmed fast in this same container (10k points in ~34ms). A naive
+    # pairwise `.union()` reduce also worked, but is effectively quadratic:
+    # 3000 points took ~1.4s, and the busiest real incident here has 10764
+    # detections - that's what made the rankings endpoint take 11s+/request.
+    return unary_union(points)
 
 
-def estimate_area_ha(points: list[tuple[float, float]]) -> float | None:
+def estimate_area_and_hull(
+    points: list[tuple[float, float]],
+) -> tuple[float | None, list[tuple[float, float]] | None]:
     """
-    Estimates a real-world hectare figure for a fire's extent from its raw
-    (lat, lon) detection points, tracing a concave hull the same way the
-    map's estimateIncidentGrowth() does client-side - for use anywhere
-    (report/rankings endpoints) that can't reach into that client-side JS
-    state.
+    Like estimate_area_ha (see below), but also returns the traced hull's own
+    vertices as (lat, lon) pairs (a closed ring, back-projected out of the
+    local-meters space used to trace it) - for callers that want to actually
+    DRAW the estimated extent (the report page's map) rather than just quote
+    its area. estimate_area_ha itself is a thin wrapper around this that
+    throws the geometry away, for the rankings endpoint's per-incident-in-
+    bulk area math, which never renders anything and shouldn't pay for
+    back-projecting coordinates it won't use.
 
-    Returns None - never a fabricated number - when there aren't enough
-    distinct points to trace a shape, or the shape traced is a
+    Returns (None, None) - never a fabricated shape - when there aren't
+    enough distinct points to trace one, or the shape traced is a
     near-collinear sliver too small to trust as a real extent (see
     MIN_MEANINGFUL_AREA_HA).
     """
     unique_points = list({(lat, lon) for lat, lon in points})
     if len(unique_points) < MIN_POINTS_FOR_HULL:
-        return None
+        return None, None
+
+    lat0 = sum(lat for lat, _lon in unique_points) / len(unique_points)
+    lon0 = sum(lon for _lat, lon in unique_points) / len(unique_points)
+    meters_per_deg_lon = _METERS_PER_DEG_LAT * math.cos(math.radians(lat0))
 
     projected = _project_to_local_meters(unique_points)
     multipoint = _multipoint_from(projected)
@@ -118,9 +132,26 @@ def estimate_area_ha(points: list[tuple[float, float]]) -> float | None:
         hull = multipoint.convex_hull
 
     if not isinstance(hull, Polygon) or hull.is_empty:
-        return None  # degenerate/collinear input - no meaningful shape to report
+        return None, None  # degenerate/collinear input - no meaningful shape to report
 
     area_ha = hull.area / 10_000  # m^2 -> ha
     if area_ha < MIN_MEANINGFUL_AREA_HA:
-        return None
+        return None, None
+
+    hull_latlon = [
+        (lat0 + y / _METERS_PER_DEG_LAT, lon0 + x / meters_per_deg_lon) for x, y in hull.exterior.coords
+    ]
+    return area_ha, hull_latlon
+
+
+def estimate_area_ha(points: list[tuple[float, float]]) -> float | None:
+    """
+    Estimates a real-world hectare figure for a fire's extent from its raw
+    (lat, lon) detection points, tracing a concave hull the same way the
+    map's estimateIncidentGrowth() does client-side - for use anywhere
+    (report/rankings endpoints) that can't reach into that client-side JS
+    state. See estimate_area_and_hull if the caller also needs the shape
+    itself, not just its area.
+    """
+    area_ha, _hull = estimate_area_and_hull(points)
     return area_ha

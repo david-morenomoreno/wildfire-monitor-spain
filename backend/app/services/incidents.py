@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
@@ -337,8 +337,46 @@ def rebuild_incidents(db: Session) -> int:
             touched += 1
             continue
 
+        # Detections actually new since this incident's LAST rebuild pass are
+        # whichever rows in `group` were ingested after that pass ran
+        # (match.updated_at gets bumped to `now` at the bottom of this branch
+        # every pass, so its pre-update value is exactly that cutoff) - not
+        # just "however many more there are than last time" via
+        # detection_count math. That distinction matters because a single
+        # batch can legitimately span several calendar days (a coverage gap
+        # followed by resumed satellite passes, or a backfill), and stamping
+        # the whole batch under one occurred_at (previously last_detected_at,
+        # the batch's NEWEST acquisition) silently collapsed every earlier
+        # day in that same batch onto the newest one - a real fire's actual
+        # multi-day ramp-up read as "zero detections" on those earlier days
+        # in the frontend's per-day chart, then one big false spike.
+        previous_updated_at = match.updated_at
+        new_group_detections = [d for d in group if d.ingested_at > previous_updated_at]
         new_detections = detection_count - match.detection_count
-        if new_detections > 0:
+        if new_group_detections:
+            counts_by_day: dict[date, int] = {}
+            for d in new_group_detections:
+                day = d.acquired_at.date()
+                counts_by_day[day] = counts_by_day.get(day, 0) + 1
+            for day in sorted(counts_by_day):
+                # End-of-day timestamp (capped at last_detected_at so it never
+                # sorts after the incident's own last-known detection) - we
+                # only know the day-level total from this batch, not each
+                # detection's individual time within it.
+                occurred_at = min(datetime.combine(day, time(23, 59, 59)), last_detected_at)
+                db.add(
+                    IncidentEvent(
+                        incident_id=match.id,
+                        occurred_at=occurred_at,
+                        event_type="detection",
+                        source="system",
+                        title=f"{counts_by_day[day]} detección(es) nueva(s)",
+                    )
+                )
+        elif new_detections > 0:
+            # Fallback for the (should-be-impossible) case where detection_count
+            # grew without any row showing up as newly-ingested - keeps the old,
+            # single-event behavior rather than silently dropping the event.
             db.add(
                 IncidentEvent(
                     incident_id=match.id,

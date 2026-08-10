@@ -190,20 +190,6 @@ async function loadSources() {
 
 document.getElementById("source-search").addEventListener("input", applySearchFilter);
 
-(function initThemeToggle() {
-  const btn = document.getElementById("theme-toggle");
-  const applyIcon = (theme) => {
-    btn.textContent = theme === "light" ? "☀️" : "🌙";
-    btn.title = theme === "light" ? "Cambiar a modo oscuro" : "Cambiar a modo claro";
-  };
-  applyIcon(document.documentElement.dataset.theme || "dark");
-  btn.addEventListener("click", () => {
-    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    document.documentElement.dataset.theme = next;
-    localStorage.setItem("wm-theme", next);
-    applyIcon(next);
-  });
-})();
 
 (async function init() {
   await loadConfig();
