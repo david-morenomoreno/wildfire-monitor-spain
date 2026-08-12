@@ -43,10 +43,14 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 20
-      start_period: 30s
+      # on_startup (app/main.py) runs rebuild_incidents synchronously before
+      # uvicorn ever opens the port - confirmed live on the VPS taking ~165s
+      # over the current fire_detections table, so retries*interval alone
+      # needs real headroom above that, not just enough to notice a crash.
+      retries: 30
+      start_period: 60s
 
   frontend:
     build: ./frontend
