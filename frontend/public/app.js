@@ -1319,8 +1319,18 @@ function renderMap() {
   incidentEstimatesById.clear();
   const hours = getSelectedDays() * 24;
 
+  // While an incident's detail view is open, its own detections always show
+  // in full (see selectedIncidentDetections) - only OTHER fires still obey
+  // the scrubber/date-range filter. Deduped by id since lastFires can
+  // already contain some of the same rows when they fall inside the
+  // current filter window.
+  const filteredFires = scrubberFilteredFires(lastFires);
+  const visibleFires = selectedIncidentDetections.length
+    ? [...filteredFires, ...selectedIncidentDetections.filter((d) => !filteredFires.some((f) => f.id === d.id))]
+    : filteredFires;
+
   const pointFires = [];
-  scrubberFilteredFires(lastFires).forEach((fire) => {
+  visibleFires.forEach((fire) => {
     let geometry = null;
     if (fire.geometry_geojson) {
       try {
@@ -1945,6 +1955,62 @@ function satelliteCarouselHtml(events) {
   );
 }
 
+const DETECTION_SOURCE_LABELS = { FIRMS: "NASA FIRMS", EFFIS: "EFFIS", EUMETSAT: "EUMETSAT", SENTINEL3: "Sentinel-3" };
+
+// Fetches this incident's FULL, unfiltered detection set (see
+// selectedIncidentDetections) and uses it for two things: letting the map
+// always show every one of this fire's points regardless of the date-range
+// filter/scrubber, and answering "when did we last actually hear from
+// FIRMS/EUMETSAT/etc. about THIS fire" - a per-source freshness line the
+// global filter can't answer since it only knows about whatever's currently
+// loaded map-wide.
+async function loadIncidentDetections(incident) {
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/incidents/${incident.id}/detections`);
+    const detections = await res.json();
+    // Stale guard: the user may have gone back to the list, or opened a
+    // different incident, before this network round-trip resolved.
+    if (predictionIncident !== incident) return;
+    selectedIncidentDetections = detections;
+
+    const lastBySource = new Map();
+    detections.forEach((d) => {
+      const prev = lastBySource.get(d.source);
+      if (!prev || new Date(d.acquired_at) > new Date(prev)) lastBySource.set(d.source, d.acquired_at);
+    });
+    const slot = document.getElementById("source-freshness-slot");
+    if (slot) {
+      slot.innerHTML = lastBySource.size
+        ? `<div class="source-freshness">` +
+          Array.from(lastBySource.entries())
+            .map(([source, at]) => `<span>${DETECTION_SOURCE_LABELS[source] || source}: ${relativeTime(at)}</span>`)
+            .join("") +
+          `</div>`
+        : "";
+    }
+
+    if (!detections.length) {
+      renderMap();
+      return;
+    }
+    // The scrubber's start bound/label described the map's global
+    // date-range window (e.g. "last 14 days"), not this fire - now that its
+    // own full history is loaded, describe THAT instead. Re-syncing the
+    // range's value to the (possibly shifted) "Ahora" fraction, then
+    // re-running onScrubberInput, keeps it consistent with whatever
+    // enableIncidentPrediction already set it to against the OLD bounds
+    // (and re-renders the map in the process, so no separate call needed).
+    scrubberBounds = { startMs: new Date(detections[0].acquired_at).getTime(), endMs: Date.now() };
+    document.getElementById("scrubber-label-start").textContent = new Date(
+      scrubberBounds.startMs
+    ).toLocaleString("es-ES", SCRUBBER_DATE_FORMAT);
+    document.getElementById("scrubber-range").value = scrubberNowFraction();
+    onScrubberInput();
+  } catch {
+    // Best-effort - the detail view already has plenty to show without this.
+  }
+}
+
 async function showIncidentDetail(incident) {
   map.flyTo([incident.centroid_lat, incident.centroid_lon], Math.max(map.getZoom(), 11));
 
@@ -1963,6 +2029,8 @@ async function showIncidentDetail(incident) {
     document.getElementById("filter-bar").classList.remove("filter-bar-hidden");
     document.getElementById("summary-bar").classList.remove("summary-bar-hidden");
     disableIncidentPrediction();
+    selectedIncidentDetections = [];
+    initTimelineScrubber(lastFires); // restores the normal date-range-filtered bounds/label
     refreshIncidentList();
   });
 
@@ -2005,6 +2073,7 @@ async function showIncidentDetail(incident) {
       : `<div class="incident-metric-value" style="font-size:15px;">${relativeTime(incident.last_detected_at)}</div><div class="incident-metric-label">Última actualización</div>`) +
     `</div>` +
     `</div>` +
+    `<div id="source-freshness-slot"></div>` +
     // Placeholder - filled in once the full-history timeline loads below.
     // The old version rendered this synchronously from `growth.timestamps`
     // (only whatever's currently loaded on the map under the active
@@ -2042,6 +2111,7 @@ async function showIncidentDetail(incident) {
   // Fire-and-forget, same pattern as the map popup's async sections - each
   // slot fills in independently as its own fetch resolves, instead of
   // blocking the whole detail card on the slowest of the three.
+  loadIncidentDetections(incident);
   getRegionalStatus(incident.id).then((records) => {
     const html = regionalSectionHtml(records);
     document.getElementById("regional-status-slot").innerHTML = html ? `<div class="priority-card">${html}</div>` : "";
@@ -2271,6 +2341,13 @@ let scrubberPlayTimer = null;
 let scrubberFutureMs = 0; // 0 unless a prediction is active (see enableIncidentPrediction)
 let scrubberFutureHours = 0;
 let predictionIncident = null; // the incident the active forecast belongs to, or null
+// This incident's own detections (see /api/incidents/{id}/detections), fetched with NO
+// hours/date-range restriction - unlike lastFires. Non-empty only while an incident's
+// detail view is open. Lets that incident always show its FULL history on the map
+// regardless of the date-range filter/scrubber position (see scrubberFilteredFires and
+// showIncidentDetail) - the thing being viewed shouldn't disappear just because the
+// global filter/scrubber has moved past its own detections.
+let selectedIncidentDetections = [];
 
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();

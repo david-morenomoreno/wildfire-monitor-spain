@@ -15,6 +15,7 @@ from app.models import (
     TelegramMessage,
 )
 from app.schemas import (
+    FireDetectionOut,
     FireIncidentOut,
     IncidentDetectionSourceCount,
     IncidentEventOut,
@@ -107,7 +108,7 @@ def _dedupe_by_place(incidents: list[FireIncident]) -> list[FireIncident]:
     return list(best.values())
 
 
-def _detections_near_incident(db: Session, incident: FireIncident) -> list[tuple[str, float, float]]:
+def _detection_rows_near_incident(db: Session, incident: FireIncident) -> list[FireDetection]:
     """
     FireDetection rows aren't foreign-keyed to a FireIncident - incidents are
     built by re-clustering raw detections by proximity on every scheduler
@@ -117,9 +118,10 @@ def _detections_near_incident(db: Session, incident: FireIncident) -> list[tuple
     itself uses for cluster membership) against the incident's own centroid
     and active window. It's best-effort, not an authoritative stored set -
     two incidents whose windows/areas overlap could double-count a
-    detection. Shared by both _detection_source_breakdown (which source) and
-    _estimate_incident_area_and_hull (spatial extent/shape) so they don't
-    each re-run the query independently.
+    detection. Shared by _detection_source_breakdown (which source),
+    _estimate_incident_area_and_hull (spatial extent/shape), and the
+    /detections endpoint (full points for the map, ignoring the global date
+    filter) so they don't each re-run the query independently.
     """
     window_start = incident.first_detected_at - timedelta(hours=1)
     window_end = incident.last_detected_at + timedelta(hours=1)
@@ -129,7 +131,7 @@ def _detections_near_incident(db: Session, incident: FireIncident) -> list[tuple
     # Python - the exact circular distance check below still applies on top,
     # since a square box is only an approximation of the real radius.
     candidates = (
-        db.query(FireDetection.source, FireDetection.latitude, FireDetection.longitude)
+        db.query(FireDetection)
         .filter(
             FireDetection.acquired_at >= window_start,
             FireDetection.acquired_at <= window_end,
@@ -141,11 +143,16 @@ def _detections_near_incident(db: Session, incident: FireIncident) -> list[tuple
         .all()
     )
     return [
-        (source, lat, lon)
-        for source, lat, lon in candidates
-        if ((lat - incident.centroid_lat) ** 2 + (lon - incident.centroid_lon) ** 2) ** 0.5
+        row
+        for row in candidates
+        if ((row.latitude - incident.centroid_lat) ** 2 + (row.longitude - incident.centroid_lon) ** 2) ** 0.5
         <= INCIDENT_REASSOCIATION_DEG
     ]
+
+
+def _detections_near_incident(db: Session, incident: FireIncident) -> list[tuple[str, float, float]]:
+    """Thin (source, lat, lon) view over _detection_rows_near_incident for callers that don't need full rows."""
+    return [(row.source, row.latitude, row.longitude) for row in _detection_rows_near_incident(db, incident)]
 
 
 def _detection_source_breakdown(db: Session, incident: FireIncident) -> list[IncidentDetectionSourceCount]:
@@ -309,6 +316,23 @@ def get_incident_timeline(
         since = datetime.utcnow() - timedelta(hours=hours)
         query = query.filter(IncidentEvent.occurred_at >= since)
     return query.order_by(IncidentEvent.occurred_at.asc()).all()
+
+
+@router.get("/{incident_id}/detections", response_model=list[FireDetectionOut])
+def get_incident_detections(incident_id: int, db: Session = Depends(get_db)):
+    """
+    Every raw detection tied to this incident (see _detection_rows_near_incident),
+    with NO hours/date-range restriction - unlike /api/fires, which the map
+    filters by the global date-range selector. The map's detail view uses
+    this to always show a fire's complete history regardless of that filter,
+    and to report each source's (FIRMS/EFFIS/EUMETSAT/Sentinel-3) most recent
+    detection for this specific fire.
+    """
+    incident = db.query(FireIncident).filter(FireIncident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    rows = _detection_rows_near_incident(db, incident)
+    return sorted(rows, key=lambda row: row.acquired_at)
 
 
 @router.get("/{incident_id}/vegetation", response_model=Optional[IncidentVegetationOut])

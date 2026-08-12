@@ -920,6 +920,28 @@
       color: var(--text-muted);
     }
 
+    .source-freshness {
+      margin-top: 10px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-size: 10.5px;
+      color: var(--text-muted);
+    }
+    .source-freshness span {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .source-freshness span::before {
+      content: "";
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      flex-shrink: 0;
+    }
+
     .sparkline-wrap { margin-top: 14px; }
     .sparkline-label {
       font-size: 10px;
