@@ -14,7 +14,23 @@ const BACKEND_INTERNAL_URL = process.env.BACKEND_INTERNAL_URL || "http://backend
 
 app.use(
   ["/api", "/media"],
-  createProxyMiddleware({ target: BACKEND_INTERNAL_URL, changeOrigin: true })
+  createProxyMiddleware({
+    target: BACKEND_INTERNAL_URL,
+    changeOrigin: true,
+    // Default error handler responds with a plain-text "Error occurred while
+    // trying to proxy: ..." body - every page that does response.json() on
+    // an /api call (sources.html, app.js, ranking.js) then crashes on
+    // "Unexpected token 'E' ... is not valid JSON" instead of showing what
+    // actually went wrong (backend unreachable/restarting). JSON here lets
+    // callers show a real message instead.
+    onError: (err, req, res) => {
+      console.error(`Proxy error reaching backend (${BACKEND_INTERNAL_URL}):`, err.message);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+      }
+      res.end(JSON.stringify({ error: "backend_unreachable", detail: err.message }));
+    },
+  })
 );
 
 app.use(express.static(path.join(__dirname, "public")));
