@@ -143,7 +143,7 @@ const RECENCY_LEGEND = [
   // detections that matter most for "where is the active front right now",
   // so they need to visually punch through the rest of the pack, not just
   // sit as another shade in the red family.
-  { maxHours: 6, color: "#ff0000", label: "< 6 h" },
+  { maxHours: 6, color: "#99000D", label: "< 6 h" },
   { maxHours: 12, color: "#ef4444", label: "6-12 h" },
   { maxHours: 24, color: "#f97316", label: "12-24 h" },
   { maxHours: 48, color: "#eab308", label: "24-48 h" },
