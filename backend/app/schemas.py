@@ -1,7 +1,25 @@
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Annotated, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PlainSerializer
+
+
+def _utc_iso(dt: datetime) -> str:
+    """
+    Every datetime this app stores is a naive UTC instant (datetime.utcnow()
+    throughout the ingestion code), but naive datetime.isoformat() has no
+    timezone marker - the frontend's `new Date(...)` then parses it as LOCAL
+    time, not UTC, silently shifting every displayed timestamp by the
+    browser's UTC offset (confirmed live: ~2h off in Madrid's CEST). This
+    marks the value as UTC explicitly at the serialization boundary, with no
+    DB/column changes needed since the underlying instant was always UTC.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+UTCDatetime = Annotated[datetime, PlainSerializer(_utc_iso, return_type=str)]
 
 
 class FireDetectionOut(BaseModel):
@@ -13,7 +31,7 @@ class FireDetectionOut(BaseModel):
     longitude: float
     confidence: Optional[str] = None
     brightness: Optional[float] = None
-    acquired_at: datetime
+    acquired_at: UTCDatetime
     geometry_geojson: Optional[str] = None
     area_ha: Optional[float] = None
 
@@ -45,9 +63,9 @@ class FireIncidentOut(BaseModel):
     # endpoints only (see routers/incidents.py); other endpoints leave it
     # None rather than pay for the extra query on every list/detail call.
     area_ha_estimated: Optional[float] = None
-    first_detected_at: datetime
-    last_detected_at: datetime
-    updated_at: datetime
+    first_detected_at: UTCDatetime
+    last_detected_at: UTCDatetime
+    updated_at: UTCDatetime
     # Computed in the router (not real columns) from IncidentEvent event
     # types present for this incident, so the frontend can filter "satellite
     # only" vs "has official status" vs "has Telegram mentions" without a
@@ -88,7 +106,7 @@ class IncidentEventOut(BaseModel):
 
     id: int
     incident_id: int
-    occurred_at: datetime
+    occurred_at: UTCDatetime
     event_type: str
     source: Optional[str] = None
     title: str
@@ -113,8 +131,8 @@ class AdminBulletinOut(BaseModel):
     title: str
     file_url: str
     file_type: str
-    fetched_at: datetime
-    parsed_at: Optional[datetime] = None
+    fetched_at: UTCDatetime
+    parsed_at: Optional[UTCDatetime] = None
     row_count: Optional[int] = None
 
 
@@ -126,7 +144,7 @@ class TelegramChannelOut(BaseModel):
     display_name: Optional[str] = None
     last_message_id: int
     is_active: bool
-    added_at: datetime
+    added_at: UTCDatetime
 
 
 class TelegramChannelCreate(BaseModel):
@@ -140,7 +158,7 @@ class TelegramMessageOut(BaseModel):
     id: int
     channel_id: int
     message_id: int
-    posted_at: datetime
+    posted_at: UTCDatetime
     text: Optional[str] = None
     media_path: Optional[str] = None
     matched_incident_id: Optional[int] = None
@@ -153,11 +171,11 @@ class SatelliteSceneOut(BaseModel):
     incident_id: int
     collection: str
     scene_id: str
-    captured_at: datetime
+    captured_at: UTCDatetime
     cloud_cover: Optional[float] = None
     thumbnail_url: Optional[str] = None
     item_url: Optional[str] = None
-    discovered_at: datetime
+    discovered_at: UTCDatetime
 
 
 class RegionalIncidentSourceOut(BaseModel):
@@ -180,14 +198,14 @@ class RegionalIncidentOut(BaseModel):
     province: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    started_at: Optional[datetime] = None
-    controlled_at: Optional[datetime] = None
-    extinguished_at: Optional[datetime] = None
+    started_at: Optional[UTCDatetime] = None
+    controlled_at: Optional[UTCDatetime] = None
+    extinguished_at: Optional[UTCDatetime] = None
     area_ha: Optional[float] = None
     cause: Optional[str] = None
     personnel_summary: Optional[str] = None
     matched_incident_id: Optional[int] = None
-    updated_at: datetime
+    updated_at: UTCDatetime
 
 
 class IncidentDetectionSourceCount(BaseModel):
@@ -265,7 +283,21 @@ class WebcamOut(BaseModel):
     latitude: float
     longitude: float
     image_url: str
-    updated_at: datetime
+    updated_at: UTCDatetime
+
+
+class AircraftOut(BaseModel):
+    # Not `from_attributes` - services/aircraft.py returns plain dicts (live,
+    # never persisted), same as fetch_windy_webcams' WebcamOut-shaped dicts.
+    hex: Optional[str] = None
+    flight: Optional[str] = None
+    aircraft_type: Optional[str] = None
+    altitude_ft: Optional[float] = None
+    ground_speed_kt: Optional[float] = None
+    track_deg: Optional[float] = None
+    latitude: float
+    longitude: float
+    category: Optional[str] = None
 
 
 class UserReportCreate(BaseModel):
@@ -287,5 +319,5 @@ class UserReportOut(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     image_path: Optional[str] = None
-    reported_at: datetime
+    reported_at: UTCDatetime
     notes: Optional[str] = None

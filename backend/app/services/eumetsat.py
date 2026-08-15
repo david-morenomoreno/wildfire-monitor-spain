@@ -257,7 +257,7 @@ def ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime | 
     """
     state.mark_attempt("eumetsat")
     try:
-        count = _ingest_eumetsat(db, start=start, end=end)
+        count, new_count = _ingest_eumetsat(db, start=start, end=end)
     except Exception as exc:
         # Roll back first - a DB-level failure (e.g. a constraint violation
         # mid-insert) leaves the session's transaction aborted, and
@@ -268,14 +268,15 @@ def ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime | 
         db.rollback()
         record_check(db, "eumetsat", "disrupted", str(exc))
         raise
-    record_check(db, "eumetsat", "ok", f"{count} fire pixels processed")
+    record_check(db, "eumetsat", "ok", f"{count} fire pixels processed", rows_written=new_count)
     return count
 
 
-def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime | None = None) -> int:
+def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime | None = None) -> tuple[int, int]:
+    """Returns (pixels processed, pixels genuinely newly inserted - see record_check)."""
     if not is_configured():
         record_check(db, "eumetsat", "skipped", "consumer_key/consumer_secret not configured")
-        return 0
+        return 0, 0
 
     if end is None:
         end = datetime.utcnow()
@@ -298,6 +299,7 @@ def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime |
         )
 
     count = 0
+    new_count = 0
     skipped_outside_spain = 0
     skipped_over_water = 0
     for feature in features:
@@ -354,8 +356,9 @@ def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime |
                 )
                 .on_conflict_do_nothing(constraint="uq_source_external_id")
             )
-            db.execute(stmt)
+            result = db.execute(stmt)
             count += 1
+            new_count += result.rowcount
 
     if skipped_outside_spain:
         logger.info(
@@ -365,4 +368,4 @@ def _ingest_eumetsat(db: Session, start: datetime | None = None, end: datetime |
     if skipped_over_water:
         logger.info("Skipped %d EUMETSAT fire pixel(s) landing inside a real water body (likely sensor false positive)", skipped_over_water)
     db.commit()
-    return count
+    return count, new_count

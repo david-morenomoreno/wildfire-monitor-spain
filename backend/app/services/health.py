@@ -11,13 +11,25 @@ from app.models import SourceCheck
 _SEVERITY = {"ok": 0, "skipped": 1, "degraded": 2, "disrupted": 3}
 
 
-def record_check(db: Session, source_key: str, status: str, message: str | None = None) -> None:
+def record_check(
+    db: Session, source_key: str, status: str, message: str | None = None, rows_written: int | None = None
+) -> None:
+    """
+    rows_written is the count of GENUINELY NEW rows this check wrote - not
+    just rows re-fetched/re-seen (most ingestion sources upsert with
+    ON CONFLICT DO NOTHING, so a re-polled, already-known row still gets
+    "processed" without being new). Leave it None for skipped/disrupted
+    checks where nothing was attempted, or 0 when the fetch succeeded but
+    found nothing new. Powers GET /api/sources' last_data_at, distinct from
+    "last successfully checked at all" - see routers/sources.py.
+    """
     db.add(
         SourceCheck(
             source_key=source_key,
             status=status,
             message=message[:1000] if message else None,
             checked_at=datetime.utcnow(),
+            rows_written=rows_written,
         )
     )
     db.commit()

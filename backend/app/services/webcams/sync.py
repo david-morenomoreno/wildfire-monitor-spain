@@ -33,9 +33,11 @@ def sync_source(db: Session, source_key: str) -> int:
     }
 
     now = datetime.utcnow()
+    new_count = 0
     for record in records:
         row = existing.get(record.external_id)
         if row is None:
+            new_count += 1
             db.add(
                 Webcam(
                     source=source_key,
@@ -59,7 +61,7 @@ def sync_source(db: Session, source_key: str) -> int:
             row.updated_at = now
 
     db.commit()
-    record_check(db, f"webcams:{source_key}", "ok", f"{len(records)} cameras")
+    record_check(db, f"webcams:{source_key}", "ok", f"{len(records)} cameras", rows_written=new_count)
     return len(records)
 
 

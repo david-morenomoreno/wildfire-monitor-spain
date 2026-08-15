@@ -25,6 +25,19 @@ const topoLayer = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
 let currentBaseLayer = positronLayer;
 currentBaseLayer.addTo(map);
 
+// SIGPAC parcel boundaries (FEGA's official WMS, free/no key, confirmed
+// live) - meaningless/visually noisy at anything but a close zoom, so
+// minZoom keeps Leaflet from even requesting tiles until it'd actually be
+// readable, matching how fuegoscyl.es gates the same layer.
+const sigpacLayer = L.tileLayer.wms("https://sigpac-hubcloud.es/wms/ows", {
+  layers: "AU.Sigpac:recinto",
+  format: "image/png",
+  transparent: true,
+  version: "1.3.0",
+  minZoom: 15,
+  attribution: "SIGPAC / FEGA",
+});
+
 // Explicit panes so stacking order is guaranteed by z-index, not by DOM
 // insertion order. Without this, the hull polygon (SVG) and hotspot dots
 // (canvas) both land in Leaflet's shared default overlayPane, and whichever
@@ -36,10 +49,16 @@ map.createPane("hotspotPane").style.zIndex = 450; // above overlayPane, below sh
 
 const markersLayer = L.layerGroup().addTo(map);
 const webcamsLayer = L.layerGroup();
+const aircraftLayer = L.layerGroup();
 const windLayer = L.layerGroup().addTo(map);
 // Windy-style arrow field (many points, not just one per active incident -
 // see windLayer above) for the current viewport - see reloadWindField.
 const windFieldLayer = L.layerGroup().addTo(map);
+// Cumulative EFFIS burnt-area extent since Jan 1 of the current year -
+// deliberately independent of the date-range selector/timeline scrubber
+// (see reloadSeasonBurntArea): this answers "how much has burned this
+// campaign", not "what's active right now".
+const seasonBurntAreaLayer = L.layerGroup();
 
 // Shared canvas renderer for hotspot dots. Leaflet's default SVG renderer
 // creates one DOM node per circleMarker, which starts to choke once you get
@@ -93,6 +112,59 @@ function setBasemapStyle(style) {
   if (!satelliteShowing) map.removeLayer(currentBaseLayer);
   currentBaseLayer = nextLayer;
   if (!satelliteShowing) currentBaseLayer.addTo(map);
+}
+
+// Fetched once per toggle-on, not re-fetched on pan/zoom/scrubber move -
+// burnt-area polygons don't move, and this layer is intentionally scoped to
+// "this campaign" rather than whatever window the map's date-range selector
+// happens to be on (see seasonBurntAreaLayer above).
+async function reloadSeasonBurntArea() {
+  seasonBurntAreaLayer.clearLayers();
+  const jan1 = new Date(Date.UTC(new Date().getUTCFullYear(), 0, 1));
+  const hoursSinceJan1 = Math.ceil((Date.now() - jan1.getTime()) / 3600000);
+  const res = await fetch(`${apiBaseUrl}/api/fires?source=EFFIS&hours=${hoursSinceJan1}`);
+  if (!res.ok) return;
+  const fires = await res.json();
+  fires.forEach((fire) => {
+    if (!fire.geometry_geojson) return;
+    let geometry;
+    try {
+      geometry = JSON.parse(fire.geometry_geojson);
+    } catch {
+      return;
+    }
+    if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") return;
+    const popupHtml =
+      `<div class="card-title">Área quemada (campaña)</div>` +
+      `<div class="card-meta">Detectado &nbsp;${fire.acquired_at}<br/>` +
+      (fire.area_ha != null ? `Área afectada &nbsp;${fire.area_ha.toLocaleString()} ha` : "") +
+      `</div>`;
+    // Same flat muted-fill convention as the incident hull polygons
+    // (see drawHullShape in renderMap()) - this represents cumulative
+    // extent, not per-point recency, so it deliberately doesn't use
+    // recencyColor() the way the in-window EFFIS polygons do.
+    L.geoJSON(geometry, {
+      style: { color: POLYGON_OUTLINE, weight: 2, fillColor: "#8a8577", fillOpacity: 0.14 },
+    })
+      .bindPopup(popupHtml)
+      .addTo(seasonBurntAreaLayer);
+  });
+}
+
+function toggleSigpacLayer() {
+  const toggle = document.getElementById("sigpac-toggle");
+  if (toggle.checked) sigpacLayer.addTo(map);
+  else map.removeLayer(sigpacLayer);
+}
+
+function toggleSeasonBurntAreaLayer() {
+  const toggle = document.getElementById("season-burnt-area-toggle");
+  if (toggle.checked) {
+    seasonBurntAreaLayer.addTo(map);
+    reloadSeasonBurntArea();
+  } else {
+    map.removeLayer(seasonBurntAreaLayer);
+  }
 }
 
 // Data source (FIRMS/EFFIS/satellite instrument) is intentionally not shown -
@@ -1027,9 +1099,30 @@ function vegetationSectionHtml(stats) {
 // temperature/humidity ride along on that same request/response
 // (fetch_wind_series, backend/app/services/fire_spread.py), not a second
 // weather source, so this never needs its own network call.
-function weatherSectionHtml(hour) {
+function weatherSectionHtml(hour, airQuality) {
   if (!hour) return "";
   const windArrow = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${hour.wind_direction_from_deg}deg);"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg>`;
+  // 120m/CAPE/VPD/etc. are additive extras from fetch_wind_series - guarded
+  // individually since older cached prediction responses (or a future
+  // upstream Open-Meteo hiccup on just one field) may not carry all of them.
+  const extraItems = [
+    hour.wind_120m_speed_kmh != null
+      ? `<span class="weather-item">🌬️ ${Math.round(hour.wind_120m_speed_kmh)} km/h a 120m</span>`
+      : "",
+    hour.cloudcover_pct != null ? `<span class="weather-item">☁️ ${Math.round(hour.cloudcover_pct)}% nubes</span>` : "",
+    hour.precipitation_mm != null ? `<span class="weather-item">🌧️ ${hour.precipitation_mm.toFixed(1)} mm</span>` : "",
+    hour.solar_radiation_wm2 != null
+      ? `<span class="weather-item">☀️ ${Math.round(hour.solar_radiation_wm2)} W/m²</span>`
+      : "",
+    hour.vapor_pressure_deficit_kpa != null
+      ? `<span class="weather-item">🍃 VPD ${hour.vapor_pressure_deficit_kpa.toFixed(1)} kPa</span>`
+      : "",
+    hour.cape_jkg != null ? `<span class="weather-item">⚡ CAPE ${Math.round(hour.cape_jkg)} J/kg</span>` : "",
+    hour.wet_bulb_c != null ? `<span class="weather-item">🌡️💧 ${hour.wet_bulb_c}°C bulbo húmedo</span>` : "",
+    airQuality?.european_aqi != null ? `<span class="weather-item">🫁 AQI ${Math.round(airQuality.european_aqi)}</span>` : "",
+  ]
+    .filter(Boolean)
+    .join("");
   return (
     `<div class="weather-card">` +
     `<div class="weather-card-title">Previsión ahora</div>` +
@@ -1038,6 +1131,7 @@ function weatherSectionHtml(hour) {
     `<span class="weather-item">🌡️ ${Math.round(hour.temperature_c)}°C</span>` +
     `<span class="weather-item">💧 ${Math.round(hour.humidity_pct)}% hum.</span>` +
     `</div>` +
+    (extraItems ? `<div class="weather-row">${extraItems}</div>` : "") +
     `</div>`
   );
 }
@@ -2218,6 +2312,7 @@ async function loadFires() {
     // on a handful of extra network round-trips (one per active incident)
     // and shouldn't block the map's first paint.
     refreshWindVectors(lastIncidents);
+    updateSatelliteFreshness();
   } catch (err) {
     setStatus(`No se pudieron cargar los datos: ${err.message}`);
   }
@@ -2317,6 +2412,27 @@ function updateSummaryBar(incidents, resolvedWinds) {
     windEl.textContent = `${Math.round(avgSpeed)} km/h`;
   } else {
     windEl.textContent = "–";
+  }
+}
+
+// Most recent time any satellite source (FIRMS/EFFIS/EUMETSAT/Sentinel-3)
+// actually wrote genuinely NEW data - see GET /api/sources' last_data_at
+// (routers/sources.py), which distinguishes "checked" from "found something
+// new" the same way this bar's other stats reflect real fire state, not just
+// "the backend polled recently".
+async function updateSatelliteFreshness() {
+  const el = document.getElementById("summary-satellite");
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/sources`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const sources = await res.json();
+    const latest = sources
+      .filter((s) => s.category === "satellite" && s.last_data_at)
+      .map((s) => new Date(s.last_data_at).getTime())
+      .reduce((max, t) => Math.max(max, t), 0);
+    el.textContent = latest ? relativeTime(new Date(latest).toISOString()) : "–";
+  } catch {
+    el.textContent = "–";
   }
 }
 
@@ -2542,7 +2658,7 @@ async function enableIncidentPrediction(incident) {
     incidentFireSpreadData = data;
     const firstFront = data.fronts[0];
     const weatherSlot = document.getElementById("weather-slot");
-    if (weatherSlot && firstFront) weatherSlot.innerHTML = weatherSectionHtml(firstFront.hourly[0]);
+    if (weatherSlot && firstFront) weatherSlot.innerHTML = weatherSectionHtml(firstFront.hourly[0], firstFront.air_quality);
     scrubberFutureHours = firstFront ? firstFront.hourly.length : 0;
     scrubberFutureMs = scrubberFutureHours * 3600000;
     updateScrubberEndLabel();
@@ -2755,6 +2871,68 @@ function toggleWebcamsLayer() {
   }
 }
 
+// ---------- ADS-B aircraft (adsb.lol) ----------
+// Live per-viewport layer, same shape as the webcams layer above - never
+// persisted, refetched on toggle-on and on every pan/zoom (see the
+// map.on("moveend", ...) wiring near the bottom of this file).
+function aircraftIcon(trackDeg) {
+  const rotation = trackDeg != null ? trackDeg : 0;
+  return L.divIcon({
+    className: "",
+    html:
+      `<div style="transform:rotate(${rotation}deg);">` +
+      `<svg viewBox="0 0 24 24" width="16" height="16" fill="#0ea5e9" stroke="#1e293b" stroke-width="0.8"><path d="M12 2l2 6 7 3v2l-7-1v5l3 2v2l-5-1.5L7 22v-2l3-2v-5l-7 1v-2l7-3z"/></svg>` +
+      `</div>`,
+    iconSize: [18, 18],
+    iconAnchor: [9, 9],
+  });
+}
+
+function aircraftPopupHtml(ac) {
+  const parts = [
+    ac.flight ? `<div class="card-title">✈️ ${ac.flight}</div>` : `<div class="card-title">✈️ ${ac.hex || "Aeronave"}</div>`,
+    `<div class="card-meta">` +
+      [
+        ac.aircraft_type,
+        ac.altitude_ft != null ? `${Math.round(ac.altitude_ft).toLocaleString()} ft` : null,
+        ac.ground_speed_kt != null ? `${Math.round(ac.ground_speed_kt)} kt` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ") +
+      `</div>`,
+  ];
+  return parts.join("");
+}
+
+async function reloadAircraft() {
+  if (!document.getElementById("aircraft-toggle").checked) return;
+  const bounds = map.getBounds();
+  const bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()].join(",");
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/aircraft?bbox=${bbox}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const aircraftList = await res.json();
+    aircraftLayer.clearLayers();
+    aircraftList.forEach((ac) => {
+      L.marker([ac.latitude, ac.longitude], { icon: aircraftIcon(ac.track_deg) })
+        .bindPopup(aircraftPopupHtml(ac))
+        .addTo(aircraftLayer);
+    });
+  } catch (err) {
+    setStatus(`No se pudieron cargar las aeronaves: ${err.message}`);
+  }
+}
+
+function toggleAircraftLayer() {
+  const enabled = document.getElementById("aircraft-toggle").checked;
+  if (enabled) {
+    aircraftLayer.addTo(map);
+    reloadAircraft();
+  } else {
+    map.removeLayer(aircraftLayer);
+  }
+}
+
 // ---------- Wind field (Windy-style arrow grid) ----------
 // A grid of wind arrows across the current viewport (not just one per
 // active incident - see windLayer/refreshWindVectors above), each carrying
@@ -2961,7 +3139,10 @@ document.getElementById("date-range").addEventListener("change", loadFires);
 document.getElementById("satellite-toggle").addEventListener("change", updateSatelliteLayer);
 document.getElementById("satellite-date").addEventListener("change", updateSatelliteLayer);
 document.getElementById("webcams-toggle").addEventListener("change", toggleWebcamsLayer);
+document.getElementById("aircraft-toggle").addEventListener("change", toggleAircraftLayer);
 document.getElementById("wind-field-toggle").addEventListener("change", toggleWindFieldLayer);
+document.getElementById("season-burnt-area-toggle").addEventListener("change", toggleSeasonBurntAreaLayer);
+document.getElementById("sigpac-toggle").addEventListener("change", toggleSigpacLayer);
 document.getElementById("basemap-style").addEventListener("change", (e) => setBasemapStyle(e.target.value));
 document.getElementById("fire-spread-place").addEventListener("click", () => {
   placingFireOrigin = true;
@@ -2988,6 +3169,7 @@ map.on("zoomend", renderMap);
 // nationwide at once) - refetch whenever the visible area actually changes,
 // but only while the layer is turned on.
 map.on("moveend", reloadWebcams);
+map.on("moveend", reloadAircraft);
 // Same per-viewport pattern for the wind field grid - both moveend (pan)
 // and zoomend (grid spacing/point count depends on the bbox span) matter
 // here, unlike webcams which only cares about moveend.

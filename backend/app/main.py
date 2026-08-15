@@ -9,6 +9,7 @@ from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.routers import (
     admin_bulletins,
+    aircraft,
     copernicus,
     copernicus_ems,
     fire_spread,
@@ -52,6 +53,7 @@ app.include_router(copernicus.router)
 app.include_router(copernicus_ems.router)
 app.include_router(regional_incidents.router)
 app.include_router(webcams.router)
+app.include_router(aircraft.router)
 app.include_router(fire_spread.router)
 app.include_router(proximity.router)
 

@@ -44,9 +44,19 @@ def _cooldown_response(source: str, key: str, interval_minutes: int | None = Non
 @router.get("", response_model=list[FireDetectionOut])
 def list_fires(
     source: Optional[str] = Query(None, description="Filter by 'FIRMS' or 'EFFIS'"),
-    hours: int = Query(72, ge=1, le=24 * 30, description="Only detections from the last N hours"),
+    hours: int = Query(
+        72,
+        ge=1,
+        le=24 * 400,
+        description="Only detections from the last N hours. Windows beyond 30 days are only "
+        "honored for source=EFFIS (comparatively low-volume burnt-area polygons) - "
+        "any other source is clamped back to 30 days to avoid pulling a season's "
+        "worth of raw satellite hotspots in one request.",
+    ),
     db: Session = Depends(get_db),
 ):
+    if hours > 24 * 30 and (source or "").upper() != "EFFIS":
+        hours = 24 * 30
     since = datetime.utcnow() - timedelta(hours=hours)
     query = db.query(FireDetection).filter(FireDetection.acquired_at >= since)
     if source:

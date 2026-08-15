@@ -102,7 +102,12 @@ function sourceCardHtml(source) {
     `<span class="status-badge ${semantics}">${source.status}</span>` +
     `</div>` +
     (source.detail ? `<div class="source-card-detail">${source.detail}</div>` : "") +
-    `<div class="source-card-meta">Last success: ${formatRelativeTime(source.last_success_at)}</div>` +
+    // last_data_at (when this source last actually wrote NEW rows) is more
+    // useful than last_success_at (when it was last successfully CHECKED,
+    // even if nothing new came in) - falls back to last_success_at for
+    // sources with no rows_written concept yet or before their first
+    // post-migration check (see routers/sources.py's record_check docstring).
+    `<div class="source-card-meta">Last data: ${formatRelativeTime(source.last_data_at ?? source.last_success_at)}</div>` +
     healthStripHtml(source.key) +
     refreshBtn +
     `</div>` +
@@ -166,6 +171,31 @@ async function refreshSource(key, refreshUrl, button) {
   }
 }
 
+// Fans out over whatever /api/sources already returned, rather than a single
+// backend "refresh everything" endpoint - the set of refreshable sources is
+// dynamic (one row per Telegram channel/region/webcam source), so this just
+// reuses the same enumeration the page already has, and one source's failure
+// (e.g. Telegram not configured) doesn't hide the others' results behind a
+// single bulk error.
+async function refreshAllSources() {
+  const button = document.getElementById("refresh-all-btn");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Refreshing all…";
+  try {
+    await Promise.allSettled(
+      lastSources
+        .filter((s) => s.refresh_url)
+        .map((s) => fetch(`${apiBaseUrl}${s.refresh_url}`, { method: "POST" }))
+    );
+    await loadSources();
+    applySearchFilter();
+  } finally {
+    button.textContent = originalText;
+    button.disabled = false;
+  }
+}
+
 function applySearchFilter() {
   const query = document.getElementById("source-search").value.trim().toLowerCase();
   const filtered = query ? lastSources.filter((s) => s.name.toLowerCase().includes(query)) : lastSources;
@@ -189,6 +219,7 @@ async function loadSources() {
 }
 
 document.getElementById("source-search").addEventListener("input", applySearchFilter);
+document.getElementById("refresh-all-btn").addEventListener("click", refreshAllSources);
 
 
 (async function init() {
