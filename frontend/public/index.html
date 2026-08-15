@@ -167,6 +167,13 @@
     }
     @media (max-width: 768px) {
       .timeline-scrubber { width: calc(100vw - 28px); }
+      /* Bigger touch target for the drag thumb/track, and a more legible
+         label - 16px/4px and 9.5px text were sized for a mouse cursor, not a
+         fingertip (confirmed hard to grab/read precisely on a real phone). */
+      .scrubber-range { height: 6px; }
+      .scrubber-range::-webkit-slider-thumb { width: 24px; height: 24px; }
+      .scrubber-range::-moz-range-thumb { width: 24px; height: 24px; }
+      .scrubber-labels { font-size: 11.5px; }
     }
 
     /* ---------- Wind vector marker (per active/critical incident) ----------

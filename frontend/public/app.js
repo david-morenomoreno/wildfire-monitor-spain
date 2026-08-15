@@ -2469,6 +2469,26 @@ function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+// Dragging <input type=range> fires "input" continuously - often MORE
+// densely on a touchscreen than a mouse drag - and renderMap() is expensive
+// (proximity clustering + concave-hull recompute over every loaded
+// detection, plus a water-subtraction fetch per hull). Calling it on every
+// single event made the scrubber visibly lag behind your finger on mobile
+// (confirmed: "super slow" / "hard to follow"). Coalescing to at most once
+// per animation frame keeps the map's own redraw rate sane regardless of how
+// many "input" events land in between, while the cheap label-text update in
+// onScrubberInput still happens immediately on every event so the number
+// you're dragging past never itself feels laggy.
+let scrubberRenderScheduled = false;
+function scheduleScrubberMapRender() {
+  if (scrubberRenderScheduled) return;
+  scrubberRenderScheduled = true;
+  requestAnimationFrame(() => {
+    scrubberRenderScheduled = false;
+    renderMap();
+  });
+}
+
 // Two independent features can each extend the scrubber past "Ahora" - a
 // single incident's fire-spread prediction (scrubberFutureHours/Ms) and the
 // viewport-wide wind field (windFieldFutureHours/Ms). Neither knows about
@@ -2551,7 +2571,7 @@ function onScrubberInput() {
 
   if (!scrubberBounds) {
     currentLabel.textContent = "";
-    renderMap();
+    scheduleScrubberMapRender();
     return;
   }
 
@@ -2565,7 +2585,7 @@ function onScrubberInput() {
     const fraction = nowFraction > 0 ? value / nowFraction : 1;
     const cutoffMs = scrubberBounds.startMs + pastSpan * Math.min(1, Math.max(0, fraction));
     currentLabel.textContent = new Date(cutoffMs).toLocaleString("es-ES", SCRUBBER_DATE_FORMAT);
-    renderMap();
+    scheduleScrubberMapRender();
     return;
   }
 
@@ -2575,14 +2595,14 @@ function onScrubberInput() {
     clearPredictionEllipse();
     if (windFieldData) renderWindFieldAtHour(1);
     else clearWindField();
-    renderMap();
+    scheduleScrubberMapRender();
     return;
   }
 
   // Future: base map stays at its unfiltered "now" state; overlay the
   // predicted spread ellipse and/or wind field for the corresponding
   // forecast hour instead.
-  renderMap();
+  scheduleScrubberMapRender();
   const futureHours = effectiveFutureHours();
   const futureFraction = (value - nowFraction) / (100 - nowFraction || 1);
   const hoursAhead = Math.min(futureHours, Math.max(1, Math.round(futureFraction * futureHours)));
