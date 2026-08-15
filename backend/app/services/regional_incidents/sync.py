@@ -208,7 +208,7 @@ def sync_region(db: Session, region_code: str) -> int:
             changed_count += 1
 
     db.commit()
-    record_check(db, f"regional:{region_code}", "ok", f"{changed_count} new/changed fires")
+    record_check(db, f"regional:{region_code}", "ok", f"{changed_count} new/changed fires", rows_written=changed_count)
     return changed_count
 
 

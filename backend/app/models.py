@@ -239,6 +239,11 @@ class SourceCheck(Base):
     status = Column(String(20), nullable=False)  # ok/degraded/disrupted/skipped
     message = Column(Text, nullable=True)
     checked_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # Genuinely NEW rows this check wrote (not just rows re-fetched/re-seen -
+    # see services/health.py's record_check docstring). Null for historical
+    # rows recorded before this column existed, and for skipped/disrupted
+    # checks where nothing was ever attempted to write.
+    rows_written = Column(Integer, nullable=True)
 
 
 class SatelliteScene(Base):

@@ -28,17 +28,39 @@ router = APIRouter(prefix="/api/sources", tags=["sources"])
 
 
 def _last_success_map(db: Session) -> dict[str, str]:
+    """Last time each source was successfully CHECKED at all, regardless of whether
+    that check actually found/wrote anything new - see _last_data_map for that."""
     rows = (
         db.query(SourceCheck.source_key, func.max(SourceCheck.checked_at))
         .filter(SourceCheck.status == "ok")
         .group_by(SourceCheck.source_key)
         .all()
     )
-    return {key: checked_at.isoformat() for key, checked_at in rows}
+    # checked_at is a naive UTC datetime (datetime.utcnow() throughout) -
+    # plain .isoformat() has no timezone marker, which the frontend's
+    # `new Date(...)` then parses as LOCAL time, silently shifting every
+    # displayed time by the browser's UTC offset (confirmed live: ~2h off in
+    # Madrid's CEST). Appending "Z" marks it UTC explicitly, matching the
+    # same fix applied globally to response_model-backed endpoints via
+    # schemas.UTCDatetime - this endpoint returns plain dicts, not a Pydantic
+    # model, so it needs the same fix applied directly here.
+    return {key: checked_at.isoformat() + "Z" for key, checked_at in rows}
+
+
+def _last_data_map(db: Session) -> dict[str, str]:
+    """Last time each source's check actually wrote genuinely NEW data (rows_written > 0),
+    not just successfully checked - see record_check's docstring for why these differ."""
+    rows = (
+        db.query(SourceCheck.source_key, func.max(SourceCheck.checked_at))
+        .filter(SourceCheck.status == "ok", SourceCheck.rows_written > 0)
+        .group_by(SourceCheck.source_key)
+        .all()
+    )
+    return {key: checked_at.isoformat() + "Z" for key, checked_at in rows}
 
 
 def _satellite_entry(
-    key: str, name: str, url: str, source_code: str, refresh_url: str, db: Session, last_success: dict
+    key: str, name: str, url: str, source_code: str, refresh_url: str, db: Session, last_success: dict, last_data: dict
 ) -> dict:
     count = db.query(FireDetection).filter(FireDetection.source == source_code).count()
     # seconds_since_last_attempt is in-memory and resets on backend restart -
@@ -55,6 +77,7 @@ def _satellite_entry(
         "detail": f"{count} detections stored",
         "refresh_url": refresh_url,
         "last_success_at": last_success.get(key),
+        "last_data_at": last_data.get(key),
     }
 
 
@@ -68,6 +91,7 @@ def list_sources(db: Session = Depends(get_db)):
     page's per-source "Refresh now" button POSTs to.
     """
     last_success = _last_success_map(db)
+    last_data = _last_data_map(db)
 
     sources: list[dict] = [
         _satellite_entry(
@@ -78,6 +102,7 @@ def list_sources(db: Session = Depends(get_db)):
             "/api/fires/refresh/firms?force=true",
             db,
             last_success,
+            last_data,
         ),
         _satellite_entry(
             "effis",
@@ -87,6 +112,7 @@ def list_sources(db: Session = Depends(get_db)):
             "/api/fires/refresh/effis?force=true",
             db,
             last_success,
+            last_data,
         ),
     ]
 
@@ -102,6 +128,7 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": f"{scene_count} scenes discovered across all incidents",
             "refresh_url": "/api/copernicus/discover-all",
             "last_success_at": last_success.get("copernicus"),
+            "last_data_at": last_data.get("copernicus"),
         }
     )
 
@@ -123,6 +150,7 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": f"{eumetsat_count} detections stored",
             "refresh_url": "/api/fires/refresh/eumetsat?force=true",
             "last_success_at": last_success.get("eumetsat"),
+            "last_data_at": last_data.get("eumetsat"),
         }
     )
 
@@ -144,6 +172,7 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": f"{sentinel3_count} detections stored",
             "refresh_url": "/api/fires/refresh/sentinel3?force=true",
             "last_success_at": last_success.get("sentinel3"),
+            "last_data_at": last_data.get("sentinel3"),
         }
     )
 
@@ -162,6 +191,7 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": f"{ems_count} Spain wildfire activations tracked, {ems_matched_count} matched to an incident",
             "refresh_url": "/api/fires/refresh/copernicus-ems?force=true",
             "last_success_at": last_success.get("copernicus_ems"),
+            "last_data_at": last_data.get("copernicus_ems"),
         }
     )
 
@@ -183,6 +213,7 @@ def list_sources(db: Session = Depends(get_db)):
                 "detail": f"{bulletin_counts.get(admin_source.id, 0)} bulletins discovered",
                 "refresh_url": f"/api/admin-sources/{admin_source.region_code}/refresh",
                 "last_success_at": last_success.get(key),
+                "last_data_at": last_data.get(key),
             }
         )
 
@@ -205,6 +236,7 @@ def list_sources(db: Session = Depends(get_db)):
                 "detail": f"{message_counts.get(channel.id, 0)} messages ingested",
                 "refresh_url": f"/api/telegram/channels/{channel.id}/refresh",
                 "last_success_at": last_success.get(key),
+                "last_data_at": last_data.get(key),
             }
         )
 
@@ -226,6 +258,7 @@ def list_sources(db: Session = Depends(get_db)):
                 "detail": f"{regional_counts.get(regional_source.id, 0)} fires tracked",
                 "refresh_url": f"/api/regional-incidents/{regional_source.region_code}/refresh",
                 "last_success_at": last_success.get(key),
+                "last_data_at": last_data.get(key),
             }
         )
 
@@ -244,6 +277,7 @@ def list_sources(db: Session = Depends(get_db)):
                 "detail": f"{webcam_counts.get(source_key, 0)} cameras",
                 "refresh_url": f"/api/webcams/{source_key}/refresh",
                 "last_success_at": last_success.get(key),
+                "last_data_at": last_data.get(key),
             }
         )
 
@@ -260,6 +294,7 @@ def list_sources(db: Session = Depends(get_db)):
             "detail": "News RSS feed - no structured per-fire data available",
             "refresh_url": None,
             "last_success_at": last_success.get("ume"),
+            "last_data_at": last_data.get("ume"),
         }
     )
 

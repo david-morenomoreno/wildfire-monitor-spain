@@ -376,7 +376,7 @@ def ingest_copernicus_ems(db: Session) -> int:
         db.rollback()
         record_check(db, "copernicus_ems", "disrupted", str(exc))
         raise
-    record_check(db, "copernicus_ems", "ok", f"{count} activations newly matched to incidents")
+    record_check(db, "copernicus_ems", "ok", f"{count} activations newly matched to incidents", rows_written=count)
     return count
 
 

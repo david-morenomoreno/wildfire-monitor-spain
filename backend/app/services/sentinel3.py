@@ -99,7 +99,7 @@ def ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime |
     """
     state.mark_attempt("sentinel3")
     try:
-        count = _ingest_sentinel3(db, start=start, end=end)
+        count, new_count = _ingest_sentinel3(db, start=start, end=end)
     except Exception as exc:
         # See the matching comment in eumetsat.py - roll back before
         # record_check reuses this session so its own db.commit() doesn't
@@ -107,14 +107,15 @@ def ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime |
         db.rollback()
         record_check(db, "sentinel3", "disrupted", str(exc))
         raise
-    record_check(db, "sentinel3", "ok", f"{count} fire pixels processed")
+    record_check(db, "sentinel3", "ok", f"{count} fire pixels processed", rows_written=new_count)
     return count
 
 
-def _ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime | None = None) -> int:
+def _ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime | None = None) -> tuple[int, int]:
+    """Returns (pixels processed, pixels genuinely newly inserted - see record_check)."""
     if not is_configured():
         record_check(db, "sentinel3", "skipped", "consumer_key/consumer_secret not configured")
-        return 0
+        return 0, 0
 
     if end is None:
         end = datetime.utcnow()
@@ -133,6 +134,7 @@ def _ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime 
         )
 
     count = 0
+    new_count = 0
     skipped_low_confidence = 0
     skipped_outside_spain = 0
     skipped_over_water = 0
@@ -191,8 +193,9 @@ def _ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime 
                 )
                 .on_conflict_do_nothing(constraint="uq_source_external_id")
             )
-            db.execute(stmt)
+            result = db.execute(stmt)
             count += 1
+            new_count += result.rowcount
 
     if skipped_low_confidence:
         logger.info("Skipped %d Sentinel-3 SLSTR pixel(s) below the confidence threshold", skipped_low_confidence)
@@ -201,4 +204,4 @@ def _ingest_sentinel3(db: Session, start: datetime | None = None, end: datetime 
     if skipped_over_water:
         logger.info("Skipped %d Sentinel-3 SLSTR pixel(s) landing inside a real water body", skipped_over_water)
     db.commit()
-    return count
+    return count, new_count

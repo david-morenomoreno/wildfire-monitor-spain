@@ -86,9 +86,10 @@ def sync_region(db: Session, region_code: str) -> int:
             f"admin:{region_code}",
             "degraded",
             f"{new_count} new bulletins, {fetch_failures} failed to fetch/parse",
+            rows_written=new_count,
         )
     else:
-        record_check(db, f"admin:{region_code}", "ok", f"{new_count} new bulletins")
+        record_check(db, f"admin:{region_code}", "ok", f"{new_count} new bulletins", rows_written=new_count)
     return new_count
 
 

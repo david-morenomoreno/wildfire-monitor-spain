@@ -57,7 +57,7 @@ def ingest_firms(db: Session, day_range: int | None = None, end_date: str | None
     """
     state.mark_attempt("firms")
     try:
-        count = _ingest_firms(db, day_range, end_date)
+        count, new_count = _ingest_firms(db, day_range, end_date)
     except Exception as exc:
         # See the matching comment in eumetsat.py - roll back before
         # record_check reuses this session so its own db.commit() doesn't
@@ -65,13 +65,15 @@ def ingest_firms(db: Session, day_range: int | None = None, end_date: str | None
         db.rollback()
         record_check(db, "firms", "disrupted", str(exc))
         raise
-    record_check(db, "firms", "ok", f"{count} rows processed")
+    record_check(db, "firms", "ok", f"{count} rows processed", rows_written=new_count)
     return count
 
 
-def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = None) -> int:
+def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = None) -> tuple[int, int]:
+    """Returns (rows processed, rows genuinely newly inserted - see record_check)."""
     day_range = day_range or settings.firms_day_range
     count = 0
+    new_count = 0
     skipped_outside_spain = 0
     skipped_over_water = 0
     for source in settings.firms_sources:
@@ -129,8 +131,13 @@ def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = Non
                 )
                 .on_conflict_do_nothing(constraint="uq_source_external_id")
             )
-            db.execute(stmt)
+            result = db.execute(stmt)
             count += 1
+            # ON CONFLICT DO NOTHING reports rowcount=0 for a row that
+            # already existed (re-fetched, not new) - summing this instead of
+            # blindly incrementing on every processed row gives a genuine
+            # "newly inserted" count (see record_check's rows_written).
+            new_count += result.rowcount
 
     if skipped_outside_spain:
         logger.info(
@@ -140,4 +147,4 @@ def _ingest_firms(db: Session, day_range: int | None, end_date: str | None = Non
     if skipped_over_water:
         logger.info("Skipped %d FIRMS row(s) landing inside a real water body (likely sensor false positive)", skipped_over_water)
     db.commit()
-    return count
+    return count, new_count

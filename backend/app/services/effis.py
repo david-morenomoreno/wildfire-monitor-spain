@@ -54,7 +54,7 @@ def fetch_effis_features() -> list[dict]:
 def ingest_effis(db: Session) -> int:
     state.mark_attempt("effis")
     try:
-        count = _ingest_effis(db)
+        count, new_count = _ingest_effis(db)
     except Exception as exc:
         # See the matching comment in eumetsat.py - roll back before
         # record_check reuses this session so its own db.commit() doesn't
@@ -62,13 +62,15 @@ def ingest_effis(db: Session) -> int:
         db.rollback()
         record_check(db, "effis", "disrupted", str(exc))
         raise
-    record_check(db, "effis", "ok", f"{count} features processed")
+    record_check(db, "effis", "ok", f"{count} features processed", rows_written=new_count)
     return count
 
 
-def _ingest_effis(db: Session) -> int:
+def _ingest_effis(db: Session) -> tuple[int, int]:
+    """Returns (features processed, features genuinely newly inserted - see record_check)."""
     features = fetch_effis_features()
     count = 0
+    new_count = 0
     for feature in features:
         geometry = feature.get("geometry") or {}
         properties = feature.get("properties") or {}
@@ -126,8 +128,9 @@ def _ingest_effis(db: Session) -> int:
             )
             .on_conflict_do_nothing(constraint="uq_source_external_id")
         )
-        db.execute(stmt)
+        result = db.execute(stmt)
         count += 1
+        new_count += result.rowcount
 
     db.commit()
-    return count
+    return count, new_count

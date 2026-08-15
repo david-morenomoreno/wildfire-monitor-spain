@@ -25,6 +25,8 @@
     .page-head { margin-bottom: 20px; }
     .page-head h1 { font-size: 19px; margin: 0 0 6px; font-weight: 650; }
     .page-head .subtitle { color: var(--text-muted); font-size: 13px; margin: 0; }
+    .page-head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+    .refresh-all-btn { flex-shrink: 0; padding: 7px 14px; font-size: 12px; }
 
     .search-field {
       position: relative;
@@ -194,8 +196,13 @@
   </nav>
   <div class="wrap">
     <div class="page-head">
-      <h1>Data sources &amp; status</h1>
-      <p class="subtitle">Every feed this monitor pulls from — satellite hotspots, official bulletins, live regional incident status, and community reports — with each one's 14-day ingestion history inline.</p>
+      <div class="page-head-row">
+        <div>
+          <h1>Data sources &amp; status</h1>
+          <p class="subtitle">Every feed this monitor pulls from — satellite hotspots, official bulletins, live regional incident status, and community reports — with each one's 14-day ingestion history inline.</p>
+        </div>
+        <button id="refresh-all-btn" class="refresh-btn refresh-all-btn">Refresh all</button>
+      </div>
     </div>
 
     <div class="search-field">

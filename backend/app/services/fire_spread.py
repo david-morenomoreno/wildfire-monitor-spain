@@ -127,29 +127,52 @@ DEFAULT_FUEL = ("desconocido/sin clasificar", 4.0)
 NON_FLAMMABLE_PREFIXES = ("1", "4", "5")  # urban fabric (1xx), wetlands (4xx), water bodies (5xx)
 
 
+def _wet_bulb_temperature_c(temperature_c: float, humidity_pct: float) -> float:
+    """
+    Stull (2011) empirical approximation - accurate to within ~1°C across
+    normal weather ranges (-20 to 50°C, 5-99% RH) without needing a full
+    psychrometric/iterative solve. Open-Meteo has no native wet-bulb field,
+    so this is computed client-side (server-side here) from temperature +
+    humidity it already returns.
+    """
+    t, rh = temperature_c, humidity_pct
+    return (
+        t * math.atan(0.151977 * math.sqrt(rh + 8.313659))
+        + math.atan(t + rh)
+        - math.atan(rh - 1.676331)
+        + 0.00391838 * rh**1.5 * math.atan(0.023101 * rh)
+        - 4.686035
+    )
+
+
 def fetch_wind_series(lat: float, lon: float, max_hours: int = 24) -> list[dict]:
     """
-    Hourly wind speed (km/h) + direction (degrees, meteorological 'from'
-    convention), temperature (°C) and relative humidity (%) for the next
-    `max_hours` hours starting at the current hour, via Open-Meteo - free, no
-    API key, confirmed live. forecast_days=3 keeps a safety margin so
-    "current hour + 24" never runs past the end of the returned series
-    regardless of what time of day "now" is.
+    Hourly weather series for the next `max_hours` hours starting at the
+    current hour, via Open-Meteo - free, no API key, confirmed live.
+    forecast_days=3 keeps a safety margin so "current hour + 24" never runs
+    past the end of the returned series regardless of what time of day "now"
+    is.
 
-    Temperature/humidity were added alongside the wind fields this function
-    already fetched for the spread model - same request, same free API, no
-    extra round-trip - so the map sidebar's "Previsión" section (index[0] of
-    this series, i.e. the current hour) can show more than wind without a
-    second weather source. Neither factors into the spread model itself
-    (still wind/fuel/slope only, see predict_spread) - they're carried
-    through purely for display.
+    Wind speed/direction (at 10m and 120m), temperature, humidity, cloud
+    cover, solar radiation, precipitation, vapor pressure deficit and CAPE
+    are all fetched in this one request - same free API, no extra round-trip
+    - so the map sidebar's "Previsión" section (index[0] of this series, i.e.
+    the current hour) can show a fuller picture than wind alone. Only wind
+    speed/direction/temperature/humidity factor into the spread model itself
+    (see predict_spread) - the rest is carried through purely for display.
+    Wet-bulb temperature isn't a native Open-Meteo field, so it's derived from
+    temperature+humidity (see _wet_bulb_temperature_c) rather than fetched.
     """
     response = httpx.get(
         OPEN_METEO_URL,
         params={
             "latitude": lat,
             "longitude": lon,
-            "hourly": "windspeed_10m,winddirection_10m,temperature_2m,relativehumidity_2m",
+            "hourly": (
+                "windspeed_10m,winddirection_10m,temperature_2m,relativehumidity_2m,"
+                "windspeed_120m,winddirection_120m,cloudcover,shortwave_radiation,"
+                "precipitation,vapour_pressure_deficit,cape"
+            ),
             "forecast_days": 3,
             "timezone": "UTC",
         },
@@ -172,9 +195,54 @@ def fetch_wind_series(lat: float, lon: float, max_hours: int = 24) -> list[dict]
             "direction_from_deg": hourly["winddirection_10m"][i],
             "temperature_c": hourly["temperature_2m"][i],
             "humidity_pct": hourly["relativehumidity_2m"][i],
+            "wet_bulb_c": round(
+                _wet_bulb_temperature_c(hourly["temperature_2m"][i], hourly["relativehumidity_2m"][i]), 1
+            ),
+            "wind_120m_speed_kmh": hourly["windspeed_120m"][i],
+            "wind_120m_direction_from_deg": hourly["winddirection_120m"][i],
+            "cloudcover_pct": hourly["cloudcover"][i],
+            "solar_radiation_wm2": hourly["shortwave_radiation"][i],
+            "precipitation_mm": hourly["precipitation"][i],
+            "vapor_pressure_deficit_kpa": hourly["vapour_pressure_deficit"][i],
+            "cape_jkg": hourly["cape"][i],
         }
         for i in range(start_idx, end_idx)
     ]
+
+
+AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+
+def fetch_air_quality(lat: float, lon: float) -> dict | None:
+    """
+    Current European AQI (1-100+ scale) for the given point - free, no API
+    key, separate Open-Meteo host from the main forecast API. Returns None
+    (not an exception) on any failure, matching fetch_slope's degrade-not-fail
+    pattern below: air quality is a secondary display field, not core to the
+    spread prediction, so a flaky call shouldn't break the rest of the panel.
+    """
+    try:
+        response = httpx.get(
+            AIR_QUALITY_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "european_aqi",
+                "forecast_days": 1,
+                "timezone": "UTC",
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        hourly = response.json()["hourly"]
+        times = hourly["time"]
+        now_hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00")
+        idx = times.index(now_hour) if now_hour in times else 0
+        aqi = hourly["european_aqi"][idx]
+        return {"european_aqi": aqi} if aqi is not None else None
+    except Exception:
+        logger.warning("Air quality lookup failed for (%s, %s)", lat, lon, exc_info=True)
+        return None
 
 
 # How many grid points to sample per axis at most - a Windy-style arrow
@@ -584,6 +652,8 @@ def predict_spread(lat: float, lon: float, max_hours: int = MAX_PREDICTION_HOURS
     water_rings = fetch_water_rings(lat, lon)
     water_shape = _water_shape(water_rings) if water_rings else None
 
+    air_quality = fetch_air_quality(lat, lon)
+
     cum_head_m = 0.0
     cum_back_m = 0.0
     cum_flank_m = 0.0
@@ -633,6 +703,14 @@ def predict_spread(lat: float, lon: float, max_hours: int = MAX_PREDICTION_HOURS
                 "wind_direction_from_deg": entry["direction_from_deg"],
                 "temperature_c": entry["temperature_c"],
                 "humidity_pct": entry["humidity_pct"],
+                "wet_bulb_c": entry["wet_bulb_c"],
+                "wind_120m_speed_kmh": entry["wind_120m_speed_kmh"],
+                "wind_120m_direction_from_deg": entry["wind_120m_direction_from_deg"],
+                "cloudcover_pct": entry["cloudcover_pct"],
+                "solar_radiation_wm2": entry["solar_radiation_wm2"],
+                "precipitation_mm": entry["precipitation_mm"],
+                "vapor_pressure_deficit_kpa": entry["vapor_pressure_deficit_kpa"],
+                "cape_jkg": entry["cape_jkg"],
                 "rate_of_spread_m_per_min": {
                     "head": round(ros["head"], 2),
                     "flank": round(ros["flank"], 2),
@@ -649,6 +727,7 @@ def predict_spread(lat: float, lon: float, max_hours: int = MAX_PREDICTION_HOURS
         "origin": {"latitude": lat, "longitude": lon},
         "fuel": fuel,
         "slope": slope,
+        "air_quality": air_quality,
         "hourly": hourly,
         "disclaimer": (
             "Prueba de concepto experimental - un modelo elíptico de crecimiento simplificado "

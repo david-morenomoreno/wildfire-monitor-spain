@@ -264,5 +264,7 @@ def discover_for_active_incidents(db: Session) -> dict[str, int]:
         record_check(db, "copernicus", "degraded", f"{failures}/{len(incidents)} incident searches failed")
     else:
         total_new = sum(results.values())
-        record_check(db, "copernicus", "ok", f"{total_new} new scenes across {len(incidents)} incidents")
+        record_check(
+            db, "copernicus", "ok", f"{total_new} new scenes across {len(incidents)} incidents", rows_written=total_new
+        )
     return results

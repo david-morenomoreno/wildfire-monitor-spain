@@ -156,7 +156,7 @@ async def _poll_channels_async(db: Session, channels: list[TelegramChannel]) -> 
             try:
                 count = await _poll_channel_async(db, client, channel)
                 results[channel.username] = count
-                record_check(db, source_key, "ok", f"{count} new messages")
+                record_check(db, source_key, "ok", f"{count} new messages", rows_written=count)
             except Exception as exc:
                 logger.exception("Telegram poll failed for channel '%s'", channel.username)
                 results[channel.username] = 0
