@@ -115,13 +115,24 @@
        own forecast slider (see the fire-spread tool's hour slider, which
        this deliberately echoes visually). Filters lastFires in app.js;
        never touches the incident list. ---------- */
-    .timeline-scrubber {
+    /* Positions BOTH the timeline scrubber and the weather dock above it
+       (see .weather-dock) as one bottom-center stack - the scrubber itself
+       used to own this absolute positioning directly; now it's static within
+       this shared wrapper so the weather dock can sit directly above it
+       without any magic-number bottom offset. */
+    .bottom-dock {
       position: absolute;
       left: 50%;
       bottom: 14px;
       transform: translateX(-50%);
       z-index: 1000;
       width: min(560px, calc(100vw - 28px));
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 10px;
+    }
+    .timeline-scrubber {
       display: flex;
       align-items: center;
       gap: 10px;
@@ -148,7 +159,7 @@
     .scrubber-play:hover, .scrubber-reset:hover { border-color: var(--accent); color: var(--accent); }
     .scrubber-play.is-playing { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
     .scrubber-reset { font-size: 11px; font-weight: 700; padding: 0 12px; height: 32px; }
-    .scrubber-track-wrap { flex: 1; min-width: 0; }
+    .scrubber-track-wrap { flex: 1; min-width: 0; position: relative; }
     .scrubber-labels {
       display: flex;
       justify-content: space-between;
@@ -165,10 +176,41 @@
       width: 100%;
       height: 4px;
       border-radius: 999px;
-      background: var(--border-strong);
       cursor: pointer;
       outline: none;
       margin: 0;
+      /* Past (gray, real detections) / forecast (blue, predicted) split -
+         --scrubber-now-pct is set in JS (updateScrubberEndLabel) to wherever
+         scrubberNowFraction() currently falls, defaulting to 100% (fully
+         gray) when no prediction is active, i.e. identical to the old flat
+         var(--border-strong) look. */
+      background: linear-gradient(
+        to right,
+        var(--border-strong) 0%,
+        var(--border-strong) var(--scrubber-now-pct, 100%),
+        var(--wind) var(--scrubber-now-pct, 100%),
+        var(--wind) 100%
+      );
+    }
+    /* Tick marks/labels under the track - see renderScrubberTicks(). Purely
+       visual reference points (span/day-or-hour orientation), not snap
+       stops - dragging stays continuous. */
+    .scrubber-ticks { position: relative; height: 12px; margin-top: 2px; }
+    .scrubber-tick {
+      position: absolute;
+      top: 0;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1px;
+    }
+    .scrubber-tick-bar { width: 1px; height: 4px; background: var(--border-strong); }
+    .scrubber-tick-label {
+      font-family: var(--font-mono);
+      font-size: 8px;
+      color: var(--text-muted);
+      white-space: nowrap;
     }
     .scrubber-range::-webkit-slider-thumb {
       -webkit-appearance: none;
@@ -189,7 +231,7 @@
       cursor: pointer;
     }
     @media (max-width: 768px) {
-      .timeline-scrubber { width: calc(100vw - 28px); }
+      .bottom-dock { width: calc(100vw - 28px); }
       /* Bigger touch target for the drag thumb/track, and a more legible
          label - 16px/4px and 9.5px text were sized for a mouse cursor, not a
          fingertip (confirmed hard to grab/read precisely on a real phone). */
@@ -212,6 +254,14 @@
     }
     .wind-arrow svg { filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35)); }
     .wind-arrow-tooltip { font-family: var(--font-mono); }
+
+    /* ---------- Wind particles (Windy-style animated flow, alternative to
+       the arrow grid above) - see startWindParticles/windParticlePane in
+       app.js. A raw canvas, not a Leaflet renderer, so it needs its own
+       absolute positioning (kept in sync with the pane's own pan/zoom
+       transform by repositionWindParticleCanvas) and must never intercept
+       clicks meant for markers/dots underneath or above it. */
+    .wind-particle-canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
 
     /* ---------- National cluster overview (very low zoom) ----------
        Colored, sized count bubbles standing in for individual dots at a
@@ -371,7 +421,6 @@
       box-shadow: 0 0 6px rgba(45, 212, 191, 0.6);
       flex-shrink: 0;
     }
-    .legend-wind-arrow { display: inline-flex; color: var(--wind); flex-shrink: 0; }
     .legend-hint { margin-top: 6px; font-size: 11px; color: var(--text-muted); }
 
     /* Discrete recency-bucket swatches (see RECENCY_LEGEND in app.js) -
@@ -1323,6 +1372,108 @@
     .weather-row { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; }
     .weather-item { display: flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600; color: var(--text-secondary); }
 
+    /* ---------- Weather dock (Windy-style, docked above the timeline
+       scrubber - see .bottom-dock/#weather-dock) ----------
+       Only present while an incident's detail view is open (see
+       loadIncidentWeatherTimeline/disableIncidentPrediction in app.js) -
+       :empty hides the whole card rather than showing a blank shell the
+       rest of the time (browsing the map with no fire selected). */
+    .weather-dock {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-soft);
+      border-radius: 16px;
+      box-shadow: var(--card-shadow);
+      padding: 10px 14px;
+      color: var(--text-primary);
+    }
+    .weather-dock:empty { display: none; }
+    .weather-dock-inner { display: flex; align-items: center; gap: 12px; }
+    .weather-dock-now {
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding-right: 12px;
+      border-right: 1px solid var(--border-soft);
+    }
+    .weather-dock-icon { font-size: 20px; line-height: 1; }
+    .weather-dock-temp { font-family: var(--font-display); font-size: 16px; font-weight: 800; }
+    .weather-dock-wind {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--wind);
+      white-space: nowrap;
+    }
+
+    /* ---------- Weather hourly strip (past -> now -> forecast) ----------
+       The bottom dock's full grid (weatherDockHtml) groups hours into day
+       columns (Windy-style); the map's compact click-popup (weatherPopupHtml)
+       reuses the same per-hour chip markup in a narrower, ungrouped strip
+       (.weather-popup-strip below) - see app.js. */
+    .weather-strip-grid {
+      display: flex;
+      gap: 14px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      min-width: 0;
+    }
+    .weather-dock-inner .weather-strip-grid { flex: 1; }
+    .weather-strip-day { flex-shrink: 0; }
+    .weather-strip-day-header {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--text-secondary);
+      text-transform: capitalize;
+      padding-bottom: 3px;
+      margin-bottom: 3px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .weather-strip-day-hours { display: flex; gap: 6px; }
+    .weather-strip-hour {
+      flex-shrink: 0;
+      width: 44px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding: 6px 2px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .weather-strip-now { background: var(--accent-dim); }
+    .weather-strip-now-tag {
+      font-size: 8px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.04em;
+    }
+    .weather-strip-label { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); }
+    .weather-strip-icon { font-size: 15px; line-height: 1.2; }
+    .weather-strip-temp { font-size: 11.5px; font-weight: 700; color: var(--text-primary); }
+    .weather-strip-rain { font-size: 8.5px; color: var(--wind); }
+    /* Tinted (not opaque) so the km/h text stays legible over it - color
+       comes from windSpeedColor, the SAME scale the map's wind-speed
+       heatmap uses, so a reading looks the same in both places. */
+    .weather-strip-wind-cell {
+      margin-top: 2px;
+      padding: 1px 5px;
+      border-radius: 5px;
+      font-size: 9px;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+
+    .weather-popup { min-width: 200px; }
+    .weather-popup .weather-card { margin-top: 0; padding-top: 0; border-top: none; }
+    .weather-popup-strip { display: flex; gap: 4px; margin-top: 8px; }
+    .weather-popup-strip .weather-strip-hour { width: 36px; }
+    .weather-popup-loading { font-size: 12px; color: var(--text-muted); padding: 4px 2px; }
+
     /* ---------- Webcams (map popup, Windy-style viewer) ---------- */
     .webcam-thumb {
       display: block;
@@ -1591,19 +1742,23 @@
   </div>
   <div id="map-wrap">
   <div id="map"></div>
-  <div class="timeline-scrubber" id="timeline-scrubber">
-    <button class="scrubber-play" id="scrubber-play" aria-label="Reproducir evolución del día">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" id="scrubber-play-icon"><path d="M6 4l14 8-14 8z"/></svg>
-    </button>
-    <div class="scrubber-track-wrap">
-      <div class="scrubber-labels">
-        <span id="scrubber-label-start">–</span>
-        <span class="scrubber-now" id="scrubber-label-current">Ahora</span>
-        <span id="scrubber-label-end">Ahora</span>
+  <div class="bottom-dock" id="bottom-dock">
+    <div class="weather-dock" id="weather-dock"></div>
+    <div class="timeline-scrubber" id="timeline-scrubber">
+      <button class="scrubber-play" id="scrubber-play" aria-label="Reproducir evolución del día">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" id="scrubber-play-icon"><path d="M6 4l14 8-14 8z"/></svg>
+      </button>
+      <div class="scrubber-track-wrap">
+        <div class="scrubber-labels">
+          <span id="scrubber-label-start">–</span>
+          <span class="scrubber-now" id="scrubber-label-current">Ahora</span>
+          <span id="scrubber-label-end">Ahora</span>
+        </div>
+        <input type="range" id="scrubber-range" class="scrubber-range" min="0" max="100" value="100" step="1" />
+        <div class="scrubber-ticks" id="scrubber-ticks"></div>
       </div>
-      <input type="range" id="scrubber-range" class="scrubber-range" min="0" max="100" value="100" step="1" />
+      <button class="scrubber-reset" id="scrubber-reset" title="Volver a 'ahora'">Ahora</button>
     </div>
-    <button class="scrubber-reset" id="scrubber-reset" title="Volver a 'ahora'">Ahora</button>
   </div>
   <div id="incident-sidebar">
     <button class="mobile-panel-close" id="mobile-sidebar-close" aria-label="Cerrar">✕</button>
@@ -1692,9 +1847,8 @@
         <div class="legend-row">
           <div class="legend-item"><span class="legend-ring"></span>Foco de detección</div>
           <div class="legend-item"><span class="legend-dot"></span>Reportes de usuarios</div>
-          <div class="legend-item"><span class="legend-wind-arrow"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg></span>Viento en el foco</div>
         </div>
-        <div class="legend-hint">Color = antigüedad del foco · Polígono = área estimada · Flecha = viento</div>
+        <div class="legend-hint">Color = antigüedad del foco · Polígono = área estimada · Activa "Partículas de viento" para consultar el viento en cualquier punto</div>
         <div class="recency-legend" id="recency-legend"></div>
       </div>
 
@@ -1712,6 +1866,24 @@
             <span class="switch-track"><span class="switch-thumb"></span></span>
           </label>
         </div>
+      </div>
+
+      <div class="settings-block">
+        <div class="settings-row">
+          <span class="settings-row-label">
+            <span class="settings-row-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12c3-4 5 4 8 0s5 4 8 0M3 17c3-4 5 4 8 0s5 4 8 0"/></svg></span>
+            <span class="settings-row-text">
+              Partículas de viento
+              <span class="settings-row-hint">Flujo animado estilo Windy - alternativa a las flechas, misma hora del campo de viento</span>
+            </span>
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="wind-particles-toggle" />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </label>
+        </div>
+        <div class="legend-hint">Un fondo de color (calma → fuerte) acompaña las flechas o partículas, indicando la velocidad</div>
+        <div class="recency-legend" id="wind-speed-legend"></div>
       </div>
 
       <div class="settings-block">

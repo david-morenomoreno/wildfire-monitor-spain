@@ -70,6 +70,13 @@ WATER_FETCH_RADIUS_M = 20_000.0
 # "wind-driven ellipse" is still a defensible approximation - was 24h.
 MAX_PREDICTION_HOURS = 8
 
+# Display-only weather timeline (see fetch_weather_timeline) - separate from
+# the spread model's own MAX_PREDICTION_HOURS above, since this just answers
+# "what was/is/will the weather be at this point", not "how far will the fire
+# spread" (no ROS math, no fuel/slope/water lookups).
+WEATHER_TIMELINE_PAST_HOURS = 24
+WEATHER_TIMELINE_FORECAST_HOURS = 48
+
 # How far back to look for "currently active" detections when picking a
 # fire's leading edge(s) to predict FROM (see predict_incident_spread) -
 # recent enough that a quiet flank isn't mistaken for still-advancing, wide
@@ -210,6 +217,83 @@ def fetch_wind_series(lat: float, lon: float, max_hours: int = 24) -> list[dict]
     ]
 
 
+def fetch_weather_timeline(
+    lat: float,
+    lon: float,
+    past_hours: int = WEATHER_TIMELINE_PAST_HOURS,
+    forecast_hours: int = WEATHER_TIMELINE_FORECAST_HOURS,
+) -> dict | None:
+    """
+    Continuous past-through-forecast hourly weather series for one point -
+    the "what was/is/will the weather be here" read for the map's
+    weather-at-the-fire panel, distinct from fetch_wind_series above (which
+    is forecast-only and feeds the spread model's ROS math - left untouched
+    so predictions keep behaving identically).
+
+    Open-Meteo's forecast endpoint accepts BOTH `past_days` and
+    `forecast_days` in the same request, returning one continuous hourly
+    series spanning both - no separate historical/archive API or second
+    request needed. past_days/forecast_days are whole-day counts, so hours
+    are converted up to the nearest day (with the same one-day safety margin
+    fetch_wind_series already uses) then the exact requested hour range is
+    sliced back out below.
+
+    Returns None (not an exception) on any failure - this is a secondary
+    display panel, matching fetch_air_quality's degrade-not-fail pattern.
+    """
+    try:
+        response = httpx.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": (
+                    "windspeed_10m,winddirection_10m,temperature_2m,relativehumidity_2m,"
+                    "windspeed_120m,winddirection_120m,cloudcover,shortwave_radiation,"
+                    "precipitation,vapour_pressure_deficit,cape,weathercode"
+                ),
+                "past_days": math.ceil(past_hours / 24),
+                "forecast_days": math.ceil(forecast_hours / 24) + 1,
+                "timezone": "UTC",
+            },
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        hourly = response.json()["hourly"]
+        times = hourly["time"]
+        now_hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00")
+        now_idx = times.index(now_hour) if now_hour in times else 0
+        start_idx = max(0, now_idx - past_hours)
+        end_idx = min(now_idx + forecast_hours + 1, len(times))
+        return {
+            "now_index": now_idx - start_idx,
+            "hourly": [
+                {
+                    "time": times[i],
+                    "speed_kmh": hourly["windspeed_10m"][i],
+                    "direction_from_deg": hourly["winddirection_10m"][i],
+                    "temperature_c": hourly["temperature_2m"][i],
+                    "humidity_pct": hourly["relativehumidity_2m"][i],
+                    "wet_bulb_c": round(
+                        _wet_bulb_temperature_c(hourly["temperature_2m"][i], hourly["relativehumidity_2m"][i]), 1
+                    ),
+                    "wind_120m_speed_kmh": hourly["windspeed_120m"][i],
+                    "wind_120m_direction_from_deg": hourly["winddirection_120m"][i],
+                    "cloudcover_pct": hourly["cloudcover"][i],
+                    "solar_radiation_wm2": hourly["shortwave_radiation"][i],
+                    "precipitation_mm": hourly["precipitation"][i],
+                    "vapor_pressure_deficit_kpa": hourly["vapour_pressure_deficit"][i],
+                    "cape_jkg": hourly["cape"][i],
+                    "weathercode": hourly["weathercode"][i],
+                }
+                for i in range(start_idx, end_idx)
+            ],
+        }
+    except Exception:
+        logger.warning("Weather timeline lookup failed for (%s, %s)", lat, lon, exc_info=True)
+        return None
+
+
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
 
@@ -245,18 +329,25 @@ def fetch_air_quality(lat: float, lon: float) -> dict | None:
         return None
 
 
-# How many grid points to sample per axis at most - a Windy-style arrow
-# field only needs to look dense at typical zoom levels, not literally
-# sample every 0.1 degree; capping this keeps both the Open-Meteo request
-# (one HTTP call, comma-joined lat/lon lists - see fetch_wind_field) and the
-# number of arrows Leaflet has to paint bounded regardless of how far
-# zoomed-out the current viewport is (a whole-Spain view spans ~14 x 8
-# degrees).
-WIND_FIELD_MAX_POINTS_PER_AXIS = 9
-# Floor on grid spacing (degrees) - prevents an absurdly dense request if a
-# caller passes a tiny bbox (deep zoom-in), where "one arrow every few
-# hundred meters" would be meaningless at this forecast's resolution anyway.
-WIND_FIELD_MIN_STEP_DEG = 0.25
+# How many grid points to sample per axis at most - keeps both the
+# Open-Meteo request (one HTTP call, comma-joined lat/lon lists - see
+# fetch_wind_field) and the number of arrows Leaflet has to paint bounded
+# regardless of how far zoomed-out the current viewport is (a whole-Spain
+# view spans ~14 x 8 degrees). 12 (was 9) trades a slightly heavier response
+# for a visibly smoother wind-speed heatmap (see drawWindHeatFrame,
+# frontend/public/app.js) - confirmed live that 9x9 read as 2-3 flat color
+# zones with a hard seam between them once zoomed in, not a believable field.
+WIND_FIELD_MAX_POINTS_PER_AXIS = 12
+# Floor on grid spacing (degrees). Originally 0.25 - "one arrow every few
+# hundred meters would be meaningless at this forecast's resolution anyway"
+# was true for the discrete ARROW grid, but it actively hurt the heatmap:
+# zoomed into a ~1-2 degree viewport, this floor (not MAX_POINTS_PER_AXIS)
+# was the binding constraint, forcing just a handful of points across the
+# visible area - bilinear interpolation between that few real readings reads
+# as an artificial hard-edged color split, not a continuous field (confirmed
+# live). Lowered so MAX_POINTS_PER_AXIS governs density at ANY zoom instead;
+# this floor now only kicks in for genuinely tiny (sub-block-level) bboxes.
+WIND_FIELD_MIN_STEP_DEG = 0.05
 
 
 def _wind_field_grid(west: float, south: float, east: float, north: float) -> list[tuple[float, float]]:
@@ -333,6 +424,281 @@ def fetch_wind_field(west: float, south: float, east: float, north: float, hours
         ]
         if series:
             field.append({"lat": lat, "lon": lon, "hours": series})
+
+    # Terrain-deflection heuristic (see module notes below) - bends each
+    # point's wind toward the local valley/ridge alignment using elevation
+    # data, purely a display enrichment for the map's particle/heatmap
+    # layers. Degrades silently to the raw, undeflected field on any
+    # failure - this must never turn a working wind-field response into a
+    # 502 over what's meant to be cosmetic.
+    elevations = fetch_elevation_grid(points)
+    if elevations:
+        gradients = _elevation_gradient_grid(points, elevations)
+        if gradients:
+            field = deflect_wind_field(field, gradients)
+    return field
+
+
+# In-memory, unbounded, process-lifetime cache - terrain doesn't change, but
+# the wind-field endpoint is refetched on every map pan/zoom, so repeatedly
+# re-querying elevation for the same points (common: panning around one
+# region) would be pure waste. Keyed by the same 3-decimal-rounded (lat, lon)
+# _wind_field_grid already produces, so panning within one zoom level (fixed
+# step size) regenerates identical keys and actually hits. A single-region
+# tool (Spain) at this precision stays trivially small in memory even in the
+# worst case (the whole country at max grid density) - no eviction needed.
+_ELEVATION_CACHE: dict[tuple[float, float], float] = {}
+_ELEVATION_CHUNK_SIZE = 100  # Open-Elevation has no documented per-request point limit, but smaller batches keep any one flaky request's blast radius small
+
+
+def fetch_elevation_grid(points: list[tuple[float, float]]) -> dict[tuple[float, float], float] | None:
+    """
+    Batched elevation lookup for every wind-field grid point, feeding the
+    terrain-deflection heuristic below - same Open-Elevation endpoint/pipe-
+    batching technique fetch_slope already uses for 2 points, extended here
+    to ~100 per request. Checks _ELEVATION_CACHE first (terrain is static),
+    only fetching points not already known.
+
+    Returns whatever was successfully resolved (partial results are still
+    useful - one flaky chunk shouldn't discard elevation for the whole grid),
+    or None only if EVERY point ends up unavailable, matching this file's
+    other degrade-not-fail conventions for Open-Elevation (see fetch_slope's
+    caller in predict_spread) - documented as a known-flaky free dependency.
+    """
+    keys = [(round(lat, 3), round(lon, 3)) for lat, lon in points]
+    missing = [k for k in keys if k not in _ELEVATION_CACHE]
+
+    for i in range(0, len(missing), _ELEVATION_CHUNK_SIZE):
+        chunk = missing[i : i + _ELEVATION_CHUNK_SIZE]
+        try:
+            response = httpx.get(
+                OPEN_ELEVATION_URL,
+                params={"locations": "|".join(f"{lat},{lon}" for lat, lon in chunk)},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            results = response.json()["results"]
+            for (lat, lon), result in zip(chunk, results):
+                _ELEVATION_CACHE[(lat, lon)] = result["elevation"]
+        except Exception:
+            logger.warning("Elevation batch fetch failed for %d point(s), skipping", len(chunk), exc_info=True)
+            continue
+
+    resolved = {k: _ELEVATION_CACHE[k] for k in keys if k in _ELEVATION_CACHE}
+    return resolved or None
+
+
+def _elevation_gradient_grid(
+    points: list[tuple[float, float]], elevations: dict[tuple[float, float], float]
+) -> dict[tuple[float, float], tuple[float, float]]:
+    """
+    Local elevation gradient (dz/dlon_m, dz/dlat_m - meters of rise per
+    meter, in the east/north directions) at each grid point, via finite
+    differences against its immediate neighbors in the SAME regular grid
+    _wind_field_grid produces - central difference for interior points,
+    one-sided at grid edges. Mirrors buildWindFieldGridMeta's client-side
+    technique (frontend/public/app.js) for reconstructing row/col adjacency
+    from a flat point list. Returns {} for a degenerate grid (<2 distinct
+    lats or lons) - same threshold sampleWindAt's own bilinear fallback uses.
+    A point missing an elevation reading (partial fetch) is treated as flat
+    (omitted) rather than guessed.
+    """
+    lats = sorted({lat for lat, _lon in points})
+    lons = sorted({lon for _lat, lon in points})
+    if len(lats) < 2 or len(lons) < 2:
+        return {}
+
+    lat_step_deg = lats[1] - lats[0]
+    lon_step_deg = lons[1] - lons[0]
+    lat_idx = {lat: i for i, lat in enumerate(lats)}
+    lon_idx = {lon: i for i, lon in enumerate(lons)}
+
+    gradients = {}
+    for lat, lon in points:
+        if (lat, lon) not in elevations:
+            continue
+        i, j = lat_idx[lat], lon_idx[lon]
+
+        def elev_at(li: int, lj: int) -> float | None:
+            if li < 0 or li >= len(lats) or lj < 0 or lj >= len(lons):
+                return None
+            return elevations.get((lats[li], lons[lj]))
+
+        west_e, east_e = elev_at(i, j - 1), elev_at(i, j + 1)
+        south_e, north_e = elev_at(i - 1, j), elev_at(i + 1, j)
+        lon_step_m = lon_step_deg * METERS_PER_DEGREE_LAT * math.cos(math.radians(lat))
+        lat_step_m = lat_step_deg * METERS_PER_DEGREE_LAT
+
+        if west_e is not None and east_e is not None:
+            dz_dlon = (east_e - west_e) / (2 * lon_step_m)
+        elif east_e is not None:
+            dz_dlon = (east_e - elevations[(lat, lon)]) / lon_step_m
+        elif west_e is not None:
+            dz_dlon = (elevations[(lat, lon)] - west_e) / lon_step_m
+        else:
+            dz_dlon = 0.0
+
+        if south_e is not None and north_e is not None:
+            dz_dlat = (north_e - south_e) / (2 * lat_step_m)
+        elif north_e is not None:
+            dz_dlat = (north_e - elevations[(lat, lon)]) / lat_step_m
+        elif south_e is not None:
+            dz_dlat = (elevations[(lat, lon)] - south_e) / lat_step_m
+        else:
+            dz_dlat = 0.0
+
+        gradients[(lat, lon)] = (dz_dlon, dz_dlat)
+    return gradients
+
+
+# Slope (as a %% rise-per-meter-horizontal) above which terrain starts
+# meaningfully channeling wind (3%) and where the deflection effect is
+# capped at its strongest (15%+) - tuned by eye against a real mountain test
+# area (Jaca/Pyrenees foothills), not a physical constant.
+WIND_DEFLECTION_GENTLE_SLOPE_PCT = 3.0
+WIND_DEFLECTION_STEEP_SLOPE_PCT = 15.0
+WIND_DEFLECTION_MAX_WEIGHT = 0.55
+
+
+def deflect_wind_field(field: list[dict], gradients: dict[tuple[float, float], tuple[float, float]]) -> list[dict]:
+    """
+    Bends each grid point's raw model wind toward the local valley/ridge
+    alignment, in proportion to how steep the terrain there is - a VISUAL
+    HEURISTIC (not real physics) for the map's particle-flow/heatmap layers,
+    compensating for Open-Meteo's free-tier model resolution not resolving
+    valley-scale wind channeling the way premium high-res regional models
+    (e.g. AROME) do. Terrain doesn't change hour-to-hour, so the deflection
+    weight/axis is computed ONCE per point and applied to every hour's
+    direction_from_deg for that point.
+
+    Blends in u/v vector-component space, never raw angles - the same
+    angle-wraparound trap this codebase's own frontend interpolation
+    (windToComponents/componentsToWind, frontend/public/app.js) already
+    guards against. The valley/ridge axis (perpendicular to the elevation
+    gradient) is bidirectional - whichever of its two opposite bearings is
+    closer to the wind's own original bearing is used, so deflection only
+    ever bends the wind, never reverses its general direction.
+    """
+    for point in field:
+        gradient = gradients.get((point["lat"], point["lon"]))
+        if not gradient:
+            continue
+        dz_dlon, dz_dlat = gradient
+        slope_pct = 100 * math.hypot(dz_dlon, dz_dlat)
+        if slope_pct <= WIND_DEFLECTION_GENTLE_SLOPE_PCT:
+            continue
+        weight = min(
+            (slope_pct - WIND_DEFLECTION_GENTLE_SLOPE_PCT)
+            / (WIND_DEFLECTION_STEEP_SLOPE_PCT - WIND_DEFLECTION_GENTLE_SLOPE_PCT),
+            1.0,
+        ) * WIND_DEFLECTION_MAX_WEIGHT
+
+        # Gradient points uphill, as an (east, north) vector (dz_dlon,
+        # dz_dlat). The valley/ridge (contour) axis is perpendicular to it -
+        # rotating (east, north) by 90 deg gives (-north, east), and
+        # since compass bearing = atan2(east, north), that perpendicular
+        # vector's bearing is atan2(-dz_dlat, dz_dlon). (Sanity check: a
+        # purely eastward gradient, dz_dlon=1/dz_dlat=0, must give a
+        # north-south axis - atan2(-0, 1) = 0 deg (north), correct; the
+        # earlier atan2(-dz_dlon, dz_dlat) form gave 270 deg instead, an
+        # actual east-west axis for an east-west gradient, which is not
+        # perpendicular at all - that was the bug causing wild swings.)
+        axis_bearing = math.degrees(math.atan2(-dz_dlat, dz_dlon)) % 360
+
+        for hour in point["hours"]:
+            speed = hour["speed_kmh"]
+            direction_from = hour["direction_from_deg"]
+            if speed is None or direction_from is None:
+                continue
+            # "Blowing toward" bearing - same convention windToComponents uses.
+            bearing = (direction_from + 180) % 360
+            u = speed * math.sin(math.radians(bearing))
+            v = speed * math.cos(math.radians(bearing))
+
+            candidates = (axis_bearing, (axis_bearing + 180) % 360)
+
+            def angular_diff(a: float, b: float) -> float:
+                d = abs(a - b) % 360
+                return min(d, 360 - d)
+
+            chosen_axis = min(candidates, key=lambda c: angular_diff(c, bearing))
+            u_axis = speed * math.sin(math.radians(chosen_axis))
+            v_axis = speed * math.cos(math.radians(chosen_axis))
+
+            u_new = (1 - weight) * u + weight * u_axis
+            v_new = (1 - weight) * v + weight * v_axis
+            new_bearing = math.degrees(math.atan2(u_new, v_new)) % 360
+            hour["direction_from_deg"] = (new_bearing - 180) % 360
+    return field
+
+
+# How much weight a point's own (pre-smoothing) vector keeps vs. its
+# immediate neighbors' average - 0.45 self / 0.55 spread across present
+# neighbors is a deliberately strong blend: the goal is a visibly CONNECTED
+# field (confirmed live against windy.com's own smooth, continuous-looking
+# flow), not a subtle touch-up.
+WIND_SMOOTH_SELF_WEIGHT = 0.45
+
+
+def _smooth_wind_field(field: list[dict]) -> list[dict]:
+    """
+    One spatial smoothing pass over the WHOLE field (not just terrain-
+    deflected points) - blends each point's wind vector with its immediate
+    grid neighbors', in u/v space. Real wind is a continuous physical field;
+    Open-Meteo's own coarse model plus this file's independent per-point
+    terrain deflection above can each introduce point-to-point disagreement
+    that reads as "every grid cell doing its own thing" rather than a
+    flowing current, even over perfectly flat terrain (confirmed live: the
+    raw model's own low-wind-speed readings are already fairly noisy
+    direction-to-direction). This doesn't explain away WHY neighbors
+    disagree, it just matches how Windy's own rendering never shows a hard
+    cell-to-cell discontinuity.
+
+    All neighbor lookups use the ORIGINAL (pre-smoothing) vectors for every
+    point in a single pass, so the result doesn't depend on point
+    iteration order.
+    """
+    if not field:
+        return field
+    points = [(p["lat"], p["lon"]) for p in field]
+    lats = sorted({lat for lat, _lon in points})
+    lons = sorted({lon for _lat, lon in points})
+    if len(lats) < 2 or len(lons) < 2:
+        return field
+    lat_idx = {lat: i for i, lat in enumerate(lats)}
+    lon_idx = {lon: i for i, lon in enumerate(lons)}
+    by_key = {(p["lat"], p["lon"]): p for p in field}
+    num_hours = min(len(p["hours"]) for p in field)
+    neighbor_offsets = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+    for hour_i in range(num_hours):
+        original_uv = {}
+        for (lat, lon), point in by_key.items():
+            hour = point["hours"][hour_i]
+            speed, direction_from = hour["speed_kmh"], hour["direction_from_deg"]
+            if speed is None or direction_from is None:
+                continue
+            bearing = math.radians((direction_from + 180) % 360)
+            original_uv[(lat, lon)] = (speed * math.sin(bearing), speed * math.cos(bearing))
+
+        for (lat, lon), (u_self, v_self) in original_uv.items():
+            i, j = lat_idx[lat], lon_idx[lon]
+            neighbor_uvs = []
+            for di, dj in neighbor_offsets:
+                ni, nj = i + di, j + dj
+                if 0 <= ni < len(lats) and 0 <= nj < len(lons):
+                    neighbor = original_uv.get((lats[ni], lons[nj]))
+                    if neighbor:
+                        neighbor_uvs.append(neighbor)
+            if neighbor_uvs:
+                neighbor_weight = (1 - WIND_SMOOTH_SELF_WEIGHT) / len(neighbor_uvs)
+                u = WIND_SMOOTH_SELF_WEIGHT * u_self + neighbor_weight * sum(u for u, _v in neighbor_uvs)
+                v = WIND_SMOOTH_SELF_WEIGHT * v_self + neighbor_weight * sum(v for _u, v in neighbor_uvs)
+            else:
+                u, v = u_self, v_self
+            hour = by_key[(lat, lon)]["hours"][hour_i]
+            hour["speed_kmh"] = math.hypot(u, v)
+            hour["direction_from_deg"] = (math.degrees(math.atan2(u, v)) - 180) % 360
     return field
 
 

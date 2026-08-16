@@ -45,14 +45,21 @@ const sigpacLayer = L.tileLayer.wms("https://sigpac-hubcloud.es/wms/ows", {
 // in practice the hull's semi-transparent gray fill was landing above the
 // dots and washing out their real recency colors.
 map.createPane("hullPane").style.zIndex = 350; // below overlayPane (400)
+// Windy-style wind-SPEED color wash (see drawWindHeatFrame) - above the hull
+// polygons (otherwise their semi-transparent fill would wash the heatmap out
+// right back, the same fill-order bug the hotspot comment below describes)
+// but below the fire dots, so detections stay legible on top of the color.
+map.createPane("windHeatPane").style.zIndex = 440;
 map.createPane("hotspotPane").style.zIndex = 450; // above overlayPane, below shadowPane (500)
+// Windy-style particle canvas (see startWindParticles) - just above the fire
+// dots so streaks read over the basemap/hotspots/heatmap, still below
+// shadowPane (500) so incident markers/tooltips stay on top and clickable.
+map.createPane("windParticlePane").style.zIndex = 460;
 
 const markersLayer = L.layerGroup().addTo(map);
 const webcamsLayer = L.layerGroup();
 const aircraftLayer = L.layerGroup();
-const windLayer = L.layerGroup().addTo(map);
-// Windy-style arrow field (many points, not just one per active incident -
-// see windLayer above) for the current viewport - see reloadWindField.
+// Windy-style arrow field across the whole viewport - see reloadWindField.
 const windFieldLayer = L.layerGroup().addTo(map);
 // Cumulative EFFIS burnt-area extent since Jan 1 of the current year -
 // deliberately independent of the date-range selector/timeline scrubber
@@ -234,6 +241,27 @@ function recencyColor(acquiredAtIso) {
   const ageHours = (Date.now() - new Date(acquiredAtIso).getTime()) / 3600000;
   const bucket = RECENCY_LEGEND.find((b) => ageHours <= b.maxHours);
   return bucket ? bucket.color : RECENCY_STALE_COLOR;
+}
+
+// Same "plain array + lookup" convention as RECENCY_LEGEND above, but the
+// opposite semantic direction - calm reads cool/blue, strong reads hot/red,
+// matching the universal wind-map convention (and windy.com itself) rather
+// than this file's own hot=fresh/urgent recency scale. Used by both the
+// map's wind-speed heatmap (drawWindHeatFrame) and the bottom dock's
+// per-hour wind cell (weatherStripChipHtml), so a reading looks the same
+// color whether you see it on the map or in the panel.
+const WIND_SPEED_LEGEND = [
+  { maxKmh: 5, color: "#2166ac", label: "0-5 km/h" },
+  { maxKmh: 15, color: "#4dac9c", label: "5-15 km/h" },
+  { maxKmh: 30, color: "#a6d96a", label: "15-30 km/h" },
+  { maxKmh: 50, color: "#fee08b", label: "30-50 km/h" },
+  { maxKmh: 80, color: "#f46d43", label: "50-80 km/h" },
+];
+const WIND_SPEED_EXTREME_COLOR = "#a50026"; // 80+ km/h - rare, but real gusts do get reported
+
+function windSpeedColor(speedKmh) {
+  const bucket = WIND_SPEED_LEGEND.find((b) => speedKmh <= b.maxKmh);
+  return bucket ? bucket.color : WIND_SPEED_EXTREME_COLOR;
 }
 
 // Distinct marker SHAPE per satellite source, layered on top of the existing
@@ -1107,7 +1135,14 @@ function vegetationSectionHtml(stats) {
 // weather source, so this never needs its own network call.
 function weatherSectionHtml(hour, airQuality) {
   if (!hour) return "";
-  const windArrow = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${hour.wind_direction_from_deg}deg);"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg>`;
+  // Two different upstream shapes land here: predict-incident's hourly
+  // entries (wind_speed_kmh/wind_direction_from_deg - renamed as part of the
+  // spread-model response) and /weather-timeline's raw entries (speed_kmh/
+  // direction_from_deg, straight from fetch_wind_series' field names). Accept
+  // either rather than forcing every caller to remap fields first.
+  const windSpeedKmh = hour.wind_speed_kmh ?? hour.speed_kmh;
+  const windDirectionDeg = hour.wind_direction_from_deg ?? hour.direction_from_deg;
+  const windArrow = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${windDirectionDeg}deg);"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg>`;
   // 120m/CAPE/VPD/etc. are additive extras from fetch_wind_series - guarded
   // individually since older cached prediction responses (or a future
   // upstream Open-Meteo hiccup on just one field) may not carry all of them.
@@ -1133,13 +1168,129 @@ function weatherSectionHtml(hour, airQuality) {
     `<div class="weather-card">` +
     `<div class="weather-card-title">Previsión ahora</div>` +
     `<div class="weather-row">` +
-    `<span class="weather-item" style="color:var(--wind);">${windArrow} ${Math.round(hour.wind_speed_kmh)} km/h</span>` +
+    `<span class="weather-item" style="color:var(--wind);">${windArrow} ${Math.round(windSpeedKmh)} km/h</span>` +
     `<span class="weather-item">🌡️ ${Math.round(hour.temperature_c)}°C</span>` +
     `<span class="weather-item">💧 ${Math.round(hour.humidity_pct)}% hum.</span>` +
     `</div>` +
     (extraItems ? `<div class="weather-row">${extraItems}</div>` : "") +
     `</div>`
   );
+}
+
+// Short "15h" / "16 ago" tick label for one hourly entry - day-boundary
+// entries (local midnight) get a date instead of an hour, same convention
+// dailyActivityChartHtml's own day-label helper uses (new Date(x + "T00:00:00Z")
+// then toLocaleDateString) - hour.time comes back as a naive UTC string
+// ("2026-08-15T13:00", no offset) from Open-Meteo, so "Z" must be appended
+// before parsing or the browser would treat it as already-local and shift it.
+function weatherStripTickLabel(isoNaiveUtc) {
+  const date = new Date(`${isoNaiveUtc}Z`);
+  return date.getHours() === 0
+    ? date.toLocaleDateString("es-ES", { day: "2-digit", month: "short" })
+    : `${date.getHours()}h`;
+}
+
+// Full date label for a day-group HEADER (see groupWeatherHoursByDay) -
+// unlike weatherStripTickLabel, always a date regardless of hour-of-day,
+// since the timeline's first bucket rarely starts exactly at midnight (it
+// starts at "now minus 24h").
+function weatherDayLabel(isoNaiveUtc) {
+  return new Date(`${isoNaiveUtc}Z`).toLocaleDateString("es-ES", { weekday: "short", day: "2-digit", month: "short" });
+}
+
+// One hourly chip - icon/hour/temp, wind speed optional (dropped in the map
+// popup's narrower window) - shared by weatherDockHtml and weatherPopupHtml
+// so both stay in sync rather than maintaining two near-identical templates.
+// The wind cell is colored via windSpeedColor - the SAME scale the map's
+// wind-speed heatmap uses, so a reading looks the same whether you see it on
+// the map or in this panel. Rain only shows when it's actually forecast
+// (>0.05mm) - a dry hour just omits the row rather than showing "0.0mm".
+function weatherStripChipHtml(hour, isNow, { showNowTag = false, showWind = true } = {}) {
+  return (
+    `<div class="weather-strip-hour${isNow ? " weather-strip-now" : ""}">` +
+    (showNowTag && isNow ? `<div class="weather-strip-now-tag">AHORA</div>` : "") +
+    `<div class="weather-strip-label">${weatherStripTickLabel(hour.time)}</div>` +
+    `<div class="weather-strip-icon">${weatherCodeIcon(hour.weathercode)}</div>` +
+    `<div class="weather-strip-temp">${Math.round(hour.temperature_c)}°</div>` +
+    (hour.precipitation_mm > 0.05
+      ? `<div class="weather-strip-rain">💧${hour.precipitation_mm.toFixed(1)}</div>`
+      : "") +
+    (showWind
+      ? `<div class="weather-strip-wind-cell" style="background:${windSpeedColor(hour.speed_kmh)}55;">${Math.round(hour.speed_kmh)} km/h</div>`
+      : "") +
+    `</div>`
+  );
+}
+
+// Groups an hourly series into consecutive day buckets (boundary = local
+// midnight, same rule weatherStripTickLabel uses) - lets weatherDockHtml
+// render a Windy-style day-header row above each day's hour chips instead of
+// one flat undifferentiated strip.
+function groupWeatherHoursByDay(hourly) {
+  const days = [];
+  hourly.forEach((hour, index) => {
+    const isDayStart = new Date(`${hour.time}Z`).getHours() === 0;
+    if (isDayStart || !days.length) {
+      days.push({ label: weatherDayLabel(hour.time), hours: [] });
+    }
+    days[days.length - 1].hours.push({ hour, index });
+  });
+  return days;
+}
+
+// Windy-style bottom dock (see #weather-dock, docked above the timeline
+// scrubber in index.html) - a compact "right now" reading alongside a
+// horizontally scrollable, day-grouped grid spanning the WHOLE past+forecast
+// window (see /api/fire-spread/weather-timeline). Replaces the old sidebar
+// weather card: this now lives at the bottom of the map instead, next to the
+// thing it's most relevant to (the timeline you're already scrubbing).
+function weatherDockHtml(timeline) {
+  if (!timeline || !timeline.hourly || !timeline.hourly.length) return "";
+  const nowHour = timeline.hourly[timeline.now_index];
+  const windArrow = `<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${nowHour.direction_from_deg}deg);"><path d="M12 2v18M12 2l-5 5M12 2l5 5"/></svg>`;
+  const nowBlock =
+    `<div class="weather-dock-now">` +
+    `<span class="weather-dock-icon">${weatherCodeIcon(nowHour.weathercode)}</span>` +
+    `<span class="weather-dock-temp">${Math.round(nowHour.temperature_c)}°</span>` +
+    `<span class="weather-dock-wind">${windArrow} ${Math.round(nowHour.speed_kmh)} km/h</span>` +
+    `</div>`;
+  const days = groupWeatherHoursByDay(timeline.hourly);
+  const dayColumns = days
+    .map(
+      (day) =>
+        `<div class="weather-strip-day">` +
+        `<div class="weather-strip-day-header">${day.label}</div>` +
+        `<div class="weather-strip-day-hours">` +
+        day.hours
+          .map(({ hour, index }) => weatherStripChipHtml(hour, index === timeline.now_index, { showNowTag: true }))
+          .join("") +
+        `</div>` +
+        `</div>`
+    )
+    .join("");
+  return (
+    `<div class="weather-dock-inner">${nowBlock}` +
+    `<div class="weather-strip-grid" id="weather-strip">${dayColumns}</div>` +
+    `</div>`
+  );
+}
+
+// Compact version of the same data for the map's click-to-open weather
+// popup (see the map "click" handler near toggleWindParticles - active
+// while "Partículas de viento" is on) - the "now" reading plus a narrow,
+// non-scrolling window of nearby hours (2 back, now, 2 forward) rather than
+// the dock's full scrollable span, since a Leaflet popup has far less room.
+function weatherPopupHtml(timeline) {
+  if (!timeline || !timeline.hourly || !timeline.hourly.length) return "";
+  const nowHour = timeline.hourly[timeline.now_index];
+  const nowCard = weatherSectionHtml(nowHour, null);
+  const windowStart = Math.max(0, timeline.now_index - 2);
+  const windowEnd = Math.min(timeline.hourly.length, timeline.now_index + 3);
+  const chips = timeline.hourly
+    .slice(windowStart, windowEnd)
+    .map((hour, offset) => weatherStripChipHtml(hour, windowStart + offset === timeline.now_index, { showWind: false }))
+    .join("");
+  return `<div class="weather-popup">${nowCard}<div class="weather-popup-strip">${chips}</div></div>`;
 }
 
 function telegramSectionHtml(messages) {
@@ -2143,6 +2294,26 @@ async function loadIncidentDetections(incident) {
   }
 }
 
+// Populates #weather-dock (docked above the timeline scrubber - see
+// index.html) with the full past+forecast hourly strip (see
+// weatherDockHtml), AND #weather-slot in the sidebar with the fuller
+// "right now" reading (humidity/precip/CAPE/etc - see weatherSectionHtml)
+// that the dock's compact layout has no room for. Independent of
+// enableIncidentPrediction, which only ever had a single current-hour
+// reading to show (predict-incident's hourly[0]) and is scoped to the 8h
+// spread-model window rather than this display-only 24h-past/48h-forecast read.
+async function loadIncidentWeatherTimeline(incident) {
+  const timeline = await fetchWeatherTimeline(incident);
+  // Stale guard: same pattern as loadIncidentDetections above - the user may
+  // have moved on to a different incident (or back to the list) before this
+  // resolved.
+  if (predictionIncident !== incident) return;
+  const dock = document.getElementById("weather-dock");
+  if (dock) dock.innerHTML = weatherDockHtml(timeline);
+  const slot = document.getElementById("weather-slot");
+  if (slot && timeline?.hourly?.length) slot.innerHTML = weatherSectionHtml(timeline.hourly[timeline.now_index], null);
+}
+
 async function showIncidentDetail(incident) {
   map.flyTo([incident.centroid_lat, incident.centroid_lon], Math.max(map.getZoom(), 11));
   // Clear any previous incident's badge immediately - switching straight from
@@ -2177,6 +2348,11 @@ async function showIncidentDetail(incident) {
   // enableIncidentPrediction. Fire-and-forget: the detail card itself
   // doesn't wait on this network round-trip.
   enableIncidentPrediction(incident);
+  // Independent of the above: the full past+forecast hourly strip (see
+  // loadIncidentWeatherTimeline) is a display-only read of "what's the
+  // weather here", not tied to the 8h spread-model window or its own
+  // failure path, so it's fetched and rendered separately.
+  loadIncidentWeatherTimeline(incident);
 
   const name = displayName(incident);
   const body = document.getElementById("sidebar-body");
@@ -2227,6 +2403,10 @@ async function showIncidentDetail(incident) {
     `<div id="regional-status-slot"></div>` +
     `<div id="satellite-carousel-slot"></div>` +
     `<div id="vegetation-slot"></div>` +
+    // The hourly strip itself lives in #weather-dock, docked above the
+    // timeline scrubber at the bottom of the map - this slot just gets the
+    // fuller "right now" reading (humidity/precip/CAPE/etc, see
+    // weatherSectionHtml) that doesn't fit the dock's compact layout.
     `<div id="weather-slot"></div>` +
     `<div id="telegram-section-slot"></div>` +
     `<button class="timeline-toggle" id="timeline-toggle">` +
@@ -2351,25 +2531,64 @@ async function loadFires() {
     await loadIncidents();
     initTimelineScrubber(lastFires);
     renderMap();
-    // Fire-and-forget - wind vectors + the summary bar's wind figure depend
-    // on a handful of extra network round-trips (one per active incident)
-    // and shouldn't block the map's first paint.
-    refreshWindVectors(lastIncidents);
+    // Fire-and-forget - the summary bar's wind figure depends on a handful
+    // of extra network round-trips (one per active incident) and shouldn't
+    // block the map's first paint.
+    updateWindSummary(lastIncidents);
     updateSatelliteFreshness();
   } catch (err) {
     setStatus(`No se pudieron cargar los datos: ${err.message}`);
   }
 }
 
-// ---------- Wind vectors (per active incident, distinct from severity) ----------
-// A small rotated arrow at each active incident's centroid shows current
-// wind speed/direction, reusing the same Open-Meteo-backed endpoint the
-// experimental fire-spread tool already calls for its 24h forecast - here
-// capped to 1h since this only needs "right now". Capped to a handful of
-// incidents at once so a busy day doesn't fire dozens of concurrent
-// requests against Open-Meteo just to paint arrows.
-const MAX_WIND_VECTORS = 20;
+// ---------- Wind summary (per active incident, feeds the national summary
+// bar's "Viento medio" figure only - no longer draws its own map marker,
+// see updateWindSummary below) ----------
+// Reuses the same Open-Meteo-backed endpoint the experimental fire-spread
+// tool already calls for its 24h forecast - here capped to 1h since this
+// only needs "right now". Capped to a handful of incidents at once so a busy
+// day doesn't fire dozens of concurrent requests against Open-Meteo.
+const MAX_WIND_SUMMARY_SAMPLES = 20;
 const windCacheByIncidentId = new Map(); // id -> { speedKmh, directionFromDeg } | null (fetch failed)
+// Full past+now+forecast weather series for a point (see
+// /api/fire-spread/weather-timeline) - separate cache from windCacheByIncidentId
+// above (that one's a single-hour /predict call feeding just the summary
+// bar's average). Keyed by `point.id`, which callers set to whatever's
+// stable for their use: an incident's own id for the sidebar/dock (see
+// loadIncidentWeatherTimeline), or a synthetic "lat,lon" string for an
+// arbitrary map click (see toggleWindParticles' click handler) - either way
+// `point` just needs `.id`/`.centroid_lat`/`.centroid_lon`.
+const weatherTimelineCacheByPointId = new Map(); // id -> { now_index, hourly: [...] } | null
+
+async function fetchWeatherTimeline(point) {
+  if (weatherTimelineCacheByPointId.has(point.id)) return weatherTimelineCacheByPointId.get(point.id);
+  try {
+    const res = await fetch(
+      `${apiBaseUrl}/api/fire-spread/weather-timeline?lat=${point.centroid_lat}&lon=${point.centroid_lon}`
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const timeline = await res.json();
+    weatherTimelineCacheByPointId.set(point.id, timeline);
+    return timeline;
+  } catch {
+    weatherTimelineCacheByPointId.set(point.id, null);
+    return null;
+  }
+}
+
+// WMO weather-code buckets (Open-Meteo's `weathercode` field) collapsed to a
+// small emoji set - just enough visual variety for an hourly strip to read
+// as "sunny/cloudy/rainy/stormy" at a glance, not a full icon set.
+function weatherCodeIcon(code) {
+  if (code === 0) return "☀️";
+  if (code === 1 || code === 2) return "⛅";
+  if (code === 3) return "☁️";
+  if (code === 45 || code === 48) return "🌫️";
+  if (code >= 51 && code <= 67) return "🌧️";
+  if (code >= 71 && code <= 86) return "🌨️";
+  if (code >= 95) return "⛈️";
+  return "☁️";
+}
 
 function windArrowIcon(directionFromDeg, speedKmh) {
   // Arrow points where the wind is blowing TOWARD (180deg from the "from"
@@ -2406,23 +2625,13 @@ async function fetchWindForIncident(incident) {
   }
 }
 
-async function refreshWindVectors(incidents) {
-  const active = incidents.filter((incident) => incident.status === "active").slice(0, MAX_WIND_VECTORS);
+// Weather-at-a-point popups now live on the wind-particles layer instead of
+// a fixed per-incident arrow (see the map click handler near
+// toggleWindParticles) - this only computes the summary bar's average, no
+// longer draws anything on the map itself.
+async function updateWindSummary(incidents) {
+  const active = incidents.filter((incident) => incident.status === "active").slice(0, MAX_WIND_SUMMARY_SAMPLES);
   const winds = await Promise.all(active.map(fetchWindForIncident));
-  windLayer.clearLayers();
-  active.forEach((incident, idx) => {
-    const wind = winds[idx];
-    if (!wind) return;
-    L.marker([incident.centroid_lat, incident.centroid_lon], {
-      icon: windArrowIcon(wind.directionFromDeg, wind.speedKmh),
-      interactive: true,
-      zIndexOffset: 500,
-    })
-      .bindTooltip(`${Math.round(wind.speedKmh)} km/h desde el ${compassLabel(wind.directionFromDeg)}`, {
-        className: "wind-arrow-tooltip",
-      })
-      .addTo(windLayer);
-  });
   updateSummaryBar(incidents, winds.filter(Boolean));
 }
 
@@ -2556,9 +2765,53 @@ function scrubberNowFraction() {
   return total > 0 ? (pastSpan / total) * 100 : 100;
 }
 
+// Short tick label for one point along the scrubber track - hour-of-day if
+// the whole track spans under 48h (matches how densely-packed a single
+// active day's worth of detections gets), otherwise a short date, so ticks
+// stay meaningful whether the loaded window is "last 24h" or "last 30 days".
+function scrubberTickLabel(ms, useHourGranularity) {
+  const date = new Date(ms);
+  return useHourGranularity
+    ? `${date.getHours()}h`
+    : date.toLocaleDateString("es-ES", { day: "2-digit", month: "short" });
+}
+
+// Interior reference points along the track (not the start/current/end
+// labels above it, and NOT snap stops - dragging stays continuous). Spans
+// the WHOLE track including any active forecast zone, so a tick past
+// scrubberNowFraction() falls inside the future/blue segment.
+function renderScrubberTicks() {
+  const container = document.getElementById("scrubber-ticks");
+  if (!container) return;
+  const pastSpan = scrubberBounds ? scrubberBounds.endMs - scrubberBounds.startMs : 0;
+  const totalSpan = pastSpan + effectiveFutureMs();
+  if (!scrubberBounds || totalSpan <= 0) {
+    container.innerHTML = "";
+    return;
+  }
+  const useHourGranularity = totalSpan < 48 * 3600000;
+  const TICK_COUNT = 4;
+  container.innerHTML = Array.from({ length: TICK_COUNT }, (_, i) => {
+    const pct = ((i + 1) / (TICK_COUNT + 1)) * 100;
+    const ms = scrubberBounds.startMs + (pct / 100) * totalSpan;
+    return (
+      `<span class="scrubber-tick" style="left:${pct}%">` +
+      `<span class="scrubber-tick-bar"></span>` +
+      `<span class="scrubber-tick-label">${scrubberTickLabel(ms, useHourGranularity)}</span>` +
+      `</span>`
+    );
+  }).join("");
+}
+
 function updateScrubberEndLabel() {
   const hours = effectiveFutureHours();
   document.getElementById("scrubber-label-end").textContent = hours > 0 ? `+${hours}h` : "Ahora";
+  // Single choke point for both the color-segmented track and the tick
+  // marks - every caller of updateScrubberEndLabel (initTimelineScrubber,
+  // enableIncidentPrediction, disableIncidentPrediction) is exactly the set
+  // of places where scrubberBounds/effectiveFutureHours() can have changed.
+  document.getElementById("scrubber-range").style.setProperty("--scrubber-now-pct", `${scrubberNowFraction()}%`);
+  renderScrubberTicks();
 }
 
 function initTimelineScrubber(fires) {
@@ -2720,8 +2973,9 @@ async function enableIncidentPrediction(incident) {
     if (predictionIncident !== incident) return;
     incidentFireSpreadData = data;
     const firstFront = data.fronts[0];
-    const weatherSlot = document.getElementById("weather-slot");
-    if (weatherSlot && firstFront) weatherSlot.innerHTML = weatherSectionHtml(firstFront.hourly[0], firstFront.air_quality);
+    // #weather-dock itself is owned by loadIncidentWeatherTimeline now (see
+    // showIncidentDetail) - this only still needs firstFront for the
+    // scrubber's future-hours span below.
     scrubberFutureHours = firstFront ? firstFront.hourly.length : 0;
     scrubberFutureMs = scrubberFutureHours * 3600000;
     updateScrubberEndLabel();
@@ -2746,6 +3000,14 @@ function disableIncidentPrediction() {
   fireSpreadLayer.clearLayers();
   restoreAreaMetric();
   updateScrubberEndLabel();
+  // Otherwise stale hourly data can linger on screen while the next
+  // incident's loadIncidentWeatherTimeline fetch is still in flight, or
+  // after going back to the list (this dock only makes sense for one
+  // specific fire's location, not the national overview).
+  const weatherDock = document.getElementById("weather-dock");
+  if (weatherDock) weatherDock.innerHTML = "";
+  const weatherSlot = document.getElementById("weather-slot");
+  if (weatherSlot) weatherSlot.innerHTML = "";
 }
 
 function clearPredictionEllipse() {
@@ -2997,9 +3259,8 @@ function toggleAircraftLayer() {
 }
 
 // ---------- Wind field (Windy-style arrow grid) ----------
-// A grid of wind arrows across the current viewport (not just one per
-// active incident - see windLayer/refreshWindVectors above), each carrying
-// its own hourly forecast series from /api/fire-spread/wind-field. Dragging
+// A grid of wind arrows across the current viewport, each carrying its own
+// hourly forecast series from /api/fire-spread/wind-field. Dragging
 // the bottom timeline scrubber into its future zone re-indexes into that
 // already-fetched series (see renderWindFieldAtHour) instead of refetching
 // per hour - exactly the pattern the single-incident fire-spread ellipse
@@ -3011,8 +3272,22 @@ let windFieldData = null; // [{lat, lon, hours: [{speed_kmh, direction_from_deg}
 let windFieldFutureHours = 0;
 let windFieldFutureMs = 0;
 
+// Arrows and particles are two mutually-exclusive rendering modes over the
+// SAME fetched grid (see toggleWindParticles below for why they don't run
+// together) - reloadWindField fetches whenever EITHER is turned on.
+function windOverlayEnabled() {
+  return (
+    document.getElementById("wind-field-toggle")?.checked || document.getElementById("wind-particles-toggle")?.checked
+  );
+}
+
 function clearWindField() {
   windFieldLayer.clearLayers();
+  // Not relevant while browsing history - same reasoning the prediction
+  // ellipse/arrow grid already apply above (see onScrubberInput's past
+  // branch), just extended to the particle canvas and heatmap too.
+  stopWindParticles();
+  destroyWindHeatCanvas();
 }
 
 // hoursAhead uses the same 1-indexed "+Nh" convention as
@@ -3020,22 +3295,33 @@ function clearWindField() {
 // hoursAhead value from onScrubberInput drives both layers identically.
 function renderWindFieldAtHour(hoursAhead) {
   windFieldLayer.clearLayers();
+  // Read by the particle loop's sampleWindAt regardless of which mode is
+  // active, so switching modes mid-scrub doesn't need its own resync.
+  windParticleHoursAhead = hoursAhead;
   if (!windFieldData || !windFieldData.length) return;
-  windFieldData.forEach((point) => {
-    const idx = Math.min(hoursAhead - 1, point.hours.length - 1);
-    if (idx < 0) return;
-    const hourEntry = point.hours[idx];
-    if (!hourEntry) return;
-    L.marker([point.lat, point.lon], {
-      icon: windArrowIcon(hourEntry.direction_from_deg, hourEntry.speed_kmh),
-      interactive: false,
-    }).addTo(windFieldLayer);
-  });
+  if (document.getElementById("wind-field-toggle")?.checked) {
+    windFieldData.forEach((point) => {
+      const idx = Math.min(hoursAhead - 1, point.hours.length - 1);
+      if (idx < 0) return;
+      const hourEntry = point.hours[idx];
+      if (!hourEntry) return;
+      L.marker([point.lat, point.lon], {
+        icon: windArrowIcon(hourEntry.direction_from_deg, hourEntry.speed_kmh),
+        interactive: false,
+      }).addTo(windFieldLayer);
+    });
+  }
+  if (document.getElementById("wind-particles-toggle")?.checked) startWindParticles();
+  // Shown under EITHER mode (see windOverlayEnabled) - not a separate toggle
+  // the user has to manage on top of the two they already have.
+  if (windOverlayEnabled()) {
+    createWindHeatCanvas();
+    drawWindHeatFrame();
+  }
 }
 
 async function reloadWindField() {
-  const toggle = document.getElementById("wind-field-toggle");
-  if (!toggle || !toggle.checked) return;
+  if (!windOverlayEnabled()) return;
   const bounds = map.getBounds();
   const params = new URLSearchParams({
     west: bounds.getWest(),
@@ -3048,8 +3334,9 @@ async function reloadWindField() {
     const res = await fetch(`${apiBaseUrl}/api/fire-spread/wind-field?${params}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    if (!toggle.checked) return; // toggled off while this request was in flight
+    if (!windOverlayEnabled()) return; // toggled off while this request was in flight
     windFieldData = data;
+    windFieldGridMeta = buildWindFieldGridMeta(data);
     windFieldFutureHours = data.length ? Math.max(...data.map((p) => p.hours.length)) : 0;
     windFieldFutureMs = windFieldFutureHours * 3600000;
     updateScrubberEndLabel();
@@ -3060,25 +3347,430 @@ async function reloadWindField() {
   }
 }
 
-function toggleWindFieldLayer() {
-  const enabled = document.getElementById("wind-field-toggle").checked;
-  if (enabled) {
-    reloadWindField();
-    return;
-  }
+// Shared teardown for "this overlay mode was just turned off" - snaps the
+// scrubber back to "now" if it was only sitting in the future zone because
+// of the wind field (no incident prediction of its own keeping it open),
+// rather than leaving it stranded past the new, possibly-shorter span.
+function resetWindOverlayState() {
   windFieldData = null;
+  windFieldGridMeta = null;
   windFieldFutureHours = 0;
   windFieldFutureMs = 0;
   clearWindField();
   updateScrubberEndLabel();
-  // If the scrubber was sitting in a future zone that only existed because
-  // of the wind field (no incident prediction of its own keeping it open),
-  // snap back to "now" rather than leaving it stranded past the new,
-  // possibly-shorter (or zero) future span.
   const range = document.getElementById("scrubber-range");
   if (Number(range.value) > scrubberNowFraction()) range.value = scrubberNowFraction();
   onScrubberInput();
 }
+
+function toggleWindFieldLayer() {
+  const arrowsToggle = document.getElementById("wind-field-toggle");
+  if (arrowsToggle.checked) {
+    // Mutual exclusion - see toggleWindParticles for why these two never
+    // render at once.
+    const particlesToggle = document.getElementById("wind-particles-toggle");
+    if (particlesToggle.checked) {
+      particlesToggle.checked = false;
+      stopWindParticles();
+    }
+    reloadWindField();
+    return;
+  }
+  if (!windOverlayEnabled()) resetWindOverlayState();
+  else clearWindField(); // particles still active - keep windFieldData alive for them
+}
+
+// ---------- Wind particles (Windy-style animated flow) ----------
+// Alternative rendering mode for the SAME windFieldData the arrow grid above
+// already fetches - a canvas overlay (see windParticlePane) running a small
+// requestAnimationFrame loop that seeds a few hundred particles across the
+// viewport and advects each one along its LOCAL wind vector every frame,
+// fading a short trailing streak behind it (the classic "particle
+// advection" technique - same idea as earth.nullschool.info/windy.com,
+// scaled down to a vanilla-canvas v1: nearest-neighbor lookup into the
+// already-sparse (<=9x9) wind-field grid rather than bilinear interpolation,
+// since that grid's own irregular edges don't reliably have 4 close
+// neighbors to blend anyway, and any visible faceting is softened by the
+// fade trail itself). Mutually exclusive with the arrow grid (see
+// toggleWindFieldLayer above) - both rendering the full viewport at once
+// visually fight, and arrows already give an exact hoverable km/h reading
+// that particles intentionally trade away for a "feel of the flow" instead.
+const WIND_PARTICLE_COUNT_DESKTOP = 800;
+const WIND_PARTICLE_COUNT_MOBILE = 250;
+const WIND_PARTICLE_LIFESPAN_FRAMES = 90;
+let windParticleCanvas = null;
+let windParticleCtx = null;
+let windParticles = [];
+let windParticleRafId = null;
+let windParticleHoursAhead = 1; // set by renderWindFieldAtHour - same hour arrows would show
+
+function windParticleCount() {
+  return window.matchMedia("(max-width: 768px)").matches ? WIND_PARTICLE_COUNT_MOBILE : WIND_PARTICLE_COUNT_DESKTOP;
+}
+
+function createWindParticleCanvas() {
+  if (windParticleCanvas) return;
+  windParticleCanvas = L.DomUtil.create("canvas", "wind-particle-canvas", map.getPane("windParticlePane"));
+  windParticleCtx = windParticleCanvas.getContext("2d");
+  repositionWindParticleCanvas();
+}
+
+// Leaflet panes translate via CSS transform as the map pans - a raw canvas
+// (unlike Leaflet's own DOM markers/L.canvas renderer) doesn't follow that
+// automatically, so this must run on every "move" event (not just
+// "moveend"), same as the pane transform itself updates continuously
+// during a drag.
+function repositionWindParticleCanvas() {
+  if (!windParticleCanvas) return;
+  const topLeft = map.containerPointToLayerPoint([0, 0]);
+  L.DomUtil.setPosition(windParticleCanvas, topLeft);
+  const size = map.getSize();
+  if (windParticleCanvas.width !== size.x || windParticleCanvas.height !== size.y) {
+    windParticleCanvas.width = size.x;
+    windParticleCanvas.height = size.y;
+  }
+}
+
+function seedWindParticles() {
+  const bounds = map.getBounds();
+  windParticles = Array.from({ length: windParticleCount() }, () => ({
+    lat: bounds.getSouth() + Math.random() * (bounds.getNorth() - bounds.getSouth()),
+    lon: bounds.getWest() + Math.random() * (bounds.getEast() - bounds.getWest()),
+    // Staggered initial age so particles don't all respawn in the same frame.
+    age: Math.floor(Math.random() * WIND_PARTICLE_LIFESPAN_FRAMES),
+  }));
+}
+
+// Reconstructed once per windFieldData load (see reloadWindField) - the
+// backend's _wind_field_grid always builds a REGULAR lat/lon grid, so the
+// distinct lats/lons can be recovered by sorting/deduping the flat point
+// list, letting sampleWindAt below locate the surrounding CELL (4 corners)
+// instead of just the single nearest point.
+let windFieldGridMeta = null; // { lats: number[], lons: number[], byKey: Map<"lat,lon", point> } | null
+
+function buildWindFieldGridMeta(data) {
+  if (!data || !data.length) return null;
+  const lats = Array.from(new Set(data.map((p) => p.lat))).sort((a, b) => a - b);
+  const lons = Array.from(new Set(data.map((p) => p.lon))).sort((a, b) => a - b);
+  const byKey = new Map(data.map((p) => [`${p.lat},${p.lon}`, p]));
+  return { lats, lons, byKey };
+}
+
+// A wind reading's speed+direction doesn't blend correctly by simple
+// averaging (350deg and 10deg average to 180deg, the opposite of "north-ish"
+// - the classic angle-wraparound trap) - converting to u/v vector components
+// first, blending THOSE, then converting back is the standard fix, same
+// technique meteorological wind-field renderers use.
+function windToComponents(hourEntry) {
+  const bearingRad = ((hourEntry.direction_from_deg + 180) % 360) * (Math.PI / 180);
+  return { u: hourEntry.speed_kmh * Math.sin(bearingRad), v: hourEntry.speed_kmh * Math.cos(bearingRad) };
+}
+function componentsToWind(u, v) {
+  return {
+    speed_kmh: Math.sqrt(u * u + v * v),
+    direction_from_deg: (((Math.atan2(u, v) * 180) / Math.PI - 180 + 360) % 360),
+  };
+}
+
+// Bilinear interpolation across the 4 grid points surrounding (lat, lon),
+// blended in u/v space (see windToComponents) - smooths the visible seams a
+// plain nearest-neighbor lookup produces right at each grid cell's boundary
+// (confirmed live: particles visibly snapped direction/speed crossing
+// between cells). Falls back to nearest-neighbor only if the grid is too
+// degenerate (a single row/column) to form a real cell.
+function sampleWindAt(lat, lon) {
+  if (!windFieldData || !windFieldData.length) return null;
+  const meta = windFieldGridMeta;
+  if (!meta || meta.lats.length < 2 || meta.lons.length < 2) {
+    let nearest = null;
+    let nearestDist = Infinity;
+    for (const point of windFieldData) {
+      const dist = (point.lat - lat) ** 2 + (point.lon - lon) ** 2;
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearest = point;
+      }
+    }
+    if (!nearest) return null;
+    const idx = Math.min(windParticleHoursAhead - 1, nearest.hours.length - 1);
+    const hourEntry = idx >= 0 ? nearest.hours[idx] : null;
+    return hourEntry && hourEntry.speed_kmh != null && hourEntry.direction_from_deg != null ? hourEntry : null;
+  }
+
+  const { lats, lons, byKey } = meta;
+  // Clamp to the grid's own edges rather than extrapolating past them - a
+  // particle can legitimately sit outside the fetched grid (viewport moved
+  // since the last fetch) right up until the next reloadWindField lands.
+  let latIdx = lats.findIndex((v) => v > lat) - 1;
+  latIdx = Math.min(Math.max(latIdx, 0), lats.length - 2);
+  let lonIdx = lons.findIndex((v) => v > lon) - 1;
+  lonIdx = Math.min(Math.max(lonIdx, 0), lons.length - 2);
+
+  const lat0 = lats[latIdx];
+  const lat1 = lats[latIdx + 1];
+  const lon0 = lons[lonIdx];
+  const lon1 = lons[lonIdx + 1];
+  const tLat = lat1 > lat0 ? Math.min(1, Math.max(0, (lat - lat0) / (lat1 - lat0))) : 0;
+  const tLon = lon1 > lon0 ? Math.min(1, Math.max(0, (lon - lon0) / (lon1 - lon0))) : 0;
+
+  const corners = [
+    byKey.get(`${lat0},${lon0}`),
+    byKey.get(`${lat0},${lon1}`),
+    byKey.get(`${lat1},${lon0}`),
+    byKey.get(`${lat1},${lon1}`),
+  ];
+  if (corners.some((c) => !c)) return null; // an irregular/incomplete grid edge - skip rather than guess
+  const hourAt = (point) => {
+    const idx = Math.min(windParticleHoursAhead - 1, point.hours.length - 1);
+    return idx >= 0 ? point.hours[idx] : null;
+  };
+  const hourEntries = corners.map(hourAt);
+  // Open-Meteo occasionally returns a null speed/direction for a specific
+  // hour at an edge-of-model-domain point (e.g. a grid corner that landed
+  // far offshore) - `null` coerces to 0 in arithmetic, which would silently
+  // read as "genuinely calm" instead of "no data here", so treat it the same
+  // as a missing corner entirely rather than let it quietly pull the blend
+  // toward a fake dead-calm reading.
+  if (hourEntries.some((h) => !h || h.speed_kmh == null || h.direction_from_deg == null)) return null;
+  const [c00, c01, c10, c11] = hourEntries.map(windToComponents);
+  const u =
+    c00.u * (1 - tLat) * (1 - tLon) + c01.u * (1 - tLat) * tLon + c10.u * tLat * (1 - tLon) + c11.u * tLat * tLon;
+  const v =
+    c00.v * (1 - tLat) * (1 - tLon) + c01.v * (1 - tLat) * tLon + c10.v * tLat * (1 - tLon) + c11.v * tLat * tLon;
+  return componentsToWind(u, v);
+}
+
+// ---------- Wind-speed heatmap (Windy-style color wash under the arrows/
+// particles) ----------
+// A raw <canvas> in its own pane (see windHeatPane above), mirroring
+// createWindParticleCanvas/repositionWindParticleCanvas's exact pattern -
+// but unlike the particle canvas, this is NOT redrawn every animation frame.
+// It only changes when the underlying data, the scrubbed hour, or the
+// viewport itself changes (see drawWindHeatFrame's call sites: the end of
+// renderWindFieldAtHour/reloadWindField, and repositionWindHeatCanvas
+// itself), since a color wash has nothing left to animate frame-to-frame the
+// way particle positions do.
+const WIND_HEAT_BLOCK_PX = 8; // coarse grid, not per-pixel - see plan for the perf reasoning; small enough that the 18px blur above fully dissolves the block edges
+const WIND_HEAT_ALPHA = 0.55; // a wash, not an opaque layer - hotspot dots/incident markers above it must stay legible
+let windHeatCanvas = null;
+let windHeatCtx = null;
+
+function createWindHeatCanvas() {
+  if (windHeatCanvas) return;
+  windHeatCanvas = L.DomUtil.create("canvas", "wind-heat-canvas", map.getPane("windHeatPane"));
+  // GPU-composited, not a per-frame JS cost (this canvas itself barely
+  // redraws) - softens the coarse block grid into a smoother Windy-like
+  // gradient. 18px (was 6px) - confirmed live that a sparse grid's real
+  // seams between two widely-different readings still showed through a
+  // light blur as a visible hard edge; a wider radius reads as genuine
+  // continuous variation instead.
+  windHeatCanvas.style.filter = "blur(18px)";
+  windHeatCtx = windHeatCanvas.getContext("2d");
+  repositionWindHeatCanvas();
+}
+
+function destroyWindHeatCanvas() {
+  if (!windHeatCanvas) return;
+  windHeatCanvas.remove();
+  windHeatCanvas = null;
+  windHeatCtx = null;
+}
+
+// Same reasoning as repositionWindParticleCanvas - a raw canvas doesn't
+// follow a Leaflet pane's own pan/zoom CSS transform automatically.
+function repositionWindHeatCanvas() {
+  if (!windHeatCanvas) return;
+  const topLeft = map.containerPointToLayerPoint([0, 0]);
+  L.DomUtil.setPosition(windHeatCanvas, topLeft);
+  const size = map.getSize();
+  if (windHeatCanvas.width !== size.x || windHeatCanvas.height !== size.y) {
+    windHeatCanvas.width = size.x;
+    windHeatCanvas.height = size.y;
+  }
+  drawWindHeatFrame();
+}
+
+// Coarse block grid rather than per-pixel (a ~1440x900 viewport is ~1.3M
+// pixels vs ~9k blocks at this size) - each block samples ONE point via the
+// same bilinear sampleWindAt particles already use, so the heatmap and the
+// particle flow always agree with each other (same interpolation, same
+// underlying grid, same scrubbed hour).
+function drawWindHeatFrame() {
+  if (!windHeatCtx || !windFieldData || !windFieldData.length) return;
+  const ctx = windHeatCtx;
+  const w = windHeatCanvas.width;
+  const h = windHeatCanvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.globalAlpha = WIND_HEAT_ALPHA;
+  for (let y = 0; y < h; y += WIND_HEAT_BLOCK_PX) {
+    for (let x = 0; x < w; x += WIND_HEAT_BLOCK_PX) {
+      const center = map.containerPointToLatLng([x + WIND_HEAT_BLOCK_PX / 2, y + WIND_HEAT_BLOCK_PX / 2]);
+      const wind = sampleWindAt(center.lat, center.lng);
+      if (!wind) continue; // ocean-edge/degenerate grid - leave transparent rather than fabricate a color
+      ctx.fillStyle = windSpeedColor(wind.speed_kmh);
+      ctx.fillRect(x, y, WIND_HEAT_BLOCK_PX, WIND_HEAT_BLOCK_PX);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Zoom-independent screen speed (the actual fix for "particles fly by way
+// too fast when zoomed in"): stepping used to move each particle by a FIXED
+// lat/lon DEGREE amount every frame, but degrees cover exponentially more
+// SCREEN PIXELS the further in you zoom - the same real wind was reading as
+// a crawl at country-wide zoom and a blur at street level. Stepping in
+// CONTAINER PIXELS instead (converting back to lat/lon only to persist the
+// particle's position) keeps the on-screen speed visually consistent at any
+// zoom, matching how Windy/earth.nullschool's own particle fields behave.
+// Reference speed for normalizing 0-1: Spanish wildfire-relevant wind almost
+// always sits in the 0-60 km/h band (rare gusts above that), so that's the
+// range the visible speed differences should be spread across - normalizing
+// against 80 (the old value) wasted most of the dynamic range on speeds users
+// will rarely see, compressing the everyday 0-30 km/h band into a narrow,
+// hard-to-distinguish sliver.
+const WIND_PARTICLE_REFERENCE_SPEED_KMH = 60;
+// The floor used to be 0.4px vs an 2.6px amplitude - at a calm 5 km/h the
+// floor alone (which every particle gets regardless of speed) was already
+// ~70% of the total motion at 30 km/h, so "calm" and "breezy" looked almost
+// identical. Shrinking the floor and widening the amplitude lets pxStep track
+// speed proportionally again while still keeping true-calm particles crawling
+// instead of freezing solid.
+const WIND_PARTICLE_MAX_PX_PER_FRAME = 3;
+const WIND_PARTICLE_MIN_PX_PER_FRAME = 0.15;
+
+// Shared 0-1 speed factor so the step size (stepWindParticles) and the tail
+// length (drawWindParticleFrame) always agree on how "fast" a given wind
+// speed should look.
+function windParticleSpeedFactor(speedKmh) {
+  return Math.min(speedKmh, WIND_PARTICLE_REFERENCE_SPEED_KMH) / WIND_PARTICLE_REFERENCE_SPEED_KMH;
+}
+
+function stepWindParticles() {
+  const bounds = map.getBounds();
+  windParticles.forEach((particle) => {
+    particle.age += 1;
+    const outOfBounds =
+      particle.lat < bounds.getSouth() ||
+      particle.lat > bounds.getNorth() ||
+      particle.lon < bounds.getWest() ||
+      particle.lon > bounds.getEast();
+    const wind = outOfBounds ? null : sampleWindAt(particle.lat, particle.lon);
+    if (particle.age > WIND_PARTICLE_LIFESPAN_FRAMES || outOfBounds || !wind) {
+      particle.lat = bounds.getSouth() + Math.random() * (bounds.getNorth() - bounds.getSouth());
+      particle.lon = bounds.getWest() + Math.random() * (bounds.getEast() - bounds.getWest());
+      particle.age = 0;
+      return;
+    }
+    // Wind direction is "from" - advect TOWARD the opposite bearing, same
+    // convention windArrowIcon's rotation already uses.
+    const bearingRad = ((wind.direction_from_deg + 180) % 360) * (Math.PI / 180);
+    const speedFactor = windParticleSpeedFactor(wind.speed_kmh);
+    const pxStep = WIND_PARTICLE_MIN_PX_PER_FRAME + speedFactor * WIND_PARTICLE_MAX_PX_PER_FRAME;
+    const point = map.latLngToContainerPoint([particle.lat, particle.lon]);
+    const next = map.containerPointToLatLng([
+      point.x + Math.sin(bearingRad) * pxStep,
+      point.y - Math.cos(bearingRad) * pxStep, // screen Y grows downward - "north" is -Y
+    ]);
+    particle.lat = next.lat;
+    particle.lon = next.lng;
+  });
+}
+
+function drawWindParticleFrame() {
+  if (!windParticleCtx) return;
+  const ctx = windParticleCtx;
+  const w = windParticleCanvas.width;
+  const h = windParticleCanvas.height;
+  // Trailing-streak fade: erase a little of the previous frame instead of
+  // clearing it outright, so each particle leaves a short fading tail.
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.fillStyle = "rgba(0,0,0,0.08)";
+  ctx.fillRect(0, 0, w, h);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.strokeStyle = cssVar("--wind") || "#0891b2";
+  ctx.lineWidth = 1.4;
+  windParticles.forEach((particle) => {
+    const wind = sampleWindAt(particle.lat, particle.lon);
+    if (!wind) return;
+    const point = map.latLngToContainerPoint([particle.lat, particle.lon]);
+    const bearingRad = ((wind.direction_from_deg + 180) % 360) * (Math.PI / 180);
+    // Fixed, zoom-independent tail length (same reasoning as the pixel-space
+    // step above) - only speed still varies the length, not zoom level.
+    const tailLength = 2 + windParticleSpeedFactor(wind.speed_kmh) * 8;
+    ctx.beginPath();
+    ctx.moveTo(point.x - Math.sin(bearingRad) * tailLength, point.y - Math.cos(bearingRad) * tailLength);
+    ctx.lineTo(point.x, point.y);
+    ctx.stroke();
+  });
+}
+
+function windParticleFrame() {
+  stepWindParticles();
+  drawWindParticleFrame();
+  windParticleRafId = requestAnimationFrame(windParticleFrame);
+}
+
+function startWindParticles() {
+  if (windParticleRafId) return; // already running
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  if (document.hidden) return; // resumed by the visibilitychange listener below instead
+  createWindParticleCanvas();
+  repositionWindParticleCanvas();
+  if (!windParticles.length) seedWindParticles();
+  windParticleFrame();
+}
+
+function stopWindParticles() {
+  if (windParticleRafId) {
+    cancelAnimationFrame(windParticleRafId);
+    windParticleRafId = null;
+  }
+  if (windParticleCtx && windParticleCanvas) {
+    windParticleCtx.clearRect(0, 0, windParticleCanvas.width, windParticleCanvas.height);
+  }
+}
+
+function toggleWindParticles() {
+  const particlesToggle = document.getElementById("wind-particles-toggle");
+  if (particlesToggle.checked) {
+    // Mutual exclusion - both rendering the full viewport at once would
+    // visually fight (see the settings panel's own hint text). Arrows give
+    // an exact hoverable reading; particles trade that for a feel of the flow.
+    const arrowsToggle = document.getElementById("wind-field-toggle");
+    if (arrowsToggle.checked) {
+      arrowsToggle.checked = false;
+      windFieldLayer.clearLayers();
+    }
+    reloadWindField();
+    return;
+  }
+  stopWindParticles();
+  windParticles = [];
+  if (!windOverlayEnabled()) resetWindOverlayState();
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopWindParticles();
+  else if (document.getElementById("wind-particles-toggle")?.checked) startWindParticles();
+});
+
+// Windy-style "click a point, get the weather there" popup - replaces the
+// old fixed per-incident wind arrow (removed; see updateWindSummary, which
+// now only feeds the summary bar's average) with a click-anywhere lookup
+// tied to the particles layer itself, active only while it's on so this
+// doesn't compete with the "place fire-spread origin" click tool below.
+map.on("click", (e) => {
+  if (placingFireOrigin) return;
+  if (!document.getElementById("wind-particles-toggle")?.checked) return;
+  const point = { id: `${e.latlng.lat},${e.latlng.lng}`, centroid_lat: e.latlng.lat, centroid_lon: e.latlng.lng };
+  const popup = L.popup({ className: "weather-popup-wrap", maxWidth: 260 })
+    .setLatLng(e.latlng)
+    .setContent(`<div class="weather-popup-loading">Cargando previsión…</div>`)
+    .openOn(map);
+  fetchWeatherTimeline(point).then((timeline) => {
+    popup.setContent(weatherPopupHtml(timeline) || "No se pudo cargar la previsión.");
+  });
+});
 
 // ---------- Fire spread prediction (experimental POC) ----------
 // Click "Place origin", then click the map: fetches /api/fire-spread/predict
@@ -3204,6 +3896,7 @@ document.getElementById("satellite-date").addEventListener("change", updateSatel
 document.getElementById("webcams-toggle").addEventListener("change", toggleWebcamsLayer);
 document.getElementById("aircraft-toggle").addEventListener("change", toggleAircraftLayer);
 document.getElementById("wind-field-toggle").addEventListener("change", toggleWindFieldLayer);
+document.getElementById("wind-particles-toggle").addEventListener("change", toggleWindParticles);
 document.getElementById("season-burnt-area-toggle").addEventListener("change", toggleSeasonBurntAreaLayer);
 document.getElementById("sigpac-toggle").addEventListener("change", toggleSigpacLayer);
 document.getElementById("basemap-style").addEventListener("change", (e) => setBasemapStyle(e.target.value));
@@ -3238,6 +3931,18 @@ map.on("moveend", reloadAircraft);
 // here, unlike webcams which only cares about moveend.
 map.on("moveend", reloadWindField);
 map.on("zoomend", reloadWindField);
+// The particle canvas is a raw <canvas>, not a Leaflet-managed layer - it
+// must re-project to the viewport on every "move" (continuously during a
+// drag), not just moveend/zoomend like the data-refetching above.
+map.on("move", repositionWindParticleCanvas);
+map.on("zoomend", repositionWindParticleCanvas);
+window.addEventListener("resize", repositionWindParticleCanvas);
+// The heatmap doesn't need to re-project on every "move" frame (it isn't
+// animating - see drawWindHeatFrame's own comment), just redrawn once panning
+// settles or the viewport size/zoom changes.
+map.on("moveend", repositionWindHeatCanvas);
+map.on("zoomend", repositionWindHeatCanvas);
+window.addEventListener("resize", repositionWindHeatCanvas);
 
 // ---------- Filter bar: dropdown pills replacing the old stacked
 // label+chip-row groups. Each pill's own label reflects the current
@@ -3744,8 +4449,19 @@ function renderRecencyLegend() {
     .join("");
 }
 
+// Same render-from-array pattern as renderRecencyLegend, for WIND_SPEED_LEGEND.
+function renderWindSpeedLegend() {
+  const el = document.getElementById("wind-speed-legend");
+  if (!el) return;
+  const items = [...WIND_SPEED_LEGEND.map((b) => ({ color: b.color, label: b.label })), { color: WIND_SPEED_EXTREME_COLOR, label: "80+ km/h" }];
+  el.innerHTML = items
+    .map((item) => `<span class="recency-swatch"><span class="recency-swatch-dot" style="background:${item.color};"></span>${item.label}</span>`)
+    .join("");
+}
+
 (async function init() {
   renderRecencyLegend();
+  renderWindSpeedLegend();
   updateFilterPillLabels();
   await loadConfig();
   await loadFires();
