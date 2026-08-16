@@ -59,6 +59,12 @@ const windFieldLayer = L.layerGroup().addTo(map);
 // (see reloadSeasonBurntArea): this answers "how much has burned this
 // campaign", not "what's active right now".
 const seasonBurntAreaLayer = L.layerGroup();
+// Per-source "last heard from" chip, shown next to the fire itself while its
+// detail view is open (see loadIncidentDetections) - the sidebar's own
+// .source-freshness text answers the same question but sits off in the
+// panel, disconnected from the thing it's describing; this puts it right on
+// the map, anchored to the incident it's about.
+const incidentFreshnessLayer = L.layerGroup().addTo(map);
 
 // Shared canvas renderer for hotspot dots. Leaflet's default SVG renderer
 // creates one DOM node per circleMarker, which starts to choke once you get
@@ -2051,6 +2057,37 @@ function satelliteCarouselHtml(events) {
 
 const DETECTION_SOURCE_LABELS = { FIRMS: "NASA FIRMS", EFFIS: "EFFIS", EUMETSAT: "EUMETSAT", SENTINEL3: "Sentinel-3" };
 
+// Draws the map-anchored freshness chip (see incidentFreshnessLayer/CSS
+// above) for the incident currently open in the detail view - one row per
+// source that has ever reported this fire, newest first, each dot reusing
+// the same recencyColor scale the hotspot dots themselves use so "red dot
+// here" means the same thing on the badge as it does on the map underneath
+// it.
+function renderIncidentFreshnessBadge(incident, lastBySource) {
+  incidentFreshnessLayer.clearLayers();
+  if (!lastBySource.size) return;
+  const rows = Array.from(lastBySource.entries())
+    .sort((a, b) => new Date(b[1]) - new Date(a[1]))
+    .map(
+      ([source, at]) =>
+        `<div class="map-freshness-row">` +
+        `<span class="map-freshness-dot" style="background:${recencyColor(at)}"></span>` +
+        `<span class="map-freshness-source">${DETECTION_SOURCE_LABELS[source] || source}</span>` +
+        `<span>${relativeTime(at)}</span>` +
+        `</div>`
+    )
+    .join("");
+  const icon = L.divIcon({
+    className: "",
+    html: `<div class="map-freshness-badge">${rows}</div>`,
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+  L.marker([incident.centroid_lat, incident.centroid_lon], { icon, interactive: false, zIndexOffset: 600 }).addTo(
+    incidentFreshnessLayer
+  );
+}
+
 // Fetches this incident's FULL, unfiltered detection set (see
 // selectedIncidentDetections) and uses it for two things: letting the map
 // always show every one of this fire's points regardless of the date-range
@@ -2082,6 +2119,7 @@ async function loadIncidentDetections(incident) {
           `</div>`
         : "";
     }
+    renderIncidentFreshnessBadge(incident, lastBySource);
 
     if (!detections.length) {
       renderMap();
@@ -2107,6 +2145,10 @@ async function loadIncidentDetections(incident) {
 
 async function showIncidentDetail(incident) {
   map.flyTo([incident.centroid_lat, incident.centroid_lon], Math.max(map.getZoom(), 11));
+  // Clear any previous incident's badge immediately - switching straight from
+  // one incident's detail to another's shouldn't leave the old one's chip
+  // floating over the new fire until loadIncidentDetections resolves.
+  incidentFreshnessLayer.clearLayers();
 
   // Filters apply to the list, not to a single incident's detail - hide
   // them to give the detail card the space instead of leaving them shown
@@ -2124,6 +2166,7 @@ async function showIncidentDetail(incident) {
     document.getElementById("summary-bar").classList.remove("summary-bar-hidden");
     disableIncidentPrediction();
     selectedIncidentDetections = [];
+    incidentFreshnessLayer.clearLayers();
     initTimelineScrubber(lastFires); // restores the normal date-range-filtered bounds/label
     refreshIncidentList();
   });

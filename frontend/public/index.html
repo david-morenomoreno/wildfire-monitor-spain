@@ -55,12 +55,14 @@
       border-bottom: 1px solid var(--border-soft);
       box-shadow: var(--card-shadow);
       overflow-x: auto;
+      scroll-snap-type: x proximity;
     }
     .summary-stat {
       display: flex;
       flex-direction: column;
       gap: 1px;
       flex-shrink: 0;
+      scroll-snap-align: start;
     }
     .summary-stat-value {
       font-family: var(--font-display);
@@ -83,7 +85,28 @@
       letter-spacing: 0.04em;
     }
     @media (max-width: 768px) {
-      .summary-bar { gap: 18px; padding: 8px 14px; }
+      .summary-bar {
+        gap: 18px;
+        padding: 8px 14px;
+        /* Scroll-shadow trick: two solid fades anchored to the visible edges
+           (background-attachment: local, so they scroll with the content and
+           sit right at its start/end) plus two radial "hint" shadows anchored
+           to the viewport (background-attachment: scroll, so they stay put).
+           Where the two coincide - i.e. there's nothing to scroll toward -
+           the solid fade fully covers the hint, so the affordance only shows
+           when a tile is actually clipped off-screen. Makes the satellite
+           tile's existence discoverable without adding a bespoke JS listener. */
+        background:
+          linear-gradient(to right, var(--bg-panel) 30%, rgba(255,255,255,0)) left,
+          linear-gradient(to left, var(--bg-panel) 30%, rgba(255,255,255,0)) right,
+          radial-gradient(farthest-side at 0 50%, rgba(0,0,0,.18), rgba(0,0,0,0)) left,
+          radial-gradient(farthest-side at 100% 50%, rgba(0,0,0,.18), rgba(0,0,0,0)) right;
+        background-repeat: no-repeat;
+        background-color: var(--bg-panel);
+        background-size: 24px 100%, 24px 100%, 10px 100%, 10px 100%;
+        background-position: left center, right center, left center, right center;
+        background-attachment: local, local, scroll, scroll;
+      }
       .summary-stat-value { font-size: 16px; }
     }
 
@@ -949,6 +972,39 @@
       flex-shrink: 0;
     }
 
+    /* ---------- Map-anchored "last heard from" badge ---------- */
+    /* Same per-source freshness the sidebar's .source-freshness line shows,
+       but rendered ON the map next to the incident it describes (see
+       renderIncidentFreshnessBadge in app.js) - answers "is fresh satellite
+       data still coming in for THIS fire" right where you're already
+       looking, instead of only in a disconnected sidebar line. */
+    .map-freshness-badge {
+      position: absolute;
+      transform: translate(-50%, calc(-100% - 13px));
+      background: var(--bg-panel);
+      border: 1px solid var(--border-soft);
+      border-radius: 9px;
+      box-shadow: var(--card-shadow);
+      padding: 6px 10px;
+      font-size: 10.5px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      pointer-events: none;
+    }
+    .map-freshness-badge::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      bottom: -6px;
+      transform: translateX(-50%);
+      border: 6px solid transparent;
+      border-top-color: var(--bg-panel);
+    }
+    .map-freshness-row { display: flex; align-items: center; gap: 5px; }
+    .map-freshness-row + .map-freshness-row { margin-top: 3px; }
+    .map-freshness-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .map-freshness-source { font-weight: 700; color: var(--text-primary); }
+
     .sparkline-wrap { margin-top: 14px; }
     .sparkline-label {
       font-size: 10px;
@@ -1517,6 +1573,10 @@
       <span class="summary-stat-label">Incendios activos</span>
     </div>
     <div class="summary-stat">
+      <span class="summary-stat-value" id="summary-satellite">–</span>
+      <span class="summary-stat-label">Últimos datos satelitales</span>
+    </div>
+    <div class="summary-stat">
       <span class="summary-stat-value" id="summary-area">–</span>
       <span class="summary-stat-label">Ha estimadas (activos)</span>
     </div>
@@ -1527,10 +1587,6 @@
     <div class="summary-stat summary-stat-wind">
       <span class="summary-stat-value" id="summary-wind">–</span>
       <span class="summary-stat-label">Viento medio (focos)</span>
-    </div>
-    <div class="summary-stat">
-      <span class="summary-stat-value" id="summary-satellite">–</span>
-      <span class="summary-stat-label">Últimos datos satelitales</span>
     </div>
   </div>
   <div id="map-wrap">
