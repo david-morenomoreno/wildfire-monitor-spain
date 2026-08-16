@@ -8,6 +8,9 @@ from app.models import FireDetection, FireIncident
 from app.services.fire_spread import (
     MAX_PREDICTION_HOURS,
     RECENT_HOTSPOT_WINDOW_HOURS,
+    WEATHER_TIMELINE_FORECAST_HOURS,
+    WEATHER_TIMELINE_PAST_HOURS,
+    fetch_weather_timeline,
     fetch_wind_field,
     predict_incident_spread,
     predict_spread,
@@ -127,3 +130,24 @@ def wind_field(
         return fetch_wind_field(west, south, east, north, hours=hours)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Wind field fetch failed: {exc}") from exc
+
+
+@router.get("/weather-timeline")
+def weather_timeline(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    past_hours: int = Query(WEATHER_TIMELINE_PAST_HOURS, ge=1, le=48),
+    forecast_hours: int = Query(WEATHER_TIMELINE_FORECAST_HOURS, ge=1, le=72),
+):
+    """
+    Continuous past-through-forecast hourly weather for one point (see
+    fetch_weather_timeline) - the data behind the map's weather-at-the-fire
+    popup and the incident sidebar's hourly strip. Standalone lat/lon
+    endpoint (not incident-scoped) since a fire's location doesn't need any
+    of predict-incident's fronts/burnt-extent machinery to answer "what's the
+    weather here".
+    """
+    timeline = fetch_weather_timeline(lat, lon, past_hours=past_hours, forecast_hours=forecast_hours)
+    if timeline is None:
+        raise HTTPException(status_code=502, detail="Weather timeline fetch failed")
+    return timeline
